@@ -10,7 +10,7 @@ Maintain the roadmap, runtime architecture, dependency decisions, and source att
 
 ## Local Contracts
 
-Describe actual state accurately: four read-only tools are implemented and eight remain on the roadmap. Document `get_task_report` as one fixed request and, for backlink reports, one explicitly bounded page; do not describe report fields as proof of completeness or fresh indexing truth. Keep operational records, credentials, account data, and machine-specific details out of public docs. Preserve source links and license attribution.
+Describe actual state accurately: four read tools and guarded `create_indexing_task` are implemented; seven tools remain on the roadmap. Default writes are disabled and previews need no key/state. Describe explicit private policy/new-only init, independent estimated caps, UTC reservation periods, immutable policy snapshots/restart, unresolved holds and synchronous SQL/cancellation limits without selecting operator values. Distinguish durable accepted state from an unrecorded ACK; do not imply provider idempotency, wallet enforcement, human authentication or V1 lineage. Preserve the normal-open WAL sidecar caveat. Document `get_task_report` as one fixed request and one bounded backlink page, without completeness or fresh indexing claims. Keep operational records, credentials, account data and machine-specific details out of public docs. Preserve source links, referral disclosure and license attribution.
 
 ## Work Guidance
 

@@ -1,11 +1,11 @@
 # SpeedyIndex MCP
 
-An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server that reads your [SpeedyIndex](https://app.speedyindex.com/r/zqgax9) account balances and existing tasks. This referral link may support project maintenance.
+An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server for [SpeedyIndex](https://app.speedyindex.com/r/zqgax9) account reads and guarded indexing submissions. This referral link may support project maintenance.
 
 [![CI](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-The Bun/TypeScript foundation exposes four read-only tools over stdio: **`get_balance`**, **`list_tasks`**, **`get_task_status`**, and **`get_task_report`**. `get_balance` returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published.
+The Bun/TypeScript server exposes five tools over stdio: **`get_balance`**, **`list_tasks`**, **`get_task_status`**, **`get_task_report`**, and **`create_indexing_task`**. Indexing submissions are disabled by default; previews work without a key, policy or database. `get_balance` returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published.
 
 ## Run from source
 
@@ -16,12 +16,12 @@ git clone https://github.com/antongulin/speedyindex-mcp.git
 cd speedyindex-mcp
 bun install --frozen-lockfile
 bun run build
-bun dist/cli.js --help
+bun --no-env-file dist/cli.js --help
 ```
 
 Sign in to the [official SpeedyIndex API page](https://app.speedyindex.com/cabinet/api) to obtain your own API key. See the [public API reference](https://en.speedyindex.com/api.php) for provider documentation.
 
-Provide `SPEEDYINDEX_API_KEY` through your process manager's secret environment, then launch `bun dist/cli.js` from the repository directory. It waits for an MCP client on stdin/stdout; it is not an interactive shell command. `bun run start` runs the source entrypoint during development. `.env.example` documents the variable without containing a real credential.
+Provide `SPEEDYINDEX_API_KEY` through your process manager's secret environment, then launch `bun --no-env-file dist/cli.js` from the repository directory. It waits for an MCP client on stdin/stdout; it is not an interactive shell command. For development, use `bun --no-env-file src/cli.ts`. Put Bun's `--no-env-file` before the entrypoint to prevent Bun's automatic environment-file loading. The server adds no environment-file loader; your launcher controls its process environment. `.env.example` documents the key variable. A key alone permits reads, with submissions still disabled. Missing keys leave startup and previews usable; read calls fail without network access.
 
 For hosted use, register an upstream through your existing MCP proxy infrastructure. This repository does not provision hosting or register a proxy upstream. The committed `.mcp.json` configures optional **CodeGraph source navigation only**.
 
@@ -77,9 +77,77 @@ Call `get_task_report` with one supported `family` and one nonblank opaque `task
 
 For `backlink/checker`, optional `page` and `limit` default to `0` and `100`; `limit` is bounded from 1 to 100. The request sends `task_id`, `page`, and `limit` in one fixed `/v2/task/backlink/checker/report` POST. The flat `reportKind: "backlink"` result contains `family`, `taskId`, `size`, `processedCount`, `page`, `lastPage`, and `donors`, with only `isCompleted` optional. The page and task ID must match the request, and the donor count cannot exceed the requested limit. Donor rows must be JSON objects; donor keys and nested finite JSON values, including `null`, are preserved without assigning meaning to provider-specific fields. Empty pages beyond `lastPage` are allowed; nonempty pages beyond it are rejected. No additional page is fetched. Report counters, arrays, and optional completion metadata do not establish completeness, retry eligibility, or fresh Google indexing truth.
 
-All four tools make one authenticated request to a fixed `https://api.speedyindex.com/v2` route, using the API key as the raw `Authorization` header. Requests have a 10-second deadline, support MCP cancellation, reject redirects, and never retry automatically. Missing keys fail without network access. Tool failures return `isError: true` with a sanitized message and no structured result. Provider bodies and exception details are never reflected in those errors. Normal stdout contains MCP messages only; diagnostics use stderr. Closing stdin ends the process.
+The four read tools make one authenticated request to a fixed `https://api.speedyindex.com/v2` route, using the API key as the raw `Authorization` header. Requests have a 10-second deadline, support MCP cancellation, reject redirects, and never retry automatically. Read-tool failures return `isError: true` with a sanitized message and no structured result. Provider bodies and exception details are never reflected in those errors. Normal stdout contains MCP messages only; diagnostics use stderr. Closing stdin ends the process.
 
-Responses over this MCP's 16 MiB decoded-body safety bound are rejected; this is not a SpeedyIndex maximum.
+Read responses over this MCP's 16 MiB decoded-body safety bound are rejected; this is not a SpeedyIndex maximum.
+
+## Indexing preview and submission
+
+Call `create_indexing_task` with an explicit `mode` of `preview` or `submit`; there is no submit default. A preview needs no operator setup:
+
+```json
+{
+  "mode": "preview",
+  "searchEngine": "google",
+  "urls": ["https://example.com/page"]
+}
+```
+
+Choose `google` or `yandex` and supply 1 to 10,000 unique absolute HTTP(S) URL strings. The server preserves their order and spelling; it rejects duplicates, credentials in URLs, whitespace, controls and invalid Unicode. Local bounds are 8,192 UTF-8 bytes per URL, 1,024 per optional title, and 2,097,152 for the serialized provider body. Accepted titles retain spaces; omitted and empty titles differ. Google always uses Pay-Per-Result. Optional Google `dripFeedDays` must be an integer from 2 to 30 and cannot exceed the URL count. Yandex accepts no drip option.
+
+Preview computes the exact payload digest and a quote without opening state, reserving allowance, fetching URLs or calling the provider. For N URLs, the documented-rate estimate reserves Google `{tokens: 100*N, indexer: 0, checker: 0}` or Yandex `{tokens: 20*N, indexer: N, checker: 0}`. Yandex uses indexing credits first; reserving both maxima protects against outside credit consumption and does not predict that both will be charged together. The three units have independent ceilings. These estimates do not enforce a provider wallet cap or account for final charges, refunds or balance observations. See the [official API reference](https://en.speedyindex.com/api.php).
+
+Submit adds a stable caller-selected `requestId` of 1 to 128 visible ASCII characters. In caller acknowledgement mode, also copy `quote.fingerprint` and `authorization.fingerprint` from a fresh configured preview into `acknowledgement.quoteFingerprint` and `acknowledgement.authorizationFingerprint`. These digests detect changed context; an agent can compute them. They do not authenticate a human, consume a one-use approval or bind a distinct request ID. Operators must restrict access to the local host. MCP inputs cannot choose authoritative policy, policy mode, caps, scope, period, clock or paths; unknown fields fail SDK input validation.
+
+Application results contain the request summary, quote and authorization state as structured content and identical JSON text. Preview reports `authorization.stateChecked: false`, even with configuration: it does not prove that state exists or that a later submit will fit. Durable accepted results and previews use `isError: false`; blocked, rejected, unknown, cancelled and unresolved results use `isError: true` with safe structured details. SDK input rejection can happen before the handler and need not include application structured content.
+
+An exact replay of a request ID returns durable state without another POST. Changed payload or policy identity conflicts. A valid provider ACK alone is insufficient if local outcome recording fails: the result separates its unrecorded observation from the held durable state. Prepared, dispatching and unknown intents retain reservations; unresolved exact URLs block another ID. Restart, cancellation, elapsed time and a new UTC day do not release those holds. Inspect unresolved state manually; this tool offers no release, reset, resend or reconciliation command. After an accepted intent, a deliberate new ID can create another job. Local request IDs do not supply provider idempotency or exactly-once creation.
+
+## Optional operator setup
+
+Use only canonical absolute POSIX paths you explicitly select. The state parent must already exist and be trusted. Initialize a new private state directory with this local command, which requires no key, policy, network or MCP session:
+
+```sh
+bun --no-env-file dist/cli.js --init-submission-state '<canonical-absolute-new-directory>'
+```
+
+The command creates version-one `ledger.sqlite` state and prints `{"initialized":true,"schemaVersion":1}`. It refuses existing paths, including broken or partial state, and does not create parents. A failed init may leave files for inspection. Do not replace an existing store to bypass reservations. Normal submit opens existing state only; startup and preview do not open it. Normal open can configure WAL and touch sidecars, including SHM bookkeeping before rejecting a wrong schema version, while preserving existing database data. It performs no repair, bootstrap or reset.
+
+With your key already supplied in the process environment, obtain its expected policy binding locally:
+
+```sh
+bun --no-env-file dist/cli.js --submission-credential-fingerprint
+```
+
+This prints only the domain-separated SHA-256 fingerprint of the trimmed key. It identifies a key, not a verified provider account. Key rotation needs an intentional policy change and does not merge allowance history across keys.
+
+Create a private JSON policy file yourself, with exactly these required fields. No path, policy labels, mode or cap values are selected by this repository:
+
+| Field                           | Operator choice                                                                                                                                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `version`                       | Integer `1`                                                                                                                                                                                                                          |
+| `enabled`                       | Explicit boolean; only `true` permits submissions                                                                                                                                                                                    |
+| `mode`                          | `caller_acknowledgement` requires both preview digests for each new intent; `operator_policy` permits submission under the configured finite policy without an acknowledgement. If supplied, both digests must match in either mode. |
+| `policyRevision`, `budgetScope` | Nonsensitive visible ASCII labels, 1 to 128 characters; cooperating hosts use a common budget scope                                                                                                                                  |
+| `credentialFingerprint`         | The expected 64-character lowercase hex output of the local fingerprint command; never the key                                                                                                                                       |
+| `period`                        | Exactly `{"kind":"utc_day"}`                                                                                                                                                                                                         |
+| `caps`                          | Exactly `{"tokens":…, "indexer":…, "checker":…}`; choose each finite nonnegative safe integer explicitly, including zero where intended                                                                                              |
+
+The file must be at most 16,384 bytes, owned by the effective UID, mode `0600`, regular, non-symlink and single-link. State requires an effective-UID `0700` directory and `0600` regular single-link database/sidecars. Ancestors must be non-symlink directories owned by root or the effective UID, without group/other write access; root-owned sticky temporary directories are allowed. Resolve OS path aliases before supplying paths. The server does not chmod or repair them.
+
+Start the configured host using your chosen paths:
+
+```sh
+bun --no-env-file dist/cli.js \
+  --submission-policy '<canonical-absolute-policy-file>' \
+  --submission-state '<canonical-absolute-existing-state-directory>'
+```
+
+Incomplete or invalid configuration disables submissions while stdio and the read tools remain available. The host loads one immutable policy snapshot. Restart **all cooperating hosts** after any policy change; no reload loop runs. Local fingerprint/init modes are exclusive with each other and with server flags. Unknown, duplicate or missing-value arguments produce a fixed syntax error.
+
+The host derives the reservation day from its own UTC clock. Policy digests bind all three caps and the expected key, excluding the current day. Accepted reservations count for their original reservation day; prepared, dispatching and unknown reservations count across days. Policy revisions do not reset exposure. Only cooperating processes sharing the same canonical local store, key fingerprint and budget scope share this allowance. Other keys, copied databases, machines and external clients can spend outside it.
+
+SQLite calls are synchronous. Contention can block stdio parsing, reads, pings and cancellation until the call returns; the 2,000 ms busy timeout is not a whole-tool latency limit. The host yields to actual I/O turns after prepare and after winning the claim, then checks cancellation before dispatch. These boundaries do not interrupt running SQL or guarantee atomic remote cancellation. The HTTP 10-second deadline covers the attempted request and response body, not the full tool call. A cancellation after invocation may leave an unknown held outcome; a fully parsed valid ACK remains recordable despite later cancellation. See [architecture](docs/architecture.md) for the state and persistence boundaries.
 
 ## Development
 
@@ -99,7 +167,7 @@ The tests use dummy credentials, loopback HTTP fixtures, the official MCP client
 
 See [architecture](docs/architecture.md), [dependency decisions](docs/dependencies.md), [contributing](CONTRIBUTING.md), [security reporting](SECURITY.md), [agent guidance](AGENTS.md), and the [LLM documentation index](llms.txt).
 
-The other 8 tools remain in the [roadmap](docs/implementation-plan.md). An internal SQLite ledger is an unexposed prerequisite for later submission work; the runtime does not open or initialize it. Task creation, provider submission, invoices, retries, runtime storage, and scheduling remain unimplemented.
+The other seven tools remain in the [roadmap](docs/implementation-plan.md). Retry planning/submission, index/backlink checks, campaign reporting, invoices, and one-shot automation or scheduling remain unimplemented. The current version-one ledger records standalone submissions without campaign/parent lineage; a future additive version-two migration needs separate design and verification and must preserve existing holds.
 
 Licensed under [MIT](LICENSE). Documentation framework attribution is in [provenance](docs/provenance.md).
 

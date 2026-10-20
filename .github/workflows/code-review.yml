@@ -15,7 +15,7 @@ jobs:
   review:
     uses: antongulin/robin/.github/workflows/review.yml@0fad708fadf57a1603b834f5e50162e87a71a79c # v2.12.1
     with:
-      max-diff-size: '160000'
+      max-diff-size: '300000'
     secrets:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}

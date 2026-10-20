@@ -1,6 +1,6 @@
 # Implementation plan
 
-The Bun/TypeScript stdio foundation implements `get_balance`, `list_tasks`, `get_task_status`, and `get_task_report`. The other 8 tools remain planned and unimplemented. No package or release is published.
+The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_task_status`, `get_task_report`, and guarded `create_indexing_task`. The other seven tools remain planned and unimplemented. No package or release is published.
 
 | Order       | Planned tool            | Intended scope                                       |
 | ----------- | ----------------------- | ---------------------------------------------------- |
@@ -8,7 +8,7 @@ The Bun/TypeScript stdio foundation implements `get_balance`, `list_tasks`, `get
 | Implemented | `list_tasks`            | Read one validated page of existing tasks            |
 | Implemented | `get_task_status`       | Read existing task status by family and task ID      |
 | Implemented | `get_task_report`       | Read one report; one bounded backlink page           |
-| Later       | `create_indexing_task`  | Submit URLs for indexing                             |
+| Implemented | `create_indexing_task`  | Pure preview; explicitly configured guarded indexing |
 | Later       | `create_index_check`    | Submit an index-status check                         |
 | Later       | `create_backlink_check` | Submit a backlink check                              |
 | Later       | `plan_retry`            | Prepare a retry proposal without submitting it       |
@@ -17,9 +17,9 @@ The Bun/TypeScript stdio foundation implements `get_balance`, `list_tasks`, `get
 | Later       | `summarize_campaigns`   | Summarize related task outcomes                      |
 | Later       | `get_retry_history`     | Inspect recorded retry activity                      |
 
-The current runtime exposes all four implemented tools. See [README.md](../README.md) for build/run commands and [architecture](architecture.md) for validation, cancellation, and error boundaries. Synthetic HTTP and real stdio tests exercise the provider contract and built CLI without live provider calls.
+The current runtime exposes all five implemented tools. Writes are disabled by default. Operators explicitly choose private policy/state paths, expected key binding and finite independent token/indexer/checker caps; no active configuration is selected here. Startup/preview never open state, and only the local new-only init command creates it. See [README.md](../README.md) for setup and [architecture](architecture.md) for validation, cancellation and persistence boundaries. Synthetic HTTP, real SQLite/process tests and SDK source/built journeys exercise these contracts without live provider calls.
 
-Later submissions and retries need explicit action boundaries, input validation, cost visibility, and protection against accidental duplicate jobs. The internal ledger establishes local request and reservation state; tool-specific policy, quote, lineage, and campaign-reporting contracts still need scoped work.
+Standalone create uses immutable policy snapshots, UTC reservation periods, local request replay and retained uncertain holds. It does not supply provider idempotency, human authentication or campaign/parent lineage. Later tools need their own action boundaries and source/eligibility proof. An additive V2 relation table and explicit offline migration must preserve all V1 records, events, holds and dispatch ownership, leave unattributed legacy rows unknown, and insert new relations with preparation atomically. No V2 schema, migration or retry API is implemented; never reset V1 state to add lineage.
 
 ## Planned retry workflow
 
@@ -29,8 +29,8 @@ This workflow is unimplemented and not activated. The current `get_task_report` 
 - Deduplicate exact URL strings, preserving query strings and trailing-slash semantics. Exclude any URL already present in any active regular or drip task, and never treat the workflow's own retry child as a new source.
 - Preview the selected source, candidate URLs, skipped URLs with reasons, and estimated token cost before any provider write. Keep source selection, approval, submission, and observation as separate states.
 - Require configured finite retry and token allowances before submission. No numeric retry or token budget is approved here.
-- Use a one-shot deterministic core shared by MCP and the existing scheduler. No LLM, browser, or extra service is required at runtime; this foundation adds no scheduler or activated schedule.
-- Use the internal local SQLite submission-ledger prerequisite for durable request identity, reservations, and dispatch state. The current runtime does not open or initialize it. Provider idempotency is not documented, so a later tool contract must resolve unknown outcomes before retrying a submission.
+- Build a one-shot deterministic core for MCP and later explicit scheduler invocation. This workflow has no runtime LLM or browser dependency. Neither that core nor scheduling is implemented or activated here.
+- Reuse the local SQLite submission ledger for durable request identity, reservations and dispatch state, with separately accepted lineage and retry eligibility. Provider idempotency is not documented; current unknown/dispatching/prepared holds permit no automatic resend, expiry or release. A future retry tool must establish eligibility without bypassing those holds.
 - Observe provider results separately from submission. A terminal provider result records that provider's outcome and does not establish fresh Google indexing truth.
 
 ## Review and delivery
