@@ -9,3 +9,9 @@
 - [Contributing](https://github.com/antongulin/speedyindex-mcp/blob/main/CONTRIBUTING.md): Development and review
 - [Security](https://github.com/antongulin/speedyindex-mcp/blob/main/SECURITY.md): Private reporting
 - [Agent contract](https://github.com/antongulin/speedyindex-mcp/blob/main/AGENTS.md): Repository instructions
+
+## Official provider resources
+
+- [SpeedyIndex](https://speedyindex.com/): Official provider website; this MCP integration is unofficial
+- [Public API reference](https://en.speedyindex.com/api.php): Official provider API documentation
+- [API key setup](https://app.speedyindex.com/cabinet/api): Official API page; sign in to obtain your key

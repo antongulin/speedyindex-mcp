@@ -1,6 +1,9 @@
 # SpeedyIndex MCP
 
-An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server that reads your SpeedyIndex account balances.
+An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server that reads your [SpeedyIndex](https://speedyindex.com/) account balances.
+
+[![CI](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 The Bun/TypeScript foundation exposes **`get_balance` only** over stdio. It returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published.
 
@@ -15,6 +18,8 @@ bun install --frozen-lockfile
 bun run build
 bun dist/cli.js --help
 ```
+
+Sign in to the [official SpeedyIndex API page](https://app.speedyindex.com/cabinet/api) to obtain your own API key. See the [public API reference](https://en.speedyindex.com/api.php) for provider documentation.
 
 Provide `SPEEDYINDEX_API_KEY` through your process manager's secret environment, then launch `bun dist/cli.js` from the repository directory. It waits for an MCP client on stdin/stdout; it is not an interactive shell command. `bun run start` runs the source entrypoint during development. `.env.example` documents the variable without containing a real credential.
 
@@ -49,7 +54,11 @@ bun run test:built
 
 The tests use dummy credentials, loopback HTTP fixtures, the official MCP client, and actual source/built CLI subprocesses. They do not contact SpeedyIndex. `bun run format` formats maintained files while preserving the upstream DOX notice.
 
-See [architecture](docs/architecture.md), [dependency decisions](docs/dependencies.md), [contributing](CONTRIBUTING.md), [security reporting](SECURITY.md), and [agent guidance](AGENTS.md). The other 11 tools remain in the [roadmap](docs/implementation-plan.md); no task submission, checking, invoices, retries, storage, or scheduling is implemented.
+## Documentation
+
+See [architecture](docs/architecture.md), [dependency decisions](docs/dependencies.md), [contributing](CONTRIBUTING.md), [security reporting](SECURITY.md), [agent guidance](AGENTS.md), and the [LLM documentation index](llms.txt).
+
+The other 11 tools remain in the [roadmap](docs/implementation-plan.md); no task submission, checking, invoices, retries, storage, or scheduling is implemented.
 
 Licensed under [MIT](LICENSE). Documentation framework attribution is in [provenance](docs/provenance.md).
 
