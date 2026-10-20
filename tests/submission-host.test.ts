@@ -20,7 +20,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   buildCreateIndexingRequest,
   createIndexingTaskResultSchema,
@@ -96,6 +96,113 @@ const paths = new Set([
   '/v2/task/google/indexer/create',
   '/v2/task/yandex/indexer/create',
 ]);
+
+type ChildMode =
+  | 'normal'
+  | 'already_aborted'
+  | 'abort_after_prepare'
+  | 'stop_after_prepare'
+  | 'abort_after_claim'
+  | 'stop_after_claim'
+  | 'abort_before_record'
+  | 'read_fault_after_write_failure';
+function spawnHostProcess() {
+  return Bun.spawn(
+    [
+      process.execPath,
+      '--no-env-file',
+      resolve('tests/fixtures/submission-host-child.ts'),
+    ],
+    {
+      cwd: process.cwd(),
+      env: {},
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
+}
+type HostProcess = ReturnType<typeof spawnHostProcess>;
+interface HostChild {
+  process: HostProcess;
+  reader: ReadableStreamDefaultReader<Uint8Array>;
+  stderr: Promise<string>;
+  decoder: TextDecoder;
+  buffer: string;
+  messages: Record<string, unknown>[];
+  operations: Promise<unknown>[];
+}
+async function childControl(child: HostChild, event: 'GO' | 'CANCEL') {
+  child.process.stdin.write(`${JSON.stringify({ event })}\n`);
+  await child.process.stdin.flush();
+}
+async function startHostChild(
+  setup: Record<string, unknown>,
+  registry: HostProcess[],
+  streams: HostChild[],
+) {
+  const process = spawnHostProcess();
+  // Register the raw handle before stream setup, serialization, writing or
+  // flushing: every startup failure must still leave a reapable owned child.
+  registry.push(process);
+  const child: HostChild = {
+    process,
+    reader: process.stdout.getReader(),
+    stderr: new Response(process.stderr).text(),
+    decoder: new TextDecoder(),
+    buffer: '',
+    messages: [],
+    operations: [],
+  };
+  streams.push(child);
+  process.stdin.write(`${JSON.stringify(setup)}\n`);
+  await process.stdin.flush();
+  expect(await childEvent(child, 'READY')).toEqual({ event: 'READY' });
+  return child;
+}
+async function childEvent(child: HostChild, event: string) {
+  while (true) {
+    const end = child.buffer.indexOf('\n');
+    if (end < 0) {
+      const chunk = await bounded(child.reader.read(), 8_000);
+      if (chunk.done) throw new Error('Host child closed before its phase.');
+      child.buffer += child.decoder.decode(chunk.value, { stream: true });
+      continue;
+    }
+    const message = JSON.parse(child.buffer.slice(0, end)) as Record<
+      string,
+      unknown
+    >;
+    child.buffer = child.buffer.slice(end + 1);
+    child.messages.push(message);
+    if (message.event === 'ERROR')
+      throw new Error('Host child fixture failed.');
+    if (message.event === event) return message;
+  }
+}
+function childResult(child: HostChild) {
+  const operation = readChildResult(child);
+  child.operations.push(operation);
+  return operation;
+}
+async function readChildResult(child: HostChild) {
+  const message = await childEvent(child, 'RESULT');
+  expect(await bounded(child.process.exited, 5_000)).toBe(0);
+  expect(await bounded(child.stderr)).toBe('');
+  expect(message.violations).toBe(0);
+  const result = message.result as CreateIndexingTaskResult;
+  expect(createIndexingTaskResultSchema.safeParse(result).success).toBe(true);
+  expect(result.error?.code).not.toBe('InternalError');
+  for (const secret of [key, fp, 'dispatchCapability', 'outcomeToken'])
+    expect(JSON.stringify(child.messages).includes(secret)).toBe(false);
+  return { result, fetchInvocations: message.fetchInvocations as number };
+}
+async function killHostChild(child: HostChild) {
+  child.process.kill('SIGKILL');
+  await bounded(child.process.exited, 5_000);
+  expect(child.process.signalCode).toBe('SIGKILL');
+  expect(await bounded(child.stderr)).toBe('');
+}
 function sha(value: string) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
@@ -156,6 +263,10 @@ async function makeHarness() {
   const handlerErrors: unknown[] = [];
   const controllers: AbortController[] = [];
   const pending: Promise<unknown>[] = [];
+  const receivers: Promise<unknown>[] = [];
+  const children: HostProcess[] = [];
+  const childStreams: HostChild[] = [];
+  const locks: (() => void)[] = [];
   const fences: ReturnType<typeof deferred<void>>[] = [];
   const received = deferred<void>();
   let now = day1,
@@ -174,7 +285,7 @@ async function makeHarness() {
   let api: Awaited<ReturnType<typeof fixture>>;
   try {
     api = await fixture((incoming, response) => {
-      void readBody(incoming)
+      const receiving = readBody(incoming)
         .then(async (body) => {
           const record = {
             body,
@@ -193,6 +304,7 @@ async function makeHarness() {
           handlerErrors.push(error);
           response.destroy();
         });
+      receivers.push(receiving);
     });
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
@@ -361,6 +473,42 @@ async function makeHarness() {
     rows,
     seed,
     fetchRequest,
+    async child(input: unknown, mode: ChildMode = 'normal') {
+      return startHostChild(
+        {
+          stateDirectory,
+          policyPath,
+          apiKey: key,
+          origin: api.origin,
+          now,
+          input,
+          mode,
+        },
+        children,
+        childStreams,
+      );
+    },
+    writerLock() {
+      const db = new Database(
+        join(stateDirectory, 'ledger.sqlite'),
+        sqliteConstants.SQLITE_OPEN_READWRITE |
+          sqliteConstants.SQLITE_OPEN_NOFOLLOW,
+      );
+      let closed = false;
+      const release = () => {
+        if (!closed) {
+          try {
+            if (db.inTransaction) db.exec('ROLLBACK');
+          } finally {
+            db.close();
+            closed = true;
+          }
+        }
+      };
+      locks.push(release);
+      db.exec('BEGIN IMMEDIATE');
+      return release;
+    },
     get attempts() {
       return attempts;
     },
@@ -385,13 +533,63 @@ async function makeHarness() {
       return fence;
     },
     async close() {
+      const errors: unknown[] = [];
+      for (const release of locks) {
+        try {
+          release();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
       for (const controller of controllers) controller.abort();
       for (const fence of fences) fence.resolve();
       let settled = false;
-      const errors: unknown[] = [];
+      const reaped = await Promise.allSettled(
+        children.map(async (child) => {
+          // SIGTERM cannot resume a SIGSTOP'ed child. All handles in this
+          // registry belong to this fixture, including incomplete startup.
+          try {
+            if (child.exitCode === null && child.signalCode === null)
+              child.kill('SIGKILL');
+            await bounded(child.exited, 5_000);
+          } finally {
+            await bounded(Promise.resolve(child.stdin.end()), 5_000);
+          }
+        }),
+      );
+      for (const result of reaped)
+        if (result.status === 'rejected') errors.push(result.reason);
+      const drained = await Promise.allSettled(
+        childStreams.map(async (child) => {
+          const closed = await Promise.allSettled([
+            bounded(child.stderr, 5_000).then((stderr) => {
+              if (stderr !== '')
+                throw new Error('Host child emitted unexpected stderr.');
+            }),
+            (async () => {
+              try {
+                await bounded(child.reader.cancel(), 5_000);
+              } finally {
+                child.reader.releaseLock();
+              }
+            })(),
+            bounded(Promise.allSettled(child.operations), 5_000),
+          ]);
+          const failures = closed.filter(
+            (result) => result.status === 'rejected',
+          );
+          if (failures.length)
+            throw new AggregateError(
+              failures.map((result) => result.reason),
+              'Host child stream cleanup failed.',
+            );
+        }),
+      );
+      for (const result of drained)
+        if (result.status === 'rejected') errors.push(result.reason);
       try {
-        await bounded(Promise.allSettled(pending), 5_000);
-        settled = true;
+        await bounded(Promise.allSettled([...pending, ...receivers]), 5_000);
+        settled = errors.length === 0;
       } catch (error) {
         errors.push(error);
       }
@@ -401,18 +599,18 @@ async function makeHarness() {
         errors.push(error);
       }
       allowedOrigins.delete(api.origin);
-      if (settled) {
+      errors.push(...handlerErrors);
+      if (settled && errors.length === 0) {
         try {
           rmSync(root, { recursive: true, force: true });
         } catch (error) {
           errors.push(error);
         }
       }
-      errors.push(...handlerErrors);
       if (errors.length)
         throw new AggregateError(
           errors,
-          'Test-owned host cleanup or receiver failed.',
+          `Test-owned host cleanup or receiver failed; unsettled state preserved at ${root}.`,
         );
     },
   };
@@ -1487,3 +1685,572 @@ test('C09 HOST: a throwing transport invocation is attempted/unknown, never refl
     assertNoPrivate(result, h);
   });
 });
+
+type HostHarness = Awaited<ReturnType<typeof makeHarness>>;
+function events(h: HostHarness, id: string) {
+  return h.rows<{ event_kind: string; state_version: number }>(
+    'SELECT event_kind, state_version FROM intent_events WHERE request_id = ? ORDER BY state_version',
+    id,
+  );
+}
+function heldTokens(h: HostHarness) {
+  return h.rows<{ tokens: number }>(
+    "SELECT coalesce(sum(reserved_tokens), 0) AS tokens FROM intents WHERE state IN ('prepared','dispatching','unknown')",
+  )[0]!.tokens;
+}
+
+async function runChild(
+  h: HostHarness,
+  input: unknown,
+  mode: ChildMode = 'normal',
+) {
+  const child = await h.child(input, mode);
+  await childControl(child, 'GO');
+  return { child, ...(await childResult(child)) };
+}
+function expectDispatchHeld(h: HostHarness, input: ReturnType<typeof request>) {
+  expect(h.read(input.requestId)).toMatchObject({
+    state: 'dispatching',
+    stateVersion: 1,
+    reservation: { tokens: 100, indexer: 0, checker: 0 },
+  });
+  expect(events(h, input.requestId)).toEqual([
+    { event_kind: 'prepared', state_version: 0 },
+    { event_kind: 'dispatching', state_version: 1 },
+  ]);
+  expect(heldTokens(h)).toBe(100);
+  expect(
+    h.rows(
+      'SELECT url_text FROM intent_urls WHERE request_id = ? ORDER BY ordinal',
+      input.requestId,
+    ),
+  ).toEqual(input.urls.map((url_text) => ({ url_text })));
+}
+async function expectHeldRestart(
+  h: HostHarness,
+  input: ReturnType<typeof request>,
+  state: 'prepared' | 'dispatching' | 'unknown',
+) {
+  const before = events(h, input.requestId);
+  const posts = h.records.length;
+  const replay = await runChild(h, input);
+  expect(replay.fetchInvocations).toBe(0);
+  expect(replay.result.status).toBe(state);
+  expect(replay.result.replayed).toBe(true);
+  expect(replay.result.observation).toBeUndefined();
+  assertNoPrivate(replay.result, h);
+  const overlap = await runChild(h, {
+    ...input,
+    requestId: `${input.requestId}-overlap`,
+  });
+  expect(overlap.fetchInvocations).toBe(0);
+  expect(overlap.result.error?.code).toBe('UrlOverlap');
+  expect(h.read(`${input.requestId}-overlap`)).toBeNull();
+  expect(events(h, input.requestId)).toEqual(before);
+  expect(heldTokens(h)).toBe(100);
+  expect(h.records).toHaveLength(posts);
+}
+
+for (const variant of [
+  'same body',
+  'different body',
+  'finite cap',
+  'held URL',
+] as const) {
+  test(`C07 HOST: two real children race with ${variant} and only one POST`, async () => {
+    await withHost(async (h) => {
+      h.init();
+      h.config({
+        caps: {
+          tokens: variant === 'finite cap' ? 100 : 1_000,
+          indexer: 0,
+          checker: 0,
+        },
+      });
+      const first = request('race-a');
+      const second =
+        variant === 'same body'
+          ? first
+          : variant === 'different body'
+            ? { ...first, title: 'other synthetic title' }
+            : request(
+                'race-b',
+                variant === 'finite cap'
+                  ? ['https://example.test/two']
+                  : first.urls,
+              );
+      const children = [await h.child(first), await h.child(second)];
+      const ackFence = h.fence();
+      h.handler = async (_receipt, response) => {
+        await ackFence.promise;
+        response.end(
+          JSON.stringify({
+            code: 0,
+            task_id: 'race-winner',
+            type: 'google/indexer',
+          }),
+        );
+      };
+      await Promise.all(children.map((child) => childControl(child, 'GO')));
+      const outcomes = children.map(async (child, index) => ({
+        index,
+        ...(await childResult(child)),
+      }));
+      await bounded(h.received.promise, 8_000);
+      const loser = await bounded(Promise.race(outcomes), 8_000);
+      expect(loser.fetchInvocations).toBe(0);
+      if (variant === 'same body') {
+        expect(loser.result.replayed).toBe(true);
+        expect(['prepared', 'dispatching']).toContain(loser.result.status);
+      } else
+        expect(loser.result.error?.code).toBe(
+          variant === 'different body'
+            ? 'RequestIdConflict'
+            : variant === 'finite cap'
+              ? 'BudgetExceeded'
+              : 'UrlOverlap',
+        );
+      const rows = h.rows<{
+        request_id: string;
+        payload_digest: string;
+        reserved_tokens: number;
+        reserved_indexer: number;
+        reserved_checker: number;
+        state: string;
+        state_version: number;
+      }>(
+        'SELECT request_id, payload_digest, reserved_tokens, reserved_indexer, reserved_checker, state, state_version FROM intents',
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        state: 'dispatching',
+        state_version: 1,
+        reserved_tokens: 100,
+        reserved_indexer: 0,
+        reserved_checker: 0,
+      });
+      expect(heldTokens(h)).toBe(100);
+      expect(
+        h.rows('SELECT budget_scope, period_id FROM budget_periods'),
+      ).toEqual([
+        { budget_scope: 'fixture-scope', period_id: 'utc-day:2026-10-20' },
+      ]);
+      expect(h.records).toHaveLength(1);
+      const wire = h.records[0]!;
+      const winnerInput = loser.index === 0 ? second : first;
+      const expectedBody = `${'title' in winnerInput ? '{"title":"other synthetic title",' : '{'}"urls":["${winnerInput.urls[0]}"],"pay_per_indexed":true,"drip_feed":false}`;
+      expect(wire.body).toBe(expectedBody);
+      expect(rows[0]!.payload_digest).toBe(sha(expectedBody));
+      expect(wire).toMatchObject({
+        method: 'POST',
+        path: '/v2/task/google/indexer/create',
+        auth: key,
+        contentType: 'application/json',
+        accept: 'application/json',
+        agent: 'speedyindex-mcp/0.1.0',
+      });
+      expect(h.rows('SELECT url_text FROM intent_urls')).toEqual([
+        { url_text: winnerInput.urls[0] },
+      ]);
+      expect(events(h, rows[0]!.request_id)).toEqual([
+        { event_kind: 'prepared', state_version: 0 },
+        { event_kind: 'dispatching', state_version: 1 },
+      ]);
+      ackFence.resolve();
+      const settled = await Promise.all(outcomes);
+      const winner = settled.find((value) => value.index !== loser.index)!;
+      expect(winner.fetchInvocations).toBe(1);
+      expect(winner.result.status).toBe('accepted');
+      expect(h.read(rows[0]!.request_id)).toMatchObject({
+        state: 'accepted',
+        stateVersion: 2,
+        providerTaskId: 'race-winner',
+      });
+      expect(events(h, rows[0]!.request_id)).toEqual([
+        { event_kind: 'prepared', state_version: 0 },
+        { event_kind: 'dispatching', state_version: 1 },
+        { event_kind: 'accepted', state_version: 2 },
+      ]);
+      const replay = await runChild(h, winnerInput);
+      expect(replay.fetchInvocations).toBe(0);
+      expect(replay.result.status).toBe('accepted');
+      expect(replay.result.replayed).toBe(true);
+      expect(h.records).toHaveLength(1);
+      expect(h.rows('SELECT request_id FROM intents')).toHaveLength(1);
+      expect(events(h, rows[0]!.request_id)).toHaveLength(3);
+      for (const value of settled) assertNoPrivate(value.result, h);
+    });
+  }, 30_000);
+}
+
+for (const finalReadFault of [false, true]) {
+  test(`C10 HOST: real outcome busy timeout preserves dispatching${finalReadFault ? ' with narrow final-read fault' : ''}`, async () => {
+    await withHost(async (h) => {
+      h.init();
+      h.config();
+      const ackFence = h.fence();
+      h.handler = async (_receipt, response) => {
+        await ackFence.promise;
+        response.end(
+          JSON.stringify({
+            code: 0,
+            task_id: 'ack-not-recorded',
+            type: 'google/indexer',
+          }),
+        );
+      };
+      const input = request('outcome-busy');
+      const child = await h.child(
+        input,
+        finalReadFault ? 'read_fault_after_write_failure' : 'normal',
+      );
+      await childControl(child, 'GO');
+      await bounded(h.received.promise, 8_000);
+      expect(h.records[0]!.body).toBe(
+        '{"urls":["https://example.test/one"],"pay_per_indexed":true,"drip_feed":false}',
+      );
+      expectDispatchHeld(h, input);
+      const release = h.writerLock();
+      // Keep this actual independent BEGIN IMMEDIATE until the child has
+      // finished its own synchronous 2000 ms record attempt and projection.
+      ackFence.resolve();
+      const observed = await childResult(child);
+      expect(observed.fetchInvocations).toBe(1);
+      expect(child.messages.filter((m) => m.event === 'RECORD_ENTER')).toEqual([
+        { event: 'RECORD_ENTER', outcome: 'accepted' },
+      ]);
+      const failures = child.messages.filter((m) => m.event === 'WRITE_FAILED');
+      console.info(
+        'C10 phase evidence',
+        JSON.stringify({
+          finalReadFault,
+          phases: child.messages.map((message) => message.event),
+          writeFailure: failures[0],
+          status: observed.result.status,
+          error: observed.result.error?.code,
+          observation: observed.result.observation,
+        }),
+      );
+      expect(failures).toHaveLength(1);
+      // BEGIN IMMEDIATE fails before the core's outcome transaction starts.
+      expect(failures[0]!.code).toBe('LedgerBusy');
+      expect(typeof failures[0]!.elapsedMs).toBe('number');
+      expect(observed.result.status).toBe(
+        finalReadFault ? 'blocked' : 'dispatching',
+      );
+      expect(observed.result.error?.code).toBe(
+        finalReadFault ? 'StateUnavailable' : 'OutcomePersistenceFailed',
+      );
+      expect(observed.result.observation).toEqual({
+        kind: 'accepted_ack',
+        recorded: false,
+        taskId: 'ack-not-recorded',
+        type: 'google/indexer',
+      });
+      if (finalReadFault) {
+        expect(observed.result.error?.lastObservedState).toBe('dispatching');
+        expect(observed.result.intent).toBeUndefined();
+        expect(
+          child.messages.filter((m) => m.event === 'FINAL_READ_FAULT'),
+        ).toHaveLength(1);
+      } else expect(observed.result.intent?.stateVersion).toBe(1);
+      release();
+      // Independent file/ledger reads after lock release, never a canned
+      // recordDispatchOutcome failure or a fabricated successful commit.
+      expectDispatchHeld(h, input);
+      expect(
+        h.rows('SELECT provider_task_id, provider_type FROM intents'),
+      ).toEqual([{ provider_task_id: null, provider_type: null }]);
+      await expectHeldRestart(h, input, 'dispatching');
+      expectDispatchHeld(h, input);
+      expect(h.records).toHaveLength(1);
+      assertNoPrivate(observed.result, h);
+    });
+  }, 30_000);
+}
+
+test('C11 HOST: SIGKILL after full HTTP receipt leaves dispatching held across fresh children', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config();
+    const ackFence = h.fence();
+    h.handler = async (_receipt, response) => {
+      await ackFence.promise;
+      response.end(
+        JSON.stringify({
+          code: 0,
+          task_id: 'abandoned-ack',
+          type: 'google/indexer',
+        }),
+      );
+    };
+    const input = request('killed-after-receipt');
+    const child = await h.child(input);
+    await childControl(child, 'GO');
+    await bounded(h.received.promise, 8_000);
+    expect(h.records[0]!.body).toBe(
+      '{"urls":["https://example.test/one"],"pay_per_indexed":true,"drip_feed":false}',
+    );
+    await childEvent(child, 'FETCH_INVOKED');
+    expectDispatchHeld(h, input);
+    await killHostChild(child);
+    expectDispatchHeld(h, input);
+    await expectHeldRestart(h, input, 'dispatching');
+    expectDispatchHeld(h, input);
+    expect(h.records).toHaveLength(1);
+  });
+}, 30_000);
+
+test('C12 HOST: already-aborted input creates no intent and no POST', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config();
+    const observed = await runChild(
+      h,
+      request('already-aborted'),
+      'already_aborted',
+    );
+    expect(observed.result.status).toBe('blocked');
+    expect(observed.result.error?.code).toBe('Cancelled');
+    expect(observed.fetchInvocations).toBe(0);
+    expect(h.rows('SELECT request_id FROM intents')).toEqual([]);
+    expect(h.rows('SELECT event_id FROM intent_events')).toEqual([]);
+    expect(h.rows('SELECT period_id FROM budget_periods')).toEqual([]);
+    expect(h.records).toHaveLength(0);
+  });
+}, 30_000);
+
+test('C12 HOST: abort after real prepare commits uses cancelled CAS before releasing its hold', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config({ caps: { tokens: 100, indexer: 0, checker: 0 } });
+    const input = request('cancel-prepared');
+    const observed = await runChild(h, input, 'abort_after_prepare');
+    expect(observed.fetchInvocations).toBe(0);
+    expect(observed.result.status).toBe('cancelled');
+    expect(observed.result.observation).toBeUndefined();
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'cancelled',
+      stateVersion: 1,
+    });
+    expect(events(h, input.requestId)).toEqual([
+      { event_kind: 'prepared', state_version: 0 },
+      { event_kind: 'cancelled', state_version: 1 },
+    ]);
+    expect(heldTokens(h)).toBe(0);
+    expect(h.records).toHaveLength(0);
+    const next = await runChild(h, { ...input, requestId: 'after-cancel' });
+    expect(next.result.status).toBe('accepted');
+    expect(next.fetchInvocations).toBe(1);
+    expect(h.records).toHaveLength(1);
+  });
+}, 30_000);
+
+test('C12 HOST: killed prepared owner loses its capability and leaves a genuine held orphan', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config();
+    const input = request('killed-prepared');
+    const child = await h.child(input, 'stop_after_prepare');
+    await childControl(child, 'GO');
+    await childEvent(child, 'PREPARED_STOP');
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'prepared',
+      stateVersion: 0,
+    });
+    expect(heldTokens(h)).toBe(100);
+    await killHostChild(child);
+    expect(child.messages.some((m) => m.event === 'FETCH_INVOKED')).toBe(false);
+    expect(events(h, input.requestId)).toEqual([
+      { event_kind: 'prepared', state_version: 0 },
+    ]);
+    await expectHeldRestart(h, input, 'prepared');
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'prepared',
+      stateVersion: 0,
+    });
+    expect(h.records).toHaveLength(0);
+  });
+}, 30_000);
+
+test('C13 HOST: direct abort after real claim records rejected not_sent without a fetch invocation', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config({ caps: { tokens: 100, indexer: 0, checker: 0 } });
+    const input = request('claimed-no-send');
+    const observed = await runChild(h, input, 'abort_after_claim');
+    expect(observed.fetchInvocations).toBe(0);
+    expect(observed.result.status).toBe('rejected');
+    expect(observed.result.error?.code).toBe('Cancelled');
+    expect(observed.result.observation).toEqual({
+      kind: 'not_sent',
+      recorded: true,
+      cause: 'cancelled',
+    });
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'rejected',
+      stateVersion: 2,
+    });
+    expect(events(h, input.requestId)).toEqual([
+      { event_kind: 'prepared', state_version: 0 },
+      { event_kind: 'dispatching', state_version: 1 },
+      { event_kind: 'rejected', state_version: 2 },
+    ]);
+    expect(heldTokens(h)).toBe(0);
+    expect(h.records).toHaveLength(0);
+    const next = await runChild(h, { ...input, requestId: 'after-not-sent' });
+    expect(next.result.status).toBe('accepted');
+    expect(next.fetchInvocations).toBe(1);
+    expect(h.records).toHaveLength(1);
+  });
+}, 30_000);
+
+test('C13 HOST: cancellation after full HTTP arrival records unknown and retains the hold', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config();
+    const ackFence = h.fence();
+    h.handler = async (_receipt, response) => {
+      await ackFence.promise;
+      response.end(
+        JSON.stringify({
+          code: 0,
+          task_id: 'too-late-ack',
+          type: 'google/indexer',
+        }),
+      );
+    };
+    const input = request('cancel-at-receiver');
+    const child = await h.child(input);
+    await childControl(child, 'GO');
+    await bounded(h.received.promise, 8_000);
+    expectDispatchHeld(h, input);
+    await childControl(child, 'CANCEL');
+    const observed = await childResult(child);
+    expect(observed.fetchInvocations).toBe(1);
+    expect(observed.result.status).toBe('unknown');
+    expect(observed.result.observation).toEqual({
+      kind: 'ambiguous',
+      recorded: true,
+      cause: 'cancelled',
+    });
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'unknown',
+      stateVersion: 2,
+    });
+    expect(events(h, input.requestId)).toEqual([
+      { event_kind: 'prepared', state_version: 0 },
+      { event_kind: 'dispatching', state_version: 1 },
+      { event_kind: 'unknown', state_version: 2 },
+    ]);
+    await expectHeldRestart(h, input, 'unknown');
+    expect(h.records).toHaveLength(1);
+  });
+}, 30_000);
+
+test('C13 HOST: parsed valid ACK is persisted accepted despite abort immediately before the real record', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config();
+    const input = request('ack-before-abort');
+    const observed = await runChild(h, input, 'abort_before_record');
+    expect(observed.fetchInvocations).toBe(1);
+    expect(
+      observed.child.messages.filter((m) => m.event === 'ABORT_BEFORE_RECORD'),
+    ).toEqual([{ event: 'ABORT_BEFORE_RECORD', outcome: 'accepted' }]);
+    expect(observed.result.status).toBe('accepted');
+    expect(observed.result.observation).toEqual({
+      kind: 'accepted_ack',
+      recorded: true,
+      taskId: 'provider-1',
+      type: 'google/indexer',
+    });
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'accepted',
+      stateVersion: 2,
+      providerTaskId: 'provider-1',
+      providerType: 'google/indexer',
+    });
+    expect(events(h, input.requestId)).toEqual([
+      { event_kind: 'prepared', state_version: 0 },
+      { event_kind: 'dispatching', state_version: 1 },
+      { event_kind: 'accepted', state_version: 2 },
+    ]);
+    const replay = await runChild(h, input);
+    expect(replay.result.status).toBe('accepted');
+    expect(replay.result.replayed).toBe(true);
+    expect(replay.fetchInvocations).toBe(0);
+    expect(h.records).toHaveLength(1);
+  });
+}, 30_000);
+
+test('C13-Q HOST: queued stdin cancellation after committed claim is serviced before fetch', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config();
+    const ackFence = h.fence();
+    h.handler = async (_receipt, response) => {
+      await ackFence.promise;
+      response.end(
+        JSON.stringify({
+          code: 0,
+          task_id: 'queued-ack',
+          type: 'google/indexer',
+        }),
+      );
+    };
+    const input = request('queued-cancel');
+    const child = await h.child(input, 'stop_after_claim');
+    await childControl(child, 'GO');
+    await childEvent(child, 'CLAIMED_STOP');
+    // The actual claim is already committed. Queue and flush cancellation
+    // while this owned child is stopped, then let its concurrent reader run.
+    expect(h.read(input.requestId)?.state).toBe('dispatching');
+    expect(heldTokens(h)).toBe(100);
+    await childControl(child, 'CANCEL');
+    process.kill(child.process.pid, 'SIGCONT');
+    const observed = await childResult(child);
+    expect(child.messages.some((m) => m.event === 'CANCEL_APPLIED')).toBe(true);
+    expect(child.messages.find((m) => m.event === 'RESUMED')).toEqual({
+      event: 'RESUMED',
+      after: 'CLAIMED_STOP',
+    });
+    expect(
+      child.messages.findIndex((m) => m.event === 'CANCEL_APPLIED'),
+    ).toBeLessThan(child.messages.findIndex((m) => m.event === 'RECORD_ENTER'));
+    const durable = h.read(input.requestId);
+    const facts = {
+      fetchInvocations: observed.fetchInvocations,
+      posts: h.records.length,
+      status: observed.result.status,
+      observation: observed.result.observation,
+      state: durable?.state,
+      version: durable?.stateVersion,
+      events: events(h, input.requestId),
+      heldTokens: heldTokens(h),
+    };
+    console.info(
+      'C13-Q phase evidence',
+      JSON.stringify({
+        phases: child.messages.map((message) => message.event),
+        ...facts,
+      }),
+    );
+    expect(facts).toEqual({
+      fetchInvocations: 0,
+      posts: 0,
+      status: 'rejected',
+      observation: { kind: 'not_sent', recorded: true, cause: 'cancelled' },
+      state: 'rejected',
+      version: 2,
+      events: [
+        { event_kind: 'prepared', state_version: 0 },
+        { event_kind: 'dispatching', state_version: 1 },
+        { event_kind: 'rejected', state_version: 2 },
+      ],
+      heldTokens: 0,
+    });
+    expect(observed.result.error?.code).toBe('Cancelled');
+    assertNoPrivate(observed.result, h);
+  });
+}, 30_000);

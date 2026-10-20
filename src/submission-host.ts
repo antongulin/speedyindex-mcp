@@ -380,6 +380,8 @@ export class SubmissionHost {
             base,
             createIndexingTaskError('DispatchClaimLost'),
           );
+        // A synchronous claim can also leave cancellation queued in I/O.
+        await yieldForPendingIO();
         return await this.dispatch(
           config,
           prepared,
