@@ -518,6 +518,20 @@ function snapshotFile(path: string) {
   };
 }
 
+function snapshotDirectoryMetadata(path: string) {
+  const stats = lstatSync(path);
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    mode: stats.mode & 0o7777,
+    uid: stats.uid,
+    nlink: stats.nlink,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+  };
+}
+
 function expectFileUnchanged(
   path: string,
   before: ReturnType<typeof snapshotFile>,
@@ -529,6 +543,13 @@ function expectFileUnchanged(
   expect(after.mode).toBe(before.mode);
   expect(after.uid).toBe(before.uid);
   expect(after.nlink).toBe(before.nlink);
+}
+
+function expectDirectoryMetadataUnchanged(
+  path: string,
+  before: ReturnType<typeof snapshotDirectoryMetadata>,
+) {
+  expect(snapshotDirectoryMetadata(path)).toEqual(before);
 }
 
 test('L01: unit reservations carry across periods and policy revisions', () => {
@@ -1477,6 +1498,93 @@ test('R3-JOURNAL: unsafe rollback-journal metadata fails closed', async () => {
     expect((openError as SubmissionLedgerError).code).toBe('LedgerUnavailable');
     expectFileUnchanged(databasePath, databaseBefore);
     expectFileUnchanged(journalPath, journalBefore);
+  } finally {
+    await cleanupLedgerTestRoot(root, ledgers);
+  }
+});
+
+test('R4-ANCESTOR: unsafe writable ancestors fail closed', async () => {
+  const root = createPrivateRoot();
+  const ledgers: SubmissionLedger[] = [];
+  const closeTrackedLedger = (ledger: SubmissionLedger) => {
+    ledger.close();
+    const index = ledgers.indexOf(ledger);
+    if (index >= 0) ledgers.splice(index, 1);
+  };
+  try {
+    const trustedParent = join(root, 'trusted-parent');
+    mkdirSync(trustedParent, { mode: 0o700 });
+    chmodSync(trustedParent, 0o700);
+    const positiveDirectory = join(trustedParent, 'positive-control');
+    const initialized = initializeLedger({
+      stateDirectory: positiveDirectory,
+    });
+    ledgers.push(initialized);
+    closeTrackedLedger(initialized);
+    const reopened = openLedger({ stateDirectory: positiveDirectory });
+    ledgers.push(reopened);
+    expect(
+      reopened.readIntent(fakeCredential, 'ancestor-positive-control'),
+    ).toBeNull();
+    closeTrackedLedger(reopened);
+
+    const unsafeInitParent = join(root, 'unsafe-init-parent');
+    mkdirSync(unsafeInitParent, { mode: 0o700 });
+    chmodSync(unsafeInitParent, 0o700);
+    chmodSync(unsafeInitParent, 0o777);
+    const unsafeInitParentBefore = snapshotDirectoryMetadata(unsafeInitParent);
+    const deniedChild = join(unsafeInitParent, 'new-state');
+    let initError: unknown;
+    let unexpectedInitialized: SubmissionLedger | undefined;
+    try {
+      unexpectedInitialized = initializeLedger({ stateDirectory: deniedChild });
+      ledgers.push(unexpectedInitialized);
+    } catch (error) {
+      initError = error;
+    }
+    if (unexpectedInitialized) {
+      closeTrackedLedger(unexpectedInitialized);
+      throw new Error(
+        'initializeLedger unexpectedly accepted a group/other-writable ancestor.',
+      );
+    }
+    expect(initError).toBeInstanceOf(SubmissionLedgerError);
+    expect((initError as SubmissionLedgerError).code).toBe('LedgerUnavailable');
+    expect(existsSync(deniedChild)).toBe(false);
+    expectDirectoryMetadataUnchanged(unsafeInitParent, unsafeInitParentBefore);
+
+    const unsafeOpenParent = join(root, 'unsafe-open-parent');
+    mkdirSync(unsafeOpenParent, { mode: 0o700 });
+    chmodSync(unsafeOpenParent, 0o700);
+    const existingDirectory = join(unsafeOpenParent, 'existing-state');
+    const existingLedger = initializeLedger({
+      stateDirectory: existingDirectory,
+    });
+    ledgers.push(existingLedger);
+    closeTrackedLedger(existingLedger);
+    const databasePath = join(existingDirectory, 'ledger.sqlite');
+    const databaseBefore = snapshotFile(databasePath);
+    chmodSync(unsafeOpenParent, 0o777);
+    const unsafeOpenParentBefore = snapshotDirectoryMetadata(unsafeOpenParent);
+
+    let openError: unknown;
+    let unexpectedOpen: SubmissionLedger | undefined;
+    try {
+      unexpectedOpen = openLedger({ stateDirectory: existingDirectory });
+      ledgers.push(unexpectedOpen);
+    } catch (error) {
+      openError = error;
+    }
+    if (unexpectedOpen) {
+      closeTrackedLedger(unexpectedOpen);
+      throw new Error(
+        'openLedger unexpectedly accepted a group/other-writable ancestor.',
+      );
+    }
+    expect(openError).toBeInstanceOf(SubmissionLedgerError);
+    expect((openError as SubmissionLedgerError).code).toBe('LedgerUnavailable');
+    expectFileUnchanged(databasePath, databaseBefore);
+    expectDirectoryMetadataUnchanged(unsafeOpenParent, unsafeOpenParentBefore);
   } finally {
     await cleanupLedgerTestRoot(root, ledgers);
   }
