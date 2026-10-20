@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Build an unofficial MCP integration for SpeedyIndex. The repository currently contains documentation only; all 12 proposed tools are unimplemented.
+Build an unofficial MCP integration for SpeedyIndex. The repository contains documentation and Robin review configuration; all 12 proposed tools are unimplemented.
 
 ## Ownership
 
-This root owns project scope, public status, licensing, and the DOX hierarchy. `docs/` owns the roadmap and provenance. There is no source tree, package manifest, runtime, or test runner yet.
+This root owns project scope, public status, licensing, and the DOX hierarchy. `docs/` owns the roadmap and provenance; `.github/` owns review automation. There is no source tree, package manifest, runtime, or test runner yet.
 
 ## Local Contracts
 
@@ -29,3 +29,4 @@ There is no application verification suite yet. For documentation, inspect the d
 | Contract | Scope |
 | --- | --- |
 | [docs/AGENTS.md](docs/AGENTS.md) | Roadmap, provenance, and third-party documentation notice |
+| [.github/AGENTS.md](.github/AGENTS.md) | Robin workflow and repository review configuration |
