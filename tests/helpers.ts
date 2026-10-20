@@ -11,13 +11,24 @@ export const account = {
 export const officialOrigin = 'https://api.speedyindex.com';
 export const officialUrl = `${officialOrigin}/v2/account`;
 
-function isSupportedProviderTarget(url: URL) {
+const statusPaths = new Set([
+  '/v2/task/google/indexer/status',
+  '/v2/task/google/checker/status',
+  '/v2/task/yandex/indexer/status',
+  '/v2/task/yandex/checker/status',
+  '/v2/task/bing/checker/status',
+  '/v2/task/backlink/checker/status',
+]);
+
+function isSupportedProviderTarget(url: URL, method: string) {
   return (
     url.origin === officialOrigin &&
-    (url.pathname === '/v2/account' ||
-      /^\/v2\/task\/(google|yandex|bing)\/(indexer|checker)\/list\/\d+$/.test(
-        url.pathname,
-      ))
+    ((method === 'GET' &&
+      (url.pathname === '/v2/account' ||
+        /^\/v2\/task\/(google\/(indexer|checker)|yandex\/(indexer|checker)|bing\/checker)\/list\/\d+$/.test(
+          url.pathname,
+        ))) ||
+      (method === 'POST' && statusPaths.has(url.pathname)))
   );
 }
 
@@ -102,7 +113,8 @@ export function loopbackFetch(origin: string): typeof fetch {
     init?: RequestInit,
   ) => {
     const target = new URL(String(input));
-    if (!isSupportedProviderTarget(target))
+    const method = (init?.method ?? 'GET').toUpperCase();
+    if (!isSupportedProviderTarget(target, method))
       throw new Error('Unexpected production URL');
     return fetch(new URL(`${target.pathname}${target.search}`, origin), init);
   }) as typeof fetch;

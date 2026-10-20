@@ -2,15 +2,15 @@
 
 ## Purpose
 
-Serve read-only SpeedyIndex account balances and task listings over MCP stdio.
+Serve read-only SpeedyIndex account balances, task listings, and task status over MCP stdio.
 
 ## Ownership
 
-`cli.ts` owns arguments and transport; `server.ts` registers tools; `client.ts` owns HTTP/validation/errors; `tools/get-balance.ts` and `tools/list-tasks.ts` own their public tools.
+`cli.ts` owns arguments and transport; `server.ts` registers tools; `client.ts` owns HTTP/validation/errors; `task-status.ts` owns task-status schemas, errors, and normalization; `tools/get-balance.ts`, `tools/list-tasks.ts`, and `tools/get-task-status.ts` own their public tools.
 
 ## Local Contracts
 
-Use fixed production HTTPS endpoints and the raw Authorization key. `get_balance` reads the account endpoint; `list_tasks` reads one validated task-list page from a fixed provider route. Cap decoded response-body bytes at the compiled-in 16 MiB limit before JSON decoding. Keep stdout exclusively protocol except explicit help/version. No redirects, automated retries, paid operations, or raw error reflection. Pass SDK cancellation to fetch and retain the deadline. Keep CodeGraph outside runtime dependencies.
+Use fixed production HTTPS endpoints and the raw Authorization key. `get_balance` reads the account endpoint; `list_tasks` reads one validated task-list page; `get_task_status` sends one JSON POST to one of six fixed read-only status routes. Validate one family and exactly one ID form, preserve opaque IDs, correlate returned roots by exact ID, and omit unreturned records without claiming they do not exist. Cap decoded response-body bytes at the compiled-in 16 MiB limit before JSON decoding. Keep stdout exclusively protocol except explicit help/version. No redirects, automated retries, paid operations, or raw error reflection. Pass SDK cancellation to fetch and retain the deadline. Keep CodeGraph outside runtime dependencies.
 
 ## Work Guidance
 

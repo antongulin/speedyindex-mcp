@@ -38,6 +38,7 @@ for (const arg of ['--help', '--version', '--unsupported']) {
         else {
           expect(stdout).toContain('get_balance');
           expect(stdout).toContain('list_tasks');
+          expect(stdout).toContain('get_task_status');
         }
       }
     } finally {
