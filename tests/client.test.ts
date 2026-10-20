@@ -198,7 +198,7 @@ test('LT-03: list_tasks maps documented optional fields, strips unknowns, and ac
               days: 3,
               days_passed: 1,
               is_stopped: false,
-              child_task_ids: ['child-a'],
+              child_task_ids: [' child-a '],
               status: 'unpromised status',
               tokens_charged: 500,
               check_after: 'unpromised timestamp',
@@ -236,7 +236,7 @@ test('LT-03: list_tasks maps documented optional fields, strips unknowns, and ac
           days: 3,
           daysPassed: 1,
           isStopped: false,
-          childTaskIds: ['child-a'],
+          childTaskIds: [' child-a '],
         },
         { id: 'partial-task', isCompleted: false, daysPassed: 0 },
       ],
@@ -296,6 +296,40 @@ for (const [index, [kind, body]] of invalidTaskListBodies.entries()) {
       expect(error).toMatchObject({ kind });
       expect(String(error)).not.toContain(dummyKey);
       expect(String(error).length).toBeLessThan(150);
+      expect(api.requests).toHaveLength(1);
+    } finally {
+      await api.close();
+    }
+  });
+}
+
+for (const [label, childTaskId] of [
+  ['empty', ''],
+  ['whitespace-only', ' \t '],
+] as const) {
+  test(`LT-11: list_tasks rejects ${label} child task IDs without retrying`, async () => {
+    const api = await fixture((_req, res) =>
+      res.end(
+        JSON.stringify({
+          code: 0,
+          page: 0,
+          last_page: 0,
+          result: [{ id: 'parent-id', child_task_ids: [childTaskId] }],
+        }),
+      ),
+    );
+    try {
+      const error = await new SpeedyIndexClient(
+        dummyKey,
+        loopbackFetch(api.origin),
+      )
+        .listTasks({ searchEngine: 'google', taskType: 'indexer', page: 0 })
+        .catch((value: unknown) => value);
+      expect(error).toMatchObject({
+        kind: 'response',
+        message: 'SpeedyIndex returned an invalid task-list response.',
+      });
+      expect(String(error)).not.toContain(dummyKey);
       expect(api.requests).toHaveLength(1);
     } finally {
       await api.close();

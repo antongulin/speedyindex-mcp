@@ -15,7 +15,7 @@ export function registerListTasks(
     {
       title: 'List SpeedyIndex tasks',
       description:
-        'Read one zero-based page of up to 1,000 tasks, newest first. Omit filter to include standard and pay-per-indexed tasks while excluding drip-feed tasks. Filters apply only to Google indexer tasks; payPerIndexed applies only with the drip_feed filter.',
+        'Read one zero-based page of up to 1,000 tasks, newest first. The response includes lastPage, the inclusive zero-based final page index; when fetching sequentially, stop after a page where page >= lastPage. Omit filter to include standard and pay-per-indexed tasks while excluding drip-feed tasks. Filters apply only to Google indexer tasks; payPerIndexed applies only with the drip_feed filter.',
       inputSchema: listTasksInputSchema,
       outputSchema: listTasksResultSchema,
       annotations: {

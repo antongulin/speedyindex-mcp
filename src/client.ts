@@ -72,7 +72,7 @@ const taskSummarySchema = z.strictObject({
   days: safeNonnegativeInteger.optional(),
   daysPassed: safeNonnegativeInteger.optional(),
   isStopped: z.boolean().optional(),
-  childTaskIds: z.array(z.string()).optional(),
+  childTaskIds: z.array(nonblankString).optional(),
 });
 
 export const listTasksResultSchema = z.strictObject({
@@ -97,7 +97,7 @@ const providerTaskSchema = z
     days: safeNonnegativeInteger.optional(),
     days_passed: safeNonnegativeInteger.optional(),
     is_stopped: z.boolean().optional(),
-    child_task_ids: z.array(z.string()).optional(),
+    child_task_ids: z.array(nonblankString).optional(),
   })
   .transform((task) => ({
     id: task.id,
