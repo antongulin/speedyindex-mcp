@@ -10,7 +10,7 @@ This root owns project scope, public status, licensing, and the DOX hierarchy. `
 
 ## Local Contracts
 
-- Follow the shared workflow at `~/.agents/instructions/WORKFLOW.md`, with the [canonical remote fallback](https://github.com/antongulin/baseline/blob/main/baseline/02-agents.md). Current explicit task instructions and higher-priority platform rules control.
+- This root and its child contracts provide the repository guidance for contributors; access to maintainer-only references is not required. Maintainer agents also follow `~/.agents/instructions/WORKFLOW.md` when installed or provided. The [private baseline workflow](https://github.com/antongulin/baseline/blob/main/baseline/02-agents.md) is a restricted maintainer reference requiring access. Current explicit task instructions and higher-priority platform rules control.
 - Read this root and every applicable child `AGENTS.md` before editing. The nearest contract controls local details without weakening the shared DOX discipline.
 - Keep roadmap features separate from implemented behavior. Only `get_balance` is implemented; other tools require later scoped work.
 - Keep public documentation free of credentials, account data, private task records, and machine-specific paths. Provider calls and paid submissions require task-specific authority.
