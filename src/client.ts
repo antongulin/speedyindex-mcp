@@ -1,5 +1,11 @@
 import { z } from 'zod';
 import { version } from '../package.json';
+import {
+  normalizeTaskStatusResult,
+  TaskStatusError,
+  taskStatusInputSchema,
+  type TaskFamily,
+} from './task-status';
 
 export const balanceSchema = z.object({
   tokens: z.number().nonnegative(),
@@ -180,16 +186,31 @@ export class TaskListError extends Error {
 const apiOrigin = 'https://api.speedyindex.com';
 const accountEndpoint = `${apiOrigin}/v2/account`;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const taskStatusRoutes: Record<TaskFamily, string> = {
+  'google/indexer': '/v2/task/google/indexer/status',
+  'google/checker': '/v2/task/google/checker/status',
+  'yandex/indexer': '/v2/task/yandex/indexer/status',
+  'yandex/checker': '/v2/task/yandex/checker/status',
+  'bing/checker': '/v2/task/bing/checker/status',
+  'backlink/checker': '/v2/task/backlink/checker/status',
+};
 
-/** One authenticated GET, with the shared deadline and redirect safeguards. */
-async function getJson(
+type JsonRequestOptions = {
+  method: 'GET' | 'POST';
+  timeoutMs: number;
+  maxResponseBytes: number;
+  signal?: AbortSignal;
+  body?: string;
+};
+
+/** One authenticated GET or POST, with shared deadline and redirect safeguards. */
+async function requestJson(
   fetchRequest: typeof fetch,
   key: string,
   endpoint: string,
-  timeoutMs: number,
-  maxResponseBytes: number,
-  signal?: AbortSignal,
+  options: JsonRequestOptions,
 ): Promise<unknown> {
+  const { method, timeoutMs, maxResponseBytes, signal, body } = options;
   const deadline = new AbortController();
   const timer = setTimeout(() => deadline.abort(), timeoutMs);
   const combined = signal
@@ -198,14 +219,16 @@ async function getJson(
   try {
     combined.throwIfAborted();
     const response = await fetchRequest(endpoint, {
-      method: 'GET',
+      method,
       headers: {
         Authorization: key,
         Accept: 'application/json',
         'User-Agent': `speedyindex-mcp/${version}`,
+        ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
       },
       redirect: 'error',
       signal: combined,
+      ...(body === undefined ? {} : { body }),
     });
     if (!response.ok) throw new RequestError('http');
     try {
@@ -274,7 +297,7 @@ async function getJson(
   }
 }
 
-/** One GET, no redirects or retries. The fetch seam supports isolated tests. */
+/** One read request, no redirects or retries. The fetch seam supports tests. */
 export class SpeedyIndexClient {
   constructor(
     private readonly apiKey: string | undefined,
@@ -297,14 +320,12 @@ export class SpeedyIndexClient {
     const key = this.apiKey?.trim();
     if (!key) throw new AccountError('credentials');
     try {
-      const body = await getJson(
-        this.fetchAccount,
-        key,
-        accountEndpoint,
-        this.timeoutMs,
-        this.maxResponseBytes,
-        signal,
-      );
+      const body = await requestJson(this.fetchAccount, key, accountEndpoint, {
+        method: 'GET',
+        timeoutMs: this.timeoutMs,
+        maxResponseBytes: this.maxResponseBytes,
+        ...(signal === undefined ? {} : { signal }),
+      });
       const envelope = z.object({ code: z.number() }).safeParse(body);
       if (!envelope.success) throw new AccountError('response');
       if (envelope.data.code !== 0) throw new AccountError('provider');
@@ -340,13 +361,16 @@ export class SpeedyIndexClient {
       endpoint.searchParams.set('pay_per_indexed', String(args.payPerIndexed));
 
     try {
-      const body = await getJson(
+      const body = await requestJson(
         this.fetchAccount,
         key,
         endpoint.toString(),
-        this.timeoutMs,
-        this.maxResponseBytes,
-        signal,
+        {
+          method: 'GET',
+          timeoutMs: this.timeoutMs,
+          maxResponseBytes: this.maxResponseBytes,
+          ...(signal === undefined ? {} : { signal }),
+        },
       );
       const envelope = z.object({ code: z.number() }).safeParse(body);
       if (!envelope.success) throw new TaskListError('response');
@@ -372,6 +396,42 @@ export class SpeedyIndexClient {
       if (error instanceof RequestError) throw new TaskListError(error.kind);
       // Never reflect provider validation details or response data.
       throw new TaskListError('response');
+    }
+  }
+
+  async getTaskStatus(input: unknown, signal?: AbortSignal) {
+    const parsedInput = taskStatusInputSchema.safeParse(input);
+    if (!parsedInput.success) throw new TaskStatusError('input');
+    const args = parsedInput.data;
+    const key = this.apiKey?.trim();
+    if (!key) throw new TaskStatusError('credentials');
+
+    const requestedIds =
+      args.taskId === undefined ? args.taskIds! : [args.taskId];
+    const requestBody =
+      args.taskId === undefined
+        ? { task_ids: args.taskIds! }
+        : { task_id: args.taskId };
+
+    try {
+      const response = await requestJson(
+        this.fetchAccount,
+        key,
+        new URL(taskStatusRoutes[args.family], apiOrigin).toString(),
+        {
+          method: 'POST',
+          timeoutMs: this.timeoutMs,
+          maxResponseBytes: this.maxResponseBytes,
+          ...(signal === undefined ? {} : { signal }),
+          body: JSON.stringify(requestBody),
+        },
+      );
+      return normalizeTaskStatusResult(args.family, requestedIds, response);
+    } catch (error) {
+      if (signal?.aborted) throw new TaskStatusError('cancelled');
+      if (error instanceof TaskStatusError) throw error;
+      if (error instanceof RequestError) throw new TaskStatusError(error.kind);
+      throw new TaskStatusError('response');
     }
   }
 }

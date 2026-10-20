@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { balanceResultSchema, listTasksResultSchema } from '../src/client';
+import { taskStatusResultSchema } from '../src/task-status';
 import {
   account,
   bounded,
@@ -10,16 +11,21 @@ import {
 } from './helpers';
 import { verifyEof } from './stdio-eof';
 
-test('LT-06: real SDK process registers both read-only tools and returns structured and text output', async () => {
-  const api = await fixture((req, res) => {
-    if (req.url === '/v2/account') {
-      res.end(JSON.stringify(account));
+test('LT-06: real SDK process registers all read-only tools with structured and text output', async () => {
+  const api = await fixture((request, response) => {
+    if (request.url === '/v2/account') {
+      response.end(JSON.stringify(account));
+      return;
+    }
+    if (request.method === 'POST') {
+      request.resume();
+      response.end(JSON.stringify({ code: 0, result: { id: 'status-task' } }));
       return;
     }
     const page = Number(
-      new URL(req.url ?? '/', 'http://fixture').pathname.split('/').at(-1),
+      new URL(request.url ?? '/', 'http://fixture').pathname.split('/').at(-1),
     );
-    res.end(
+    response.end(
       JSON.stringify({
         code: 0,
         page,
@@ -39,6 +45,7 @@ test('LT-06: real SDK process registers both read-only tools and returns structu
     expect(tools.map((tool) => tool.name)).toEqual([
       'get_balance',
       'list_tasks',
+      'get_task_status',
     ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
@@ -80,6 +87,46 @@ test('LT-06: real SDK process registers both read-only tools and returns structu
       idempotentHint: true,
       openWorldHint: true,
     });
+    expect(tools[2]?.inputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['family'],
+      properties: {
+        family: {
+          enum: [
+            'google/indexer',
+            'google/checker',
+            'yandex/indexer',
+            'yandex/checker',
+            'bing/checker',
+            'backlink/checker',
+          ],
+        },
+        taskId: { type: 'string' },
+        taskIds: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 1000,
+          items: { type: 'string' },
+        },
+      },
+    });
+    expect(tools[2]?.outputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['family', 'requestedIds', 'tasks', 'unreturnedIds'],
+      properties: {
+        requestedIds: { type: 'array', minItems: 1, maxItems: 1000 },
+        tasks: { type: 'array', maxItems: 1000 },
+        unreturnedIds: { type: 'array', maxItems: 1000 },
+      },
+    });
+    expect(tools[2]?.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
     const result = await session.client.callTool({
       name: 'get_balance',
       arguments: {},
@@ -102,10 +149,108 @@ test('LT-06: real SDK process registers both read-only tools and returns structu
     expect(listResult.content).toEqual([
       { type: 'text', text: JSON.stringify(parsedList) },
     ]);
+    const statusResult = await session.client.callTool({
+      name: 'get_task_status',
+      arguments: { family: 'google/indexer', taskId: 'status-task' },
+    });
+    expect(statusResult.isError).not.toBe(true);
+    const parsedStatus = taskStatusResultSchema.parse(
+      statusResult.structuredContent,
+    );
+    expect(parsedStatus).toEqual({
+      family: 'google/indexer',
+      requestedIds: ['status-task'],
+      tasks: [{ id: 'status-task' }],
+      unreturnedIds: [],
+    });
+    expect(statusResult.content).toEqual([
+      { type: 'text', text: JSON.stringify(parsedStatus) },
+    ]);
     expect(api.requests.map(({ method, path }) => ({ method, path }))).toEqual([
       { method: 'GET', path: '/v2/account' },
       { method: 'GET', path: '/v2/task/google/indexer/list/0' },
+      { method: 'POST', path: '/v2/task/google/indexer/status' },
     ]);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('TSP-07: MCP rejects invalid status IDs and families before provider HTTP', async () => {
+  const api = await fixture((_request, response) =>
+    response.end(JSON.stringify({ code: 0, result: { id: 'unexpected' } })),
+  );
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+
+  try {
+    session = await connect(api.origin);
+    const invalidCalls = [
+      {
+        arguments: {
+          family: 'google/indexer',
+          taskId: 'one',
+          taskIds: ['one'],
+        },
+        reason: 'taskId',
+      },
+      {
+        arguments: { family: 'unsupported/checker', taskId: 'one' },
+        reason: 'family',
+      },
+    ];
+    for (const invalid of invalidCalls) {
+      const result = await session.client.callTool({
+        name: 'get_task_status',
+        arguments: invalid.arguments,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toBeUndefined();
+      const message = result.content
+        .filter((item) => item.type === 'text')
+        .map((item) => item.text)
+        .join(' ');
+      expect(message.length).toBeGreaterThan(0);
+      expect(message).toContain(invalid.reason);
+    }
+    expect(api.requests).toHaveLength(0);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('TSP-05: MCP status errors redact provider details and omit structured output', async () => {
+  const sentinel = 'synthetic-status-error-detail';
+  const api = await fixture((_request, response) =>
+    response.end(
+      JSON.stringify({ code: 9, message: `${dummyKey}-${sentinel}` }),
+    ),
+  );
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+
+  try {
+    session = await connect(api.origin);
+    const result = await session.client.callTool({
+      name: 'get_task_status',
+      arguments: { family: 'google/indexer', taskId: 'requested' },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain(dummyKey);
+    expect(JSON.stringify(result)).not.toContain(sentinel);
+    expect(result.content).toEqual([
+      { type: 'text', text: 'SpeedyIndex rejected the task-status request.' },
+    ]);
+    expect(api.requests).toHaveLength(1);
     expect(session.stderr()).toBe('');
   } finally {
     try {
@@ -356,6 +501,66 @@ test('LT-07: SDK list_tasks cancellation aborts underlying HTTP and next call su
       [{ id: 'task-a' }],
     );
     expect(api.requests).toHaveLength(2);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('TSP-08: SDK status cancellation aborts POST and the next call succeeds', async () => {
+  const arrived = deferred<void>();
+  const disconnected = deferred<void>();
+  let first = true;
+  const api = await fixture((request, response) => {
+    request.on('data', () => undefined);
+    request.on('end', () => {
+      if (first) {
+        first = false;
+        response.on('close', () => disconnected.resolve());
+        arrived.resolve();
+      } else {
+        response.end(JSON.stringify({ code: 0, result: { id: 'next-task' } }));
+      }
+    });
+  });
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+
+  try {
+    session = await connect(api.origin);
+    const controller = new AbortController();
+    const cancelled = session.client
+      .callTool(
+        {
+          name: 'get_task_status',
+          arguments: { family: 'google/indexer', taskId: 'cancelled-task' },
+        },
+        { signal: controller.signal },
+      )
+      .then(
+        () => 'unexpected success',
+        () => 'cancelled',
+      );
+    await bounded(arrived.promise);
+    controller.abort();
+    expect(await bounded(cancelled)).toBe('cancelled');
+    await bounded(disconnected.promise);
+
+    const next = await session.client.callTool({
+      name: 'get_task_status',
+      arguments: { family: 'google/indexer', taskId: 'next-task' },
+    });
+    expect(next.isError).not.toBe(true);
+    expect(taskStatusResultSchema.parse(next.structuredContent).tasks).toEqual([
+      { id: 'next-task' },
+    ]);
+    expect(api.requests.map(({ method, path }) => ({ method, path }))).toEqual([
+      { method: 'POST', path: '/v2/task/google/indexer/status' },
+      { method: 'POST', path: '/v2/task/google/indexer/status' },
+    ]);
     expect(session.stderr()).toBe('');
   } finally {
     try {

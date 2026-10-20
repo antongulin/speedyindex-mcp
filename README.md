@@ -5,7 +5,7 @@ An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server t
 [![CI](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-The Bun/TypeScript foundation exposes the read-only **`get_balance`** and **`list_tasks`** tools over stdio. `get_balance` returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published.
+The Bun/TypeScript foundation exposes three read-only tools over stdio: **`get_balance`**, **`list_tasks`**, and **`get_task_status`**. `get_balance` returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published.
 
 ## Run from source
 
@@ -63,7 +63,17 @@ Call `list_tasks` with a required `searchEngine` (`google`, `yandex`, or `bing`)
 
 For Google indexer tasks, optional `filter` values are `standard`, `pay_per_indexed`, and `drip_feed`. Omitting `filter` includes standard and pay-per-indexed tasks and excludes drip-feed tasks. Optional `payPerIndexed` is valid only with `filter: "drip_feed"` and selects drip-feed tasks by that flag. Filters are not accepted for other task families. Documented summary fields are returned in camelCase when present; optional fields remain omitted when the provider does not return them, and unknown fields are discarded. The list response does not guarantee status, token charges/refunds, or a check-after time.
 
-Both tools make one authenticated GET to a fixed `https://api.speedyindex.com/v2` route, using the API key as the raw `Authorization` header. Requests have a 10-second deadline, support MCP cancellation, reject redirects, and never retry automatically. Missing keys fail without network access. Tool failures return `isError: true` with a sanitized message and no structured result. Provider bodies and exception details are never reflected in those errors. Normal stdout contains MCP messages only; diagnostics use stderr. Closing stdin ends the process.
+Call `get_task_status` with a `family` and exactly one of `taskId` or `taskIds`. Supported families are `google/indexer`, `google/checker`, `yandex/indexer`, `yandex/checker`, `bing/checker`, and `backlink/checker`. IDs are opaque, nonblank strings. `taskIds` accepts 1 to 1,000 unique IDs; uniqueness lets the tool correlate results without ambiguity. For example:
+
+```json
+{ "family": "google/indexer", "taskIds": ["opaque-task-a", "opaque-task-b"] }
+```
+
+Each call makes one authenticated `POST` to that family's fixed `/status` route, with either `task_id` or `task_ids` in the JSON body. The provider may return one task or an array. The tool matches returned records by exact ID and orders `tasks` and `unreturnedIds` by the submitted IDs. `unreturnedIds` means the provider omitted those records from this response; it does not mean those tasks do not exist. Duplicate, malformed, or unrequested returned IDs invalidate the response.
+
+Known status fields map to camelCase when present; unknown fields are discarded. A task can include `size`, `processedCount`, `indexedCount`, `isCompleted`, `title`, `type`, `createdAt`, `status`, `payPerIndexed`, `tokensCharged`, `tokensRefunded`, `checkAfter`, `days`, `daysPassed`, `isStopped`, `dripFeed`, `awaitingResult`, `childTaskIds`, `children`, and `targetDomains`. Counts and day values are safe nonnegative integers. Token values are finite nonnegative numbers and may be fractional. Missing optional fields stay omitted. Status strings and completion booleans pass through as returned, and the tool does not infer completion from counts or status text. The optional `dripFeed` and `awaitingResult` flags are observed provider fields, not universal guarantees; the tool returns them only when the provider sends booleans. Direct child summaries include common task and PPI metadata plus an optional `day`; the tool does not return nested children.
+
+All three tools make one authenticated request to a fixed `https://api.speedyindex.com/v2` route, using the API key as the raw `Authorization` header. Requests have a 10-second deadline, support MCP cancellation, reject redirects, and never retry automatically. Missing keys fail without network access. Tool failures return `isError: true` with a sanitized message and no structured result. Provider bodies and exception details are never reflected in those errors. Normal stdout contains MCP messages only; diagnostics use stderr. Closing stdin ends the process.
 
 Responses over this MCP's 16 MiB decoded-body safety bound are rejected; this is not a SpeedyIndex maximum.
 
@@ -85,7 +95,7 @@ The tests use dummy credentials, loopback HTTP fixtures, the official MCP client
 
 See [architecture](docs/architecture.md), [dependency decisions](docs/dependencies.md), [contributing](CONTRIBUTING.md), [security reporting](SECURITY.md), [agent guidance](AGENTS.md), and the [LLM documentation index](llms.txt).
 
-The other 10 tools remain in the [roadmap](docs/implementation-plan.md); task creation/submission, status and report retrieval, invoices, retries, storage, and scheduling are not implemented.
+The other 9 tools remain in the [roadmap](docs/implementation-plan.md); task creation/submission, report retrieval, invoices, retries, storage, and scheduling are not implemented.
 
 Licensed under [MIT](LICENSE). Documentation framework attribution is in [provenance](docs/provenance.md).
 

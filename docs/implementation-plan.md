@@ -1,12 +1,12 @@
 # Implementation plan
 
-The Bun/TypeScript stdio foundation implements `get_balance` and `list_tasks`. The other 10 tools remain planned and unimplemented. No package or release is published.
+The Bun/TypeScript stdio foundation implements `get_balance`, `list_tasks`, and `get_task_status`. The other 9 tools remain planned and unimplemented. No package or release is published.
 
 | Order       | Planned tool            | Intended scope                                       |
 | ----------- | ----------------------- | ---------------------------------------------------- |
 | Implemented | `get_balance`           | Read all three account wallets without creating jobs |
 | Implemented | `list_tasks`            | Read one validated page of existing tasks            |
-| Later       | `get_task_status`       | Inspect task progress                                |
+| Implemented | `get_task_status`       | Read existing task status by family and task ID      |
 | Later       | `get_task_report`       | Retrieve task results                                |
 | Later       | `create_indexing_task`  | Submit URLs for indexing                             |
 | Later       | `create_index_check`    | Submit an index-status check                         |
@@ -17,7 +17,7 @@ The Bun/TypeScript stdio foundation implements `get_balance` and `list_tasks`. T
 | Later       | `summarize_campaigns`   | Summarize related task outcomes                      |
 | Later       | `get_retry_history`     | Inspect recorded retry activity                      |
 
-The current runtime exposes `get_balance` and `list_tasks`. See [README.md](../README.md) for build/run commands and [architecture](architecture.md) for validation, cancellation, and error boundaries. Synthetic HTTP and real stdio tests exercise the provider contract and built CLI without live provider calls.
+The current runtime exposes all three implemented tools. See [README.md](../README.md) for build/run commands and [architecture](architecture.md) for validation, cancellation, and error boundaries. Synthetic HTTP and real stdio tests exercise the provider contract and built CLI without live provider calls.
 
 Later submissions and retries need explicit action boundaries, input validation, cost visibility, and protection against accidental duplicate jobs. Decide storage and reporting contracts in their own scoped work before promising persisted history or campaign behavior.
 
