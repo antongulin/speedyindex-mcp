@@ -10,7 +10,7 @@ Maintain the roadmap, runtime architecture, dependency decisions, and source att
 
 ## Local Contracts
 
-Describe actual state accurately; planned tools are not shipped tools. Keep operational records, credentials, account data, and machine-specific details out of public docs. Preserve source links and license attribution.
+Describe actual state accurately: four read-only tools are implemented and eight remain on the roadmap. Document `get_task_report` as one fixed request and, for backlink reports, one explicitly bounded page; do not describe report fields as proof of completeness or fresh indexing truth. Keep operational records, credentials, account data, and machine-specific details out of public docs. Preserve source links and license attribution.
 
 ## Work Guidance
 

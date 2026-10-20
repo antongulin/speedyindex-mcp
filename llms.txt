@@ -1,6 +1,6 @@
 # SpeedyIndex MCP
 
-> Unofficial Bun/TypeScript stdio MCP server. Read-only get_balance, list_tasks, and get_task_status are implemented; the other 9 tools are roadmap work. No npm release is published.
+> Unofficial Bun/TypeScript stdio MCP server. Read-only get_balance, list_tasks, get_task_status, and get_task_report are implemented; the other 8 tools are roadmap work. No npm release is published.
 
 - [README](https://github.com/antongulin/speedyindex-mcp/blob/main/README.md): Setup and tool contract
 - [Architecture](https://github.com/antongulin/speedyindex-mcp/blob/main/docs/architecture.md): Runtime boundaries

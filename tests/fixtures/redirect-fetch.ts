@@ -8,6 +8,14 @@ const statusPaths = new Set([
   '/v2/task/bing/checker/status',
   '/v2/task/backlink/checker/status',
 ]);
+const reportPaths = new Set([
+  '/v2/task/google/indexer/report',
+  '/v2/task/google/checker/report',
+  '/v2/task/yandex/indexer/report',
+  '/v2/task/yandex/checker/report',
+  '/v2/task/bing/checker/report',
+  '/v2/task/backlink/checker/report',
+]);
 globalThis.fetch = ((
   input: Parameters<typeof fetch>[0],
   init?: RequestInit,
@@ -22,9 +30,11 @@ globalThis.fetch = ((
       ));
   const supportedStatusPost =
     method === 'POST' && statusPaths.has(target.pathname);
+  const supportedReportPost =
+    method === 'POST' && reportPaths.has(target.pathname);
   const supportedTarget =
     target.origin === 'https://api.speedyindex.com' &&
-    (supportedGet || supportedStatusPost);
+    (supportedGet || supportedStatusPost || supportedReportPost);
   if (!supportedTarget) {
     throw new Error('Unexpected production URL');
   }

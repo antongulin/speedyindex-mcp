@@ -19,6 +19,14 @@ const statusPaths = new Set([
   '/v2/task/bing/checker/status',
   '/v2/task/backlink/checker/status',
 ]);
+const reportPaths = new Set([
+  '/v2/task/google/indexer/report',
+  '/v2/task/google/checker/report',
+  '/v2/task/yandex/indexer/report',
+  '/v2/task/yandex/checker/report',
+  '/v2/task/bing/checker/report',
+  '/v2/task/backlink/checker/report',
+]);
 
 function isSupportedProviderTarget(url: URL, method: string) {
   return (
@@ -28,7 +36,8 @@ function isSupportedProviderTarget(url: URL, method: string) {
         /^\/v2\/task\/(google\/(indexer|checker)|yandex\/(indexer|checker)|bing\/checker)\/list\/\d+$/.test(
           url.pathname,
         ))) ||
-      (method === 'POST' && statusPaths.has(url.pathname)))
+      (method === 'POST' &&
+        (statusPaths.has(url.pathname) || reportPaths.has(url.pathname))))
   );
 }
 
