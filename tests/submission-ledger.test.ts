@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { Database, constants as sqliteConstants } from 'bun:sqlite';
 import { expect, test } from 'bun:test';
 import {
@@ -788,9 +788,50 @@ test('L02: request replay, outcomes, and URL holds remain immutable', () => {
   }
 });
 
+test('L02-MAX: checks the 10,000 URL boundary and last URL overlap', () => {
+  const root = createPrivateRoot();
+  const stateDirectory = join(root, 'state');
+  let ledger: SubmissionLedger | undefined;
+  try {
+    ledger = initializeLedger({ stateDirectory });
+    const submittedUrls = Array.from(
+      { length: 10_000 },
+      (_, index) => `https://example.test/bulk/${index}`,
+    );
+    const input = makeInput({
+      requestId: 'max-url-count',
+      submittedUrls,
+    });
+    expect(createIntent(ledger, input).intent.state).toBe('prepared');
+
+    const lastUrlOverlap = makeInput({
+      requestId: 'max-url-overlap-last',
+      submittedUrls: [submittedUrls[submittedUrls.length - 1]!],
+    });
+    expectLedgerError(
+      () => ledger!.prepareIntent(lastUrlOverlap),
+      'UrlOverlap',
+    );
+
+    const tooManyUrls = makeInput({
+      requestId: 'max-url-count-plus-one',
+      submittedUrls: [...submittedUrls, 'https://example.test/bulk/10000'],
+    });
+    expectLedgerError(
+      () => ledger!.prepareIntent(tooManyUrls),
+      'InvalidLedgerInput',
+    );
+    expect(ledger.readIntent(fakeCredential, tooManyUrls.requestId)).toBeNull();
+  } finally {
+    ledger?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('L03: separate processes cannot duplicate IDs or over-reserve a period', async () => {
   const root = createPrivateRoot();
   const children: ChildHandle[] = [];
+  const reopenedLedgers: SubmissionLedger[] = [];
   try {
     const sameState = join(root, 'same-id-state');
     const sameLedger = initializeLedger({ stateDirectory: sameState });
@@ -833,6 +874,7 @@ test('L03: separate processes cannot duplicate IDs or over-reserve a period', as
     expect(replay).not.toHaveProperty('dispatchCapability');
     await Promise.all(sameChildren.map((child) => expectChildExit(child)));
     const reopenedSame = openLedger({ stateDirectory: sameState });
+    reopenedLedgers.push(reopenedSame);
     expect(
       reopenedSame.readIntent(fakeCredential, sameInput.requestId)?.state,
     ).toBe('prepared');
@@ -906,6 +948,7 @@ test('L03: separate processes cannot duplicate IDs or over-reserve a period', as
     ).not.toHaveProperty('dispatchCapability');
     await Promise.all(budgetChildren.map((child) => expectChildExit(child)));
     const accounted = openLedger({ stateDirectory: budgetState });
+    reopenedLedgers.push(accounted);
     const survivingId =
       budgetResults.find((message) => message.kind === 'created') ===
       budgetResults[0]
@@ -924,8 +967,15 @@ test('L03: separate processes cannot duplicate IDs or over-reserve a period', as
     ).toBeNull();
     accounted.close();
   } finally {
-    await Promise.all(children.map(stopAndReap));
-    rmSync(root, { recursive: true, force: true });
+    try {
+      await Promise.all(children.map(stopAndReap));
+    } finally {
+      try {
+        for (const ledger of reopenedLedgers) ledger.close();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
   }
 });
 
@@ -1156,9 +1206,12 @@ test('L07: unsafe or incomplete storage fails closed without replacing state', (
     throw new Error('POSIX UID lookup is required for this test.');
   const uid = process.geteuid();
   const readonlySkips: string[] = [];
+  const ledgers: SubmissionLedger[] = [];
+  let ledger: SubmissionLedger | undefined;
   try {
     const validDirectory = join(root, 'valid');
-    let ledger = initializeLedger({ stateDirectory: validDirectory });
+    ledger = initializeLedger({ stateDirectory: validDirectory });
+    ledgers.push(ledger);
     const validDb = join(validDirectory, 'ledger.sqlite');
     expect(lstatSync(validDirectory).mode & 0o777).toBe(0o700);
     expect(lstatSync(validDb).mode & 0o777).toBe(0o600);
@@ -1167,8 +1220,54 @@ test('L07: unsafe or incomplete storage fails closed without replacing state', (
     expect(readLedgerPragmas(validDb)).toEqual({ version: 1, journal: 'wal' });
     ledger.close();
     ledger = openLedger({ stateDirectory: validDirectory });
+    ledgers.push(ledger);
     expect(ledger.readIntent(fakeCredential, 'no-row')).toBeNull();
     ledger.close();
+
+    const closedDatabaseBefore = snapshotFile(validDb);
+    ledger.close();
+    expectLedgerError(
+      () => ledger!.readIntent(fakeCredential, 'after-close-read'),
+      'LedgerUnavailable',
+    );
+    expectLedgerError(
+      () =>
+        ledger!.prepareIntent(makeInput({ requestId: 'after-close-prepare' })),
+      'LedgerUnavailable',
+    );
+    expectFileUnchanged(validDb, closedDatabaseBefore);
+
+    const relativeStateDirectory = relative(
+      process.cwd(),
+      join(root, 'relative-state'),
+    );
+    const nulStateDirectory = `${join(root, 'nul-state')}\0suffix`;
+    const aliasParent = join(root, 'path-alias');
+    mkdirSync(aliasParent, { mode: 0o700 });
+    chmodSync(aliasParent, 0o700);
+    const noncanonicalStateDirectory = `${aliasParent}/../valid`;
+    expect(resolve(noncanonicalStateDirectory)).toBe(validDirectory);
+    expect(noncanonicalStateDirectory).not.toBe(validDirectory);
+
+    const validDatabaseBeforeInvalidPaths = snapshotFile(validDb);
+    for (const stateDirectory of [
+      relativeStateDirectory,
+      nulStateDirectory,
+      noncanonicalStateDirectory,
+    ]) {
+      expectLedgerError(
+        () => initializeLedger({ stateDirectory }),
+        'InvalidLedgerInput',
+      );
+      expectLedgerError(
+        () => openLedger({ stateDirectory }),
+        'InvalidLedgerInput',
+      );
+    }
+    expect(existsSync(join(root, 'relative-state'))).toBe(false);
+    expect(existsSync(join(root, 'nul-state'))).toBe(false);
+    expectFileUnchanged(validDb, validDatabaseBeforeInvalidPaths);
+
     for (const suffix of ['-wal', '-shm']) {
       const sidecar = `${validDb}${suffix}`;
       if (existsSync(sidecar)) {
@@ -1293,6 +1392,7 @@ test('L07: unsafe or incomplete storage fails closed without replacing state', (
 
     const realState = join(root, 'symlink-target-state');
     const targetLedger = initializeLedger({ stateDirectory: realState });
+    ledgers.push(targetLedger);
     targetLedger.close();
     const symlinkDirectory = join(root, 'symlinked-state');
     symlinkSync(realState, symlinkDirectory, 'dir');
@@ -1356,6 +1456,7 @@ test('L07: unsafe or incomplete storage fails closed without replacing state', (
     const readonlyLedger = initializeLedger({
       stateDirectory: readonlyDirectory,
     });
+    ledgers.push(readonlyLedger);
     readonlyLedger.close();
     const readonlyPath = join(readonlyDirectory, 'ledger.sqlite');
     chmodSync(readonlyPath, 0o400);
@@ -1381,6 +1482,10 @@ test('L07: unsafe or incomplete storage fails closed without replacing state', (
     if (readonlySkips.length > 0)
       console.info(`L07 skipped subcase: ${readonlySkips.join(' ')}`);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    try {
+      for (const handle of ledgers) handle.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
