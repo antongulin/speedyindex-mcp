@@ -25,7 +25,7 @@ Inspect the pinned upstream workflow and supported config before changing this i
 
 ## Verification
 
-Run `actionlint .github/workflows/code-review.yml` when installed, parse both YAML files with an available parser, compare the reusable workflow's secrets and defaults, and run `git diff --check`. These static checks do not verify secret values, provider access, or a posted Robin review.
+Run `actionlint .github/workflows/code-review.yml .github/workflows/ci.yml` when installed, parse maintained YAML files with an available parser, compare the reusable workflow's secrets and defaults, and run `git diff --check`. These static checks do not verify secret values, provider access, or a posted Robin review.
 
 ## Child DOX Index
 

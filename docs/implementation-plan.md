@@ -21,4 +21,18 @@ The current runtime exposes only `get_balance`. See [README.md](../README.md) fo
 
 Later submissions and retries need explicit action boundaries, input validation, cost visibility, and protection against accidental duplicate jobs. Decide storage and reporting contracts in their own scoped work before promising persisted history or campaign behavior.
 
+## Planned retry workflow
+
+This workflow is unimplemented and not activated. The intended behavior is:
+
+- Select only the latest completed Pay-Per-Result indexing source. Take candidates only from its final unindexed report; `processed == size` alone does not establish completion or a final report.
+- Deduplicate exact URL strings, preserving query strings and trailing-slash semantics. Exclude any URL already present in any active regular or drip task, and never treat the workflow's own retry child as a new source.
+- Preview the selected source, candidate URLs, skipped URLs with reasons, and estimated token cost before any provider write. Keep source selection, approval, submission, and observation as separate states.
+- Require configured finite retry and token allowances before submission. No numeric retry or token budget is approved here.
+- Use a one-shot deterministic core shared by MCP and the existing scheduler. No LLM, browser, or extra service is required at runtime; this foundation adds no scheduler or activated schedule.
+- Consider a small local SQLite store for durable submission intents, lineage, and a lock. Provider idempotency is not documented, so reconcile unknown submission outcomes before any retry rather than blindly resubmitting.
+- Observe provider results separately from submission. A terminal provider result records that provider's outcome and does not establish fresh Google indexing truth.
+
+## Review and delivery
+
 Robin review automation is installed on the default branch. Substantive changes require a real review of their exact head plus CI and delivery verification. The workflow excludes `synchronize`; later pushes need an authorized manual review within the task budget. Fork PR events lack repository secrets and need an authorized maintainer command through the default-branch workflow. Deployment, scheduling, and releases remain outside this foundation.
