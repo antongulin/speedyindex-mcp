@@ -592,7 +592,7 @@ test('TSP-06: status POST uses deadline, redirect, body bound, and recovery guar
   let bodyApi: Awaited<ReturnType<typeof fixture>> | undefined;
 
   try {
-    const timeoutClient = statusClient(timeoutApi.origin, 150);
+    const timeoutClient = statusClient(timeoutApi.origin, 1000);
     const timedOut = timeoutClient
       .getTaskStatus({ family: 'google/indexer', taskId: 'timeout' })
       .then(
