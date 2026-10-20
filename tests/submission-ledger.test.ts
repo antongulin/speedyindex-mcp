@@ -46,6 +46,8 @@ type BudgetOverrides = Omit<Partial<TrustedBudgetContext>, 'caps'> & {
   caps?: Partial<UnitVector>;
 };
 
+type CloseableTestHandle = { close(): void };
+
 type InputOverrides = Omit<Partial<PrepareIntentInput>, 'budget'> & {
   budget?: BudgetOverrides;
 };
@@ -362,7 +364,7 @@ function cleanupErrorMessage(error: unknown) {
 
 async function cleanupLedgerTestRoot(
   root: string,
-  ledgers: readonly SubmissionLedger[],
+  handles: readonly CloseableTestHandle[],
   children: readonly ChildHandle[] = [],
 ) {
   const failures: string[] = [];
@@ -377,12 +379,12 @@ async function cleanupLedgerTestRoot(
     }
   }
 
-  for (const [index, ledger] of ledgers.entries()) {
+  for (const [index, handle] of handles.entries()) {
     try {
-      ledger.close();
+      handle.close();
     } catch (error) {
       failures.push(
-        `ledger handle ${index + 1} close: ${cleanupErrorMessage(error)}`,
+        `SQLite handle ${index + 1} close: ${cleanupErrorMessage(error)}`,
       );
     }
   }
@@ -401,6 +403,15 @@ async function cleanupLedgerTestRoot(
       { cause: error },
     );
   }
+}
+
+function closeTrackedHandle(
+  handle: CloseableTestHandle,
+  handles: CloseableTestHandle[],
+) {
+  handle.close();
+  const index = handles.indexOf(handle);
+  if (index >= 0) handles.splice(index, 1);
 }
 
 function createBareSqlite(
@@ -1192,17 +1203,17 @@ test('L03: separate processes cannot duplicate IDs or over-reserve a period', as
 test('L04: one process owns the dispatch claim and its result token', async () => {
   const root = createPrivateRoot();
   const children: ChildHandle[] = [];
-  let ledger: SubmissionLedger | undefined;
+  const handles: CloseableTestHandle[] = [];
   try {
     const stateDirectory = join(root, 'state');
-    ledger = initializeLedger({ stateDirectory });
+    const ledger = initializeLedger({ stateDirectory });
+    handles.push(ledger);
     const input = makeInput({
       requestId: 'cross-process-claim',
       submittedUrls: ['https://example.test/cross-process-claim'],
     });
     const prepared = createIntent(ledger, input);
-    ledger.close();
-    ledger = undefined;
+    closeTrackedHandle(ledger, handles);
 
     const { children: contenders, ready } = await startChildrenAtReady(
       [
@@ -1278,19 +1289,19 @@ test('L04: one process owns the dispatch claim and its result token', async () =
       },
     });
   } finally {
-    ledger?.close();
-    await Promise.all(children.map(stopAndReap));
-    rmSync(root, { recursive: true, force: true });
+    await cleanupLedgerTestRoot(root, handles, children);
   }
 }, 30_000);
 
 test('L05: a killed dispatcher remains held after database reopen', async () => {
   const root = createPrivateRoot();
   const children: ChildHandle[] = [];
+  const handles: CloseableTestHandle[] = [];
   try {
     const stateDirectory = join(root, 'state');
     const initial = initializeLedger({ stateDirectory });
-    initial.close();
+    handles.push(initial);
+    closeTrackedHandle(initial, handles);
     const input = makeInput({
       requestId: 'crash-after-claim',
       submittedUrls: ['https://example.test/crash-after-claim'],
@@ -1308,6 +1319,7 @@ test('L05: a killed dispatcher remains held after database reopen', async () => 
     expect(await bounded(child.stderr)).toBe('');
 
     const reopened = openLedger({ stateDirectory });
+    handles.push(reopened);
     try {
       expect(
         reopened.readIntent(fakeCredential, input.requestId),
@@ -1327,7 +1339,7 @@ test('L05: a killed dispatcher remains held after database reopen', async () => 
         reopened.claimDispatch('Z'.repeat(43) as DispatchCapability, 0),
       ).toEqual({ kind: 'lost' });
     } finally {
-      reopened.close();
+      closeTrackedHandle(reopened, handles);
     }
     const audit = inspectIntent(
       stateDirectory,
@@ -1342,8 +1354,43 @@ test('L05: a killed dispatcher remains held after database reopen', async () => 
       },
     });
   } finally {
-    await Promise.all(children.map(stopAndReap));
-    rmSync(root, { recursive: true, force: true });
+    await cleanupLedgerTestRoot(root, handles, children);
+  }
+}, 30_000);
+
+test('R5-BUSY: a locked ledger rolls back and can reserve after release', async () => {
+  const root = createPrivateRoot();
+  const handles: CloseableTestHandle[] = [];
+  try {
+    const stateDirectory = join(root, 'state');
+    const ledger = initializeLedger({ stateDirectory });
+    handles.push(ledger);
+    const rawDatabase = new Database(
+      join(stateDirectory, 'ledger.sqlite'),
+      sqliteConstants.SQLITE_OPEN_READWRITE |
+        sqliteConstants.SQLITE_OPEN_NOFOLLOW,
+    );
+    handles.push(rawDatabase);
+
+    rawDatabase.exec('BEGIN IMMEDIATE');
+    const input = makeInput({
+      requestId: 'busy-lock-retry',
+      submittedUrls: ['https://example.test/busy-lock-retry'],
+      budget: { caps: { tokens: 3, indexer: 2, checker: 1 } },
+      reservation: { tokens: 3, indexer: 2, checker: 1 },
+    });
+    expectLedgerError(() => ledger.prepareIntent(input), 'LedgerBusy');
+
+    rawDatabase.exec('ROLLBACK');
+    expect(ledger.readIntent(fakeCredential, input.requestId)).toBeNull();
+    expect(ledger.prepareIntent(input).kind).toBe('created');
+    expect(ledger.readIntent(fakeCredential, input.requestId)).toMatchObject({
+      periodId: input.budget.periodId,
+      reservation: { tokens: 3, indexer: 2, checker: 1 },
+      state: 'prepared',
+    });
+  } finally {
+    await cleanupLedgerTestRoot(root, handles);
   }
 }, 30_000);
 

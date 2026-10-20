@@ -1089,8 +1089,6 @@ class LocalSubmissionLedger implements SubmissionLedger {
     this.ensureOpen();
     validatePrepareInput(value);
     const input = value;
-    const capability = mintToken() as DispatchCapability;
-    const capabilityDigest = digestToken(capability);
     const now = Date.now();
     if (!Number.isSafeInteger(now)) fail('LedgerUnavailable');
 
@@ -1127,6 +1125,8 @@ class LocalSubmissionLedger implements SubmissionLedger {
         validateAndRecordPeriod(this.database, input.budget, now);
         assertWithinBudget(this.database, input);
 
+        const capability = mintToken() as DispatchCapability;
+        const capabilityDigest = digestToken(capability);
         this.database
           .query(
             `INSERT INTO intents (
@@ -1201,9 +1201,9 @@ class LocalSubmissionLedger implements SubmissionLedger {
     this.ensureOpen();
     const capability = checkToken(capabilityValue);
     validateStateVersion(expectedStateVersion);
-    const capabilityDigest = digestToken(capability);
 
     try {
+      const capabilityDigest = digestToken(capability);
       return withImmediateTransaction(this.database, () => {
         const row = this.database
           .query(
