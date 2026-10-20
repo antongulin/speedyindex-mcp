@@ -31,6 +31,9 @@ function schemaContainsNull(schema: unknown): boolean {
 test('LT-06: real SDK process registers all read-only tools with structured and text output', async () => {
   const statusBodies: string[] = [];
   const reportBodies: string[] = [];
+  const opaqueDonor = {
+    unknown: { nested: [null, false, 2, 'keep', { inner: null }] },
+  };
   const api = await fixture((request, response) => {
     if (request.url === '/v2/account') {
       response.end(JSON.stringify(account));
@@ -54,7 +57,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
                   id: parsed.task_id,
                   size: 1,
                   processed_count: 1,
-                  donors: [],
+                  donors: [opaqueDonor],
                   page: parsed.page,
                   last_page: 0,
                 }
@@ -282,7 +285,8 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
         ?.const,
     ).toBe('backlink/checker');
     const donors = backlinkOutput?.properties?.donors as
-      { items?: Record<string, unknown> } | undefined;
+      { maxItems?: number; items?: Record<string, unknown> } | undefined;
+    expect(donors?.maxItems).toBe(100);
     expect(donors?.items?.type).toBe('object');
     expect(donors?.items?.additionalProperties).not.toBe(false);
     expect(schemaContainsNull(reportTool?.outputSchema)).toBe(true);
@@ -386,7 +390,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       taskId: 'sdk-backlink',
       size: 1,
       processedCount: 1,
-      donors: [],
+      donors: [opaqueDonor],
       page: 0,
       lastPage: 0,
     });

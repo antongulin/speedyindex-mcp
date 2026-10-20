@@ -62,7 +62,7 @@ const backlinkReportSchema = z.strictObject({
   processedCount: safeNonnegativeInteger,
   page: safeNonnegativeInteger,
   lastPage: safeNonnegativeInteger,
-  donors: z.array(z.record(z.string(), z.json())),
+  donors: z.array(z.record(z.string(), z.json())).max(100),
   isCompleted: z.boolean().optional(),
 });
 
@@ -107,7 +107,7 @@ const providerBacklinkSchema = z.object({
   id: nonblankString,
   size: safeNonnegativeInteger,
   processed_count: safeNonnegativeInteger,
-  donors: z.array(z.record(z.string(), z.json())),
+  donors: z.array(z.record(z.string(), z.json())).max(100),
   page: safeNonnegativeInteger,
   last_page: safeNonnegativeInteger,
   is_completed: z.boolean().optional(),
