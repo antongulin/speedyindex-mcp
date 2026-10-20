@@ -754,7 +754,7 @@ test('RB-05: default response bound accepts 16 MiB and rejects one byte above', 
 test('RB-01: response byte boundary handles split multibyte UTF-8', async () => {
   const limitBytes = 128;
   const payload = new TextEncoder().encode(
-    JSON.stringify({ ...listResponse(0), ignored: 'é' }),
+    JSON.stringify(listResponse(0, [{ id: 'task-a', title: 'é' }])),
   );
   const exact = new Uint8Array(limitBytes).fill(0x20);
   exact.set(payload);
@@ -762,6 +762,8 @@ test('RB-01: response byte boundary handles split multibyte UTF-8', async () => 
   const over = new Uint8Array(limitBytes + 1).fill(0x20);
   over.set(payload);
   expect(splitAt).toBeGreaterThan(0);
+  expect(exact[splitAt - 1]).toBe(0xc3);
+  expect(exact[splitAt]).toBe(0xa9);
   expect(exact.byteLength).toBe(limitBytes);
   expect(new TextDecoder().decode(exact).length).toBeLessThan(exact.byteLength);
 
@@ -785,7 +787,9 @@ test('RB-01: response byte boundary handles split multibyte UTF-8', async () => 
   );
   const input = { searchEngine: 'google', taskType: 'indexer', page: 0 };
 
-  await expect(client.listTasks(input)).resolves.toMatchObject({ tasks: [] });
+  await expect(client.listTasks(input)).resolves.toMatchObject({
+    tasks: [{ id: 'task-a', title: 'é' }],
+  });
   await expect(client.listTasks(input)).rejects.toMatchObject({
     kind: 'response',
     message: 'SpeedyIndex returned an invalid task-list response.',
