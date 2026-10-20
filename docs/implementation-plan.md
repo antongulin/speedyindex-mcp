@@ -19,7 +19,7 @@ The Bun/TypeScript stdio foundation implements `get_balance`, `list_tasks`, `get
 
 The current runtime exposes all four implemented tools. See [README.md](../README.md) for build/run commands and [architecture](architecture.md) for validation, cancellation, and error boundaries. Synthetic HTTP and real stdio tests exercise the provider contract and built CLI without live provider calls.
 
-Later submissions and retries need explicit action boundaries, input validation, cost visibility, and protection against accidental duplicate jobs. Decide storage and any persisted-history or campaign-reporting contracts in their own scoped work before promising those behaviors.
+Later submissions and retries need explicit action boundaries, input validation, cost visibility, and protection against accidental duplicate jobs. The internal ledger establishes local request and reservation state; tool-specific policy, quote, lineage, and campaign-reporting contracts still need scoped work.
 
 ## Planned retry workflow
 
@@ -30,7 +30,7 @@ This workflow is unimplemented and not activated. The current `get_task_report` 
 - Preview the selected source, candidate URLs, skipped URLs with reasons, and estimated token cost before any provider write. Keep source selection, approval, submission, and observation as separate states.
 - Require configured finite retry and token allowances before submission. No numeric retry or token budget is approved here.
 - Use a one-shot deterministic core shared by MCP and the existing scheduler. No LLM, browser, or extra service is required at runtime; this foundation adds no scheduler or activated schedule.
-- Consider a small local SQLite store for durable submission intents, lineage, and a lock. Provider idempotency is not documented, so reconcile unknown submission outcomes before any retry rather than blindly resubmitting.
+- Use the internal local SQLite submission-ledger prerequisite for durable request identity, reservations, and dispatch state. The current runtime does not open or initialize it. Provider idempotency is not documented, so a later tool contract must resolve unknown outcomes before retrying a submission.
 - Observe provider results separately from submission. A terminal provider result records that provider's outcome and does not establish fresh Google indexing truth.
 
 ## Review and delivery

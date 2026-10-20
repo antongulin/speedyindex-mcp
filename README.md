@@ -99,7 +99,7 @@ The tests use dummy credentials, loopback HTTP fixtures, the official MCP client
 
 See [architecture](docs/architecture.md), [dependency decisions](docs/dependencies.md), [contributing](CONTRIBUTING.md), [security reporting](SECURITY.md), [agent guidance](AGENTS.md), and the [LLM documentation index](llms.txt).
 
-The other 8 tools remain in the [roadmap](docs/implementation-plan.md); task creation/submission, invoices, retries, storage, and scheduling are not implemented.
+The other 8 tools remain in the [roadmap](docs/implementation-plan.md). An internal SQLite ledger is an unexposed prerequisite for later submission work; the runtime does not open or initialize it. Task creation, provider submission, invoices, retries, runtime storage, and scheduling remain unimplemented.
 
 Licensed under [MIT](LICENSE). Documentation framework attribution is in [provenance](docs/provenance.md).
 
