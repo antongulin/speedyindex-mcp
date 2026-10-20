@@ -7,7 +7,7 @@ The Bun/TypeScript stdio foundation implements `get_balance`, `list_tasks`, `get
 | Implemented | `get_balance`           | Read all three account wallets without creating jobs |
 | Implemented | `list_tasks`            | Read one validated page of existing tasks            |
 | Implemented | `get_task_status`       | Read existing task status by family and task ID      |
-| Implemented | `get_task_report`       | Read one task report page                            |
+| Implemented | `get_task_report`       | Read one report; one bounded backlink page           |
 | Later       | `create_indexing_task`  | Submit URLs for indexing                             |
 | Later       | `create_index_check`    | Submit an index-status check                         |
 | Later       | `create_backlink_check` | Submit a backlink check                              |

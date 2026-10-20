@@ -357,6 +357,16 @@ test('TR-04: backlink reports preserve opaque JSON and enforce one-page coherenc
           last_page: parsed.page,
           is_completed: true,
         };
+      } else if (taskId === 'false-completion') {
+        result = {
+          id: taskId,
+          size: 3,
+          processed_count: 2,
+          donors: [opaqueDonor],
+          page: parsed.page,
+          last_page: parsed.page,
+          is_completed: false,
+        };
       } else if (taskId === 'max-rows') {
         result = {
           id: taskId,
@@ -469,6 +479,17 @@ test('TR-04: backlink reports preserve opaque JSON and enforce one-page coherenc
       task_id: 'explicit',
       page: 2,
       limit: 1,
+    });
+
+    const falseCompletion = await client.getTaskReport({
+      family: 'backlink/checker',
+      taskId: 'false-completion',
+    });
+    expect(falseCompletion).toMatchObject({
+      reportKind: 'backlink',
+      taskId: 'false-completion',
+      donors: [opaqueDonor],
+      isCompleted: false,
     });
 
     const maximum = await client.getTaskReport({
