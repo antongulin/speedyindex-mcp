@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Maintain the public implementation roadmap and source attribution.
+Maintain the roadmap, runtime architecture, dependency decisions, and source attribution.
 
 ## Ownership
 
-`implementation-plan.md` owns proposed scope and delivery gates. `provenance.md` owns documentation sources and revisions. `dox-LICENSE.txt` preserves the upstream notice verbatim.
+`implementation-plan.md` owns proposed scope and delivery gates. `architecture.md` describes runtime boundaries; `dependencies.md` records compatibility decisions. `provenance.md` owns documentation sources and revisions. `dox-LICENSE.txt` preserves the upstream notice verbatim.
 
 ## Local Contracts
 

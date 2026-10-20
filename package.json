@@ -1,0 +1,34 @@
+{
+  "name": "speedyindex-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Unofficial read-only SpeedyIndex MCP server",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.4.2"
+  },
+  "scripts": {
+    "start": "bun src/cli.ts",
+    "build": "bun build src/cli.ts --target=bun --outdir dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "bun test tests/client.test.ts tests/stdio.test.ts tests/cli.test.ts",
+    "test:built": "bun test tests/distribution.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@types/bun": "1.4.3",
+    "typescript": "6.0.3",
+    "eslint": "10.13.0",
+    "@eslint/js": "10.0.1",
+    "typescript-eslint": "8.72.0",
+    "prettier": "3.9.10"
+  }
+}

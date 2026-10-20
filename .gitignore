@@ -1,0 +1,10 @@
+.env*
+!.env.example
+.dev.vars
+.codegraph/
+node_modules/
+dist/
+coverage/
+test-results/
+*.log
+.DS_Store
