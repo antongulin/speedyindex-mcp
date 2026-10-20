@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { balanceResultSchema, listTasksResultSchema } from '../src/client';
 import { taskStatusResultSchema } from '../src/task-status';
+import { taskReportOutputSchema } from '../src/task-report';
 import {
   account,
   bounded,
@@ -11,8 +12,25 @@ import {
 } from './helpers';
 import { verifyEof } from './stdio-eof';
 
+type SchemaBranch = {
+  type?: string;
+  additionalProperties?: unknown;
+  required?: string[];
+  properties?: Record<string, unknown>;
+};
+
+function schemaContainsNull(schema: unknown): boolean {
+  if (Array.isArray(schema)) return schema.some(schemaContainsNull);
+  if (typeof schema !== 'object' || schema === null) return false;
+  const object = schema as Record<string, unknown>;
+  if (object.type === 'null') return true;
+  if (Array.isArray(object.type) && object.type.includes('null')) return true;
+  return Object.values(object).some(schemaContainsNull);
+}
+
 test('LT-06: real SDK process registers all read-only tools with structured and text output', async () => {
   const statusBodies: string[] = [];
+  const reportBodies: string[] = [];
   const api = await fixture((request, response) => {
     if (request.url === '/v2/account') {
       response.end(JSON.stringify(account));
@@ -23,6 +41,36 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       void (async () => {
         for await (const chunk of request) chunks.push(Buffer.from(chunk));
         const body = Buffer.concat(chunks).toString('utf8');
+        if (request.url?.endsWith('/report')) {
+          reportBodies.push(body);
+          const parsed = JSON.parse(body) as {
+            task_id: string;
+            page?: number;
+            limit?: number;
+          };
+          const result =
+            request.url === '/v2/task/backlink/checker/report'
+              ? {
+                  id: parsed.task_id,
+                  size: 1,
+                  processed_count: 1,
+                  donors: [],
+                  page: parsed.page,
+                  last_page: 0,
+                }
+              : {
+                  id: parsed.task_id,
+                  size: 1,
+                  processed_count: 1,
+                  indexed_links: [],
+                  unindexed_links: [],
+                  type: 'google/indexer',
+                  title: 'synthetic SDK report',
+                  created_at: '2026-10-20T10:00:00.000Z',
+                };
+          response.end(JSON.stringify({ code: 0, result }));
+          return;
+        }
         statusBodies.push(body);
         const parsed = JSON.parse(body) as {
           task_id?: string;
@@ -57,6 +105,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       'get_balance',
       'list_tasks',
       'get_task_status',
+      'get_task_report',
     ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
@@ -138,6 +187,111 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       idempotentHint: true,
       openWorldHint: true,
     });
+    const reportTool = tools[3];
+    const reportInputVariants = (
+      reportTool?.inputSchema as { oneOf?: SchemaBranch[] } | undefined
+    )?.oneOf;
+    expect(reportTool?.inputSchema).toMatchObject({ type: 'object' });
+    expect(reportInputVariants).toHaveLength(2);
+    const genericInput = reportInputVariants?.find((variant) => {
+      const family = variant.properties?.family as
+        { enum?: string[] } | undefined;
+      return family?.enum !== undefined;
+    });
+    const backlinkInput = reportInputVariants?.find((variant) => {
+      const family = variant.properties?.family as
+        { const?: string } | undefined;
+      return family?.const === 'backlink/checker';
+    });
+    expect(genericInput).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['family', 'taskId'],
+      properties: {
+        family: {
+          enum: [
+            'google/indexer',
+            'google/checker',
+            'yandex/indexer',
+            'yandex/checker',
+            'bing/checker',
+          ],
+        },
+        taskId: { type: 'string' },
+      },
+    });
+    expect(genericInput?.properties?.page).toBeUndefined();
+    expect(genericInput?.properties?.limit).toBeUndefined();
+    expect(backlinkInput).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['family', 'taskId'],
+      properties: {
+        family: { const: 'backlink/checker' },
+        page: { type: 'integer', default: 0 },
+        limit: { type: 'integer', default: 100, minimum: 1, maximum: 100 },
+      },
+    });
+    expect(
+      (backlinkInput?.properties?.page as { minimum?: number } | undefined)
+        ?.minimum,
+    ).toBe(0);
+    const reportOutputVariants = (
+      reportTool?.outputSchema as { oneOf?: SchemaBranch[] } | undefined
+    )?.oneOf;
+    expect(reportTool?.outputSchema).toMatchObject({ type: 'object' });
+    expect(reportOutputVariants).toHaveLength(2);
+    expect(
+      reportOutputVariants
+        ?.map(
+          (variant) =>
+            (variant.properties?.reportKind as { const?: string } | undefined)
+              ?.const,
+        )
+        .sort(),
+    ).toEqual(['backlink', 'links']);
+    for (const variant of reportOutputVariants ?? []) {
+      expect(variant).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+      });
+      expect(variant.required).toContain('reportKind');
+    }
+    const backlinkOutput = reportOutputVariants?.find(
+      (variant) =>
+        (variant.properties?.reportKind as { const?: string } | undefined)
+          ?.const === 'backlink',
+    );
+    const linksOutput = reportOutputVariants?.find(
+      (variant) =>
+        (variant.properties?.reportKind as { const?: string } | undefined)
+          ?.const === 'links',
+    );
+    expect(
+      (linksOutput?.properties?.family as { enum?: string[] } | undefined)
+        ?.enum,
+    ).toEqual([
+      'google/indexer',
+      'google/checker',
+      'yandex/indexer',
+      'yandex/checker',
+      'bing/checker',
+    ]);
+    expect(
+      (backlinkOutput?.properties?.family as { const?: string } | undefined)
+        ?.const,
+    ).toBe('backlink/checker');
+    const donors = backlinkOutput?.properties?.donors as
+      { items?: Record<string, unknown> } | undefined;
+    expect(donors?.items?.type).toBe('object');
+    expect(donors?.items?.additionalProperties).not.toBe(false);
+    expect(schemaContainsNull(reportTool?.outputSchema)).toBe(true);
+    expect(reportTool?.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
     const result = await session.client.callTool({
       name: 'get_balance',
       arguments: {},
@@ -195,6 +349,64 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
     expect(batchStatusResult.content).toEqual([
       { type: 'text', text: JSON.stringify(parsedBatchStatus) },
     ]);
+    const genericReportResult = await session.client.callTool({
+      name: 'get_task_report',
+      arguments: { family: 'google/indexer', taskId: 'sdk-report' },
+    });
+    expect(genericReportResult.isError).not.toBe(true);
+    const parsedGenericReport = taskReportOutputSchema.parse(
+      genericReportResult.structuredContent,
+    );
+    expect(parsedGenericReport).toEqual({
+      family: 'google/indexer',
+      reportKind: 'links',
+      taskId: 'sdk-report',
+      size: 1,
+      processedCount: 1,
+      indexedLinks: [],
+      unindexedLinks: [],
+      type: 'google/indexer',
+      title: 'synthetic SDK report',
+      createdAt: '2026-10-20T10:00:00.000Z',
+    });
+    expect(genericReportResult.content).toEqual([
+      { type: 'text', text: JSON.stringify(parsedGenericReport) },
+    ]);
+    const backlinkReportResult = await session.client.callTool({
+      name: 'get_task_report',
+      arguments: { family: 'backlink/checker', taskId: 'sdk-backlink' },
+    });
+    expect(backlinkReportResult.isError).not.toBe(true);
+    const parsedBacklinkReport = taskReportOutputSchema.parse(
+      backlinkReportResult.structuredContent,
+    );
+    expect(parsedBacklinkReport).toEqual({
+      family: 'backlink/checker',
+      reportKind: 'backlink',
+      taskId: 'sdk-backlink',
+      size: 1,
+      processedCount: 1,
+      donors: [],
+      page: 0,
+      lastPage: 0,
+    });
+    expect(backlinkReportResult.content).toEqual([
+      { type: 'text', text: JSON.stringify(parsedBacklinkReport) },
+    ]);
+    const invalidReportInput = await session.client.callTool({
+      name: 'get_task_report',
+      arguments: {
+        family: 'google/indexer',
+        taskId: 'invalid-report-input',
+        page: 1,
+      },
+    });
+    expect(invalidReportInput.isError).toBe(true);
+    expect(invalidReportInput.structuredContent).toBeUndefined();
+    expect(reportBodies).toEqual([
+      JSON.stringify({ task_id: 'sdk-report' }),
+      JSON.stringify({ task_id: 'sdk-backlink', page: 0, limit: 100 }),
+    ]);
     expect(statusBodies).toEqual([
       JSON.stringify({ task_id: 'status-task' }),
       JSON.stringify({ task_ids: batchIds }),
@@ -204,6 +416,8 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       { method: 'GET', path: '/v2/task/google/indexer/list/0' },
       { method: 'POST', path: '/v2/task/google/indexer/status' },
       { method: 'POST', path: '/v2/task/google/indexer/status' },
+      { method: 'POST', path: '/v2/task/google/indexer/report' },
+      { method: 'POST', path: '/v2/task/backlink/checker/report' },
     ]);
     expect(session.stderr()).toBe('');
   } finally {
@@ -283,6 +497,39 @@ test('TSP-05: MCP status errors redact provider details and omit structured outp
     expect(JSON.stringify(result)).not.toContain(sentinel);
     expect(result.content).toEqual([
       { type: 'text', text: 'SpeedyIndex rejected the task-status request.' },
+    ]);
+    expect(api.requests).toHaveLength(1);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('TR-06: MCP report errors redact provider details and omit structured output', async () => {
+  const sentinel = 'synthetic-report-error-detail';
+  const api = await fixture((_request, response) =>
+    response.end(
+      JSON.stringify({ code: 9, message: `${dummyKey}-${sentinel}` }),
+    ),
+  );
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+
+  try {
+    session = await connect(api.origin);
+    const result = await session.client.callTool({
+      name: 'get_task_report',
+      arguments: { family: 'google/indexer', taskId: 'requested' },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain(dummyKey);
+    expect(JSON.stringify(result)).not.toContain(sentinel);
+    expect(result.content).toEqual([
+      { type: 'text', text: 'SpeedyIndex rejected the task-report request.' },
     ]);
     expect(api.requests).toHaveLength(1);
     expect(session.stderr()).toBe('');
@@ -594,6 +841,81 @@ test('TSP-08: SDK status cancellation aborts POST and the next call succeeds', a
     expect(api.requests.map(({ method, path }) => ({ method, path }))).toEqual([
       { method: 'POST', path: '/v2/task/google/indexer/status' },
       { method: 'POST', path: '/v2/task/google/indexer/status' },
+    ]);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('TR-07: SDK report cancellation aborts POST and the next report succeeds', async () => {
+  const arrived = deferred<void>();
+  const disconnected = deferred<void>();
+  let first = true;
+  const api = await fixture((request, response) => {
+    request.on('data', () => undefined);
+    request.on('end', () => {
+      if (first) {
+        first = false;
+        response.on('close', () => disconnected.resolve());
+        arrived.resolve();
+      } else {
+        response.end(
+          JSON.stringify({
+            code: 0,
+            result: {
+              id: 'next-report',
+              size: 1,
+              processed_count: 1,
+              indexed_links: [],
+              unindexed_links: [],
+              type: 'google/indexer',
+              title: 'synthetic cancellation recovery',
+              created_at: '2026-10-20T10:00:00.000Z',
+            },
+          }),
+        );
+      }
+    });
+  });
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+
+  try {
+    session = await connect(api.origin);
+    const controller = new AbortController();
+    const cancelled = session.client
+      .callTool(
+        {
+          name: 'get_task_report',
+          arguments: { family: 'google/indexer', taskId: 'cancelled-report' },
+        },
+        { signal: controller.signal },
+      )
+      .then(
+        () => 'unexpected success',
+        () => 'cancelled',
+      );
+    await bounded(arrived.promise);
+    controller.abort();
+    expect(await bounded(cancelled)).toBe('cancelled');
+    await bounded(disconnected.promise);
+
+    const next = await session.client.callTool({
+      name: 'get_task_report',
+      arguments: { family: 'google/indexer', taskId: 'next-report' },
+    });
+    expect(next.isError).not.toBe(true);
+    expect(taskReportOutputSchema.parse(next.structuredContent)).toMatchObject({
+      reportKind: 'links',
+      taskId: 'next-report',
+    });
+    expect(api.requests.map(({ method, path }) => ({ method, path }))).toEqual([
+      { method: 'POST', path: '/v2/task/google/indexer/report' },
+      { method: 'POST', path: '/v2/task/google/indexer/report' },
     ]);
     expect(session.stderr()).toBe('');
   } finally {

@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { version } from '../package.json';
 import {
+  normalizeTaskReport,
+  TaskReportError,
+  taskReportInputSchema,
+} from './task-report';
+import {
   normalizeTaskStatusResult,
   TaskStatusError,
   taskStatusInputSchema,
@@ -193,6 +198,14 @@ const taskStatusRoutes: Record<TaskFamily, string> = {
   'yandex/checker': '/v2/task/yandex/checker/status',
   'bing/checker': '/v2/task/bing/checker/status',
   'backlink/checker': '/v2/task/backlink/checker/status',
+};
+const taskReportRoutes: Record<TaskFamily, string> = {
+  'google/indexer': '/v2/task/google/indexer/report',
+  'google/checker': '/v2/task/google/checker/report',
+  'yandex/indexer': '/v2/task/yandex/indexer/report',
+  'yandex/checker': '/v2/task/yandex/checker/report',
+  'bing/checker': '/v2/task/bing/checker/report',
+  'backlink/checker': '/v2/task/backlink/checker/report',
 };
 
 type JsonRequestOptions = {
@@ -432,6 +445,40 @@ export class SpeedyIndexClient {
       if (error instanceof TaskStatusError) throw error;
       if (error instanceof RequestError) throw new TaskStatusError(error.kind);
       throw new TaskStatusError('response');
+    }
+  }
+
+  async getTaskReport(input: unknown, signal?: AbortSignal) {
+    const parsedInput = taskReportInputSchema.safeParse(input);
+    if (!parsedInput.success) throw new TaskReportError('input');
+    const args = parsedInput.data;
+    const key = this.apiKey?.trim();
+    if (!key) throw new TaskReportError('credentials');
+
+    const isBacklink = args.family === 'backlink/checker';
+    const requestBody = isBacklink
+      ? { task_id: args.taskId, page: args.page, limit: args.limit }
+      : { task_id: args.taskId };
+
+    try {
+      const response = await requestJson(
+        this.fetchAccount,
+        key,
+        new URL(taskReportRoutes[args.family], apiOrigin).toString(),
+        {
+          method: 'POST',
+          timeoutMs: this.timeoutMs,
+          maxResponseBytes: this.maxResponseBytes,
+          ...(signal === undefined ? {} : { signal }),
+          body: JSON.stringify(requestBody),
+        },
+      );
+      return normalizeTaskReport(args, response);
+    } catch (error) {
+      if (signal?.aborted) throw new TaskReportError('cancelled');
+      if (error instanceof TaskReportError) throw error;
+      if (error instanceof RequestError) throw new TaskReportError(error.kind);
+      throw new TaskReportError('response');
     }
   }
 }

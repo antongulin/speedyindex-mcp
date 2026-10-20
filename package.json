@@ -15,7 +15,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "bun test tests/client.test.ts tests/task-status.test.ts tests/stdio.test.ts tests/cli.test.ts",
+    "test": "bun test tests/client.test.ts tests/task-status.test.ts tests/task-report.test.ts tests/stdio.test.ts tests/cli.test.ts",
     "test:built": "bun test tests/distribution.test.ts"
   },
   "dependencies": {
