@@ -5,8 +5,9 @@ import { verifyEof } from './stdio-eof';
 
 test('F09: built CLI initializes, lists and calls get_balance', async () => {
   const api = await fixture((_req, res) => res.end(JSON.stringify(account)));
-  const session = await connect(api.origin, 'dist/cli.js');
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
+    session = await connect(api.origin, 'dist/cli.js');
     expect(session.client.getServerVersion()?.name).toBe('speedyindex-mcp');
     expect(
       (await session.client.listTools()).tools.map((tool) => tool.name),
@@ -22,8 +23,11 @@ test('F09: built CLI initializes, lists and calls get_balance', async () => {
     expect(session.stderr()).toBe('');
     expect(api.requests).toHaveLength(1);
   } finally {
-    await session.close();
-    await api.close();
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
   }
 });
 

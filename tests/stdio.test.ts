@@ -12,8 +12,9 @@ import { verifyEof } from './stdio-eof';
 
 test('F01: real SDK process initializes, advertises only read-only get_balance and calls it', async () => {
   const api = await fixture((_req, res) => res.end(JSON.stringify(account)));
-  const session = await connect(api.origin);
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
+    session = await connect(api.origin);
     expect(session.client.getServerVersion()).toEqual({
       name: 'speedyindex-mcp',
       version: '0.1.0',
@@ -47,8 +48,11 @@ test('F01: real SDK process initializes, advertises only read-only get_balance a
     expect(api.requests).toHaveLength(1);
     expect(session.stderr()).toBe('');
   } finally {
-    await session.close();
-    await api.close();
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
   }
 });
 
@@ -78,8 +82,9 @@ for (const [label, key, mode] of [
     const api = await fixture((_req, res) =>
       res.end(JSON.stringify({ code: 3, message: dummyKey })),
     );
-    const session = await connect(api.origin, 'src/cli.ts', key, mode);
+    let session: Awaited<ReturnType<typeof connect>> | undefined;
     try {
+      session = await connect(api.origin, 'src/cli.ts', key, mode);
       const result = await session.client.callTool({
         name: 'get_balance',
         arguments: {},
@@ -98,8 +103,11 @@ for (const [label, key, mode] of [
           },
         ]);
     } finally {
-      await session.close();
-      await api.close();
+      try {
+        await session?.close();
+      } finally {
+        await api.close();
+      }
     }
   });
 }
@@ -115,8 +123,9 @@ test('F07: SDK cancellation aborts underlying HTTP and next call succeeds', asyn
       arrived.resolve();
     } else res.end(JSON.stringify(account));
   });
-  const session = await connect(api.origin);
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
+    session = await connect(api.origin);
     const controller = new AbortController();
     const cancelled = session.client
       .callTool(
@@ -142,7 +151,10 @@ test('F07: SDK cancellation aborts underlying HTTP and next call succeeds', asyn
     expect(api.requests).toHaveLength(2);
     expect(session.stderr()).toBe('');
   } finally {
-    await session.close();
-    await api.close();
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
   }
 });
