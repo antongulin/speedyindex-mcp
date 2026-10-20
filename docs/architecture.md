@@ -16,6 +16,14 @@ Task reports have a separate `src/task-report.ts` schema and normalizer. Generic
 
 All four tools return structured content and equivalent JSON text. Errors use fixed messages without provider bodies or thrown error details.
 
-The SDK stdio transport handles stdin EOF, closes the connection, and aborts in-flight requests. No web listener, database, scheduler, task submission, or deployment service is part of this package. CodeGraph is an optional developer tool, independent of the runtime and build.
+The SDK stdio transport handles stdin EOF, closes the connection, and aborts in-flight requests. The runtime starts no web listener, database connection, scheduler, task submission, or deployment service. CodeGraph is an optional developer tool, independent of the runtime and build.
+
+## Unexposed submission-ledger prerequisite
+
+`src/submission-ledger.ts` provides a local SQLite core for a later `create_indexing_task` tool. It is not imported by the server, CLI, or provider client. The runtime still exposes four read-only tools, and the other eight tools remain on the roadmap. No operator path, configuration file, initialized ledger, or activation flow exists.
+
+The internal API records immutable request identity, exact submitted URL strings, three independent unit reservations, and prepared, dispatching, and terminal outcomes. It accepts trusted scope, period, caps, policy digests, and quote data from a future host; this prerequisite selects no values. `initializeLedger` creates only a new private local directory and database. Normal `openLedger` requires a complete existing version-one database and does not create, repair, or replace state. An unresolved dispatch remains held across reopen; this module provides no automatic retry, reconciliation, reset, or cleanup operation.
+
+SQLite transactions coordinate cooperating processes that open the same local database. They do not reserve SpeedyIndex wallet funds, identify an account, coordinate database copies or hosts, prevent other clients spending the same wallet, or guarantee that distinct submissions cannot create duplicate jobs. WAL with SQLite `synchronous=FULL` stays subject to the VFS, filesystem, storage hardware, and operating system; it is not a power-loss guarantee.
 
 The provider contract comes from the [official API reference](https://en.speedyindex.com/api.php) and the [account API page](https://app.speedyindex.com/cabinet/api). This integration is unofficial. Future tools need their own scope, action boundaries, documentation, and verification; see the [roadmap](implementation-plan.md).
