@@ -16,7 +16,7 @@ Configure Robin review automation for this public repository.
 - Map only the repository secrets `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` under their matching names. Never store their values in Git. Secret configuration and hosted execution require separate verification.
 - Keep `reasoning-effort: max` in `robin.yml`; other settings use upstream defaults. Config is read from the PR base branch.
 - PR-triggered bootstrap reviews can run before the workflow reaches the default branch. `issue_comment` commands require the workflow on the default branch. Because `synchronize` is excluded, substantive follow-up pushes require an authorized manual `/robin` within the task review budget.
-- Fork `pull_request` runs do not receive the three repository secrets; the pinned action fails when the base URL or model is missing. External PRs need an authorized maintainer `/robin` command through the default-branch `issue_comment` workflow. Do not enable `pull_request_target` or execute fork code to obtain secrets.
+- Fork `pull_request` runs do not receive the three repository secrets; the referenced Robin action fails when the base URL or model is missing. External PRs need an authorized maintainer `/robin` command through the default-branch `issue_comment` workflow. Do not enable `pull_request_target` or execute fork code to obtain secrets.
 - Land the minimal initial bootstrap under the shared bootstrap exception using lead review and available checks. A hosted result proves only the reviewed revision and configuration used; it does not validate a later head or `max` effort from config absent on the base. Substantive code must receive a real Robin review of its exact head. Do not describe static checks as a completed hosted review.
 
 ## Work Guidance
