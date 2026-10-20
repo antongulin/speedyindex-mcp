@@ -1,6 +1,6 @@
 # SpeedyIndex MCP
 
-An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server that reads your [SpeedyIndex](https://speedyindex.com/) account balances and existing tasks.
+An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server that reads your [SpeedyIndex](https://app.speedyindex.com/r/zqgax9) account balances and existing tasks. This referral link may support project maintenance.
 
 [![CI](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -20,8 +20,6 @@ bun dist/cli.js --help
 ```
 
 Sign in to the [official SpeedyIndex API page](https://app.speedyindex.com/cabinet/api) to obtain your own API key. See the [public API reference](https://en.speedyindex.com/api.php) for provider documentation.
-
-SpeedyIndex referral link: [open SpeedyIndex](https://app.speedyindex.com/r/zqgax9) (may support maintenance of this project).
 
 Provide `SPEEDYINDEX_API_KEY` through your process manager's secret environment, then launch `bun dist/cli.js` from the repository directory. It waits for an MCP client on stdin/stdout; it is not an interactive shell command. `bun run start` runs the source entrypoint during development. `.env.example` documents the variable without containing a real credential.
 
