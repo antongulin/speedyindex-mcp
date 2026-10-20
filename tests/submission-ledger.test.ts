@@ -354,6 +354,55 @@ async function stopAndReap(handle: ChildHandle) {
   await bounded(handle.stderr, testTimeoutMs);
 }
 
+function cleanupErrorMessage(error: unknown) {
+  return error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : String(error);
+}
+
+async function cleanupLedgerTestRoot(
+  root: string,
+  ledgers: readonly SubmissionLedger[],
+  children: readonly ChildHandle[] = [],
+) {
+  const failures: string[] = [];
+  const reapResults = await Promise.allSettled(
+    children.map((child) => stopAndReap(child)),
+  );
+  for (const [index, result] of reapResults.entries()) {
+    if (result.status === 'rejected') {
+      failures.push(
+        `child ${index + 1} stop/reap: ${cleanupErrorMessage(result.reason)}`,
+      );
+    }
+  }
+
+  for (const [index, ledger] of ledgers.entries()) {
+    try {
+      ledger.close();
+    } catch (error) {
+      failures.push(
+        `ledger handle ${index + 1} close: ${cleanupErrorMessage(error)}`,
+      );
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new Error(
+      `Ledger test cleanup failed; preserving test-owned root ${root}: ${failures.join('; ')}`,
+    );
+  }
+
+  try {
+    rmSync(root, { recursive: true, force: true });
+  } catch (error) {
+    throw new Error(
+      `Ledger test cleanup could not remove test-owned root ${root}: ${cleanupErrorMessage(error)}`,
+      { cause: error },
+    );
+  }
+}
+
 function createBareSqlite(
   path: string,
   initialize: (database: Database) => void,
@@ -967,15 +1016,7 @@ test('L03: separate processes cannot duplicate IDs or over-reserve a period', as
     ).toBeNull();
     accounted.close();
   } finally {
-    try {
-      await Promise.all(children.map(stopAndReap));
-    } finally {
-      try {
-        for (const ledger of reopenedLedgers) ledger.close();
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    }
+    await cleanupLedgerTestRoot(root, reopenedLedgers, children);
   }
 });
 
@@ -1200,7 +1241,7 @@ test('L06: prepared cancellation and the dispatch claim cannot release each othe
   }
 });
 
-test('L07: unsafe or incomplete storage fails closed without replacing state', () => {
+test('L07: unsafe or incomplete storage fails closed without replacing state', async () => {
   const root = createPrivateRoot();
   if (typeof process.geteuid !== 'function')
     throw new Error('POSIX UID lookup is required for this test.');
@@ -1482,10 +1523,6 @@ test('L07: unsafe or incomplete storage fails closed without replacing state', (
     if (readonlySkips.length > 0)
       console.info(`L07 skipped subcase: ${readonlySkips.join(' ')}`);
   } finally {
-    try {
-      for (const handle of ledgers) handle.close();
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    await cleanupLedgerTestRoot(root, ledgers);
   }
 });
