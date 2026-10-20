@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Verify the public account and stdio contracts using synthetic data.
+Verify the public account, task-list, and stdio contracts using synthetic data.
 
 ## Ownership
 

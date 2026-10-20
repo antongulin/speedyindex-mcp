@@ -9,9 +9,9 @@ if (args.length === 1 && args[0] === '--help') {
 Usage: bun src/cli.ts [--help | --version]
        bun dist/cli.js [--help | --version]
 
-Stdio MCP server exposing read-only get_balance.
+Stdio MCP server exposing read-only get_balance and list_tasks.
 Set SPEEDYINDEX_API_KEY in the process environment.
-Account requests have a 10-second deadline, support cancellation, and never retry.`);
+Provider requests have a 10-second deadline, support cancellation, and never retry.`);
 } else if (args.length === 1 && args[0] === '--version') {
   console.log(version);
 } else if (args.length > 0) {

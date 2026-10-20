@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { balanceResultSchema } from '../src/client';
+import { balanceResultSchema, listTasksResultSchema } from '../src/client';
 import {
   account,
   bounded,
@@ -10,8 +10,24 @@ import {
 } from './helpers';
 import { verifyEof } from './stdio-eof';
 
-test('F01: real SDK process initializes, advertises only read-only get_balance and calls it', async () => {
-  const api = await fixture((_req, res) => res.end(JSON.stringify(account)));
+test('LT-06: real SDK process registers both read-only tools and returns structured and text output', async () => {
+  const api = await fixture((req, res) => {
+    if (req.url === '/v2/account') {
+      res.end(JSON.stringify(account));
+      return;
+    }
+    const page = Number(
+      new URL(req.url ?? '/', 'http://fixture').pathname.split('/').at(-1),
+    );
+    res.end(
+      JSON.stringify({
+        code: 0,
+        page,
+        last_page: 0,
+        result: [{ id: 'task-a' }],
+      }),
+    );
+  });
   let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
     session = await connect(api.origin);
@@ -20,7 +36,10 @@ test('F01: real SDK process initializes, advertises only read-only get_balance a
       version: '0.1.0',
     });
     const { tools } = await session.client.listTools();
-    expect(tools.map((tool) => tool.name)).toEqual(['get_balance']);
+    expect(tools.map((tool) => tool.name)).toEqual([
+      'get_balance',
+      'list_tasks',
+    ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
       additionalProperties: false,
@@ -35,6 +54,32 @@ test('F01: real SDK process initializes, advertises only read-only get_balance a
       idempotentHint: true,
       openWorldHint: true,
     });
+    expect(tools[1]?.inputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['searchEngine', 'taskType', 'page'],
+      properties: {
+        searchEngine: { enum: ['google', 'yandex', 'bing'] },
+        taskType: { enum: ['indexer', 'checker'] },
+        page: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+        filter: { enum: ['standard', 'pay_per_indexed', 'drip_feed'] },
+        payPerIndexed: { type: 'boolean' },
+      },
+    });
+    expect(tools[1]?.outputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['searchEngine', 'taskType', 'page', 'lastPage', 'tasks'],
+      properties: {
+        tasks: { type: 'array', maxItems: 1000 },
+      },
+    });
+    expect(tools[1]?.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
     const result = await session.client.callTool({
       name: 'get_balance',
       arguments: {},
@@ -44,6 +89,106 @@ test('F01: real SDK process initializes, advertises only read-only get_balance a
     expect(parsed.balance).toEqual(account.balance);
     expect(result.content).toEqual([
       { type: 'text', text: JSON.stringify(parsed) },
+    ]);
+    const listResult = await session.client.callTool({
+      name: 'list_tasks',
+      arguments: { searchEngine: 'google', taskType: 'indexer', page: 0 },
+    });
+    expect(listResult.isError).not.toBe(true);
+    const parsedList = listTasksResultSchema.parse(
+      listResult.structuredContent,
+    );
+    expect(parsedList.tasks).toEqual([{ id: 'task-a' }]);
+    expect(listResult.content).toEqual([
+      { type: 'text', text: JSON.stringify(parsedList) },
+    ]);
+    expect(api.requests.map(({ method, path }) => ({ method, path }))).toEqual([
+      { method: 'GET', path: '/v2/account' },
+      { method: 'GET', path: '/v2/task/google/indexer/list/0' },
+    ]);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('LT-02: SDK rejects invalid list_tasks input before making a provider request', async () => {
+  const api = await fixture((_req, res) =>
+    res.end(JSON.stringify({ code: 0, page: 0, last_page: 0, result: [] })),
+  );
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+  const invalidInputs: Record<string, unknown>[] = [
+    { searchEngine: 'google', taskType: 'indexer' },
+    { searchEngine: 'google', taskType: 'indexer', page: -1 },
+    { searchEngine: 'google', taskType: 'indexer', page: 1.25 },
+    { searchEngine: 'other', taskType: 'checker', page: 0 },
+    {
+      searchEngine: 'google',
+      taskType: 'indexer',
+      page: 0,
+      filter: 'all',
+    },
+    { searchEngine: 'bing', taskType: 'indexer', page: 0 },
+    {
+      searchEngine: 'yandex',
+      taskType: 'indexer',
+      page: 0,
+      filter: 'standard',
+    },
+    {
+      searchEngine: 'google',
+      taskType: 'indexer',
+      page: 0,
+      payPerIndexed: true,
+    },
+    {
+      searchEngine: 'google',
+      taskType: 'indexer',
+      page: 0,
+      unexpected: true,
+    },
+  ];
+  try {
+    session = await connect(api.origin);
+    for (const input of invalidInputs) {
+      const result = await session.client.callTool({
+        name: 'list_tasks',
+        arguments: input,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toBeUndefined();
+    }
+    expect(api.requests).toHaveLength(0);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('LT-04: MCP list_tasks errors are sanitized and omit structured output', async () => {
+  const api = await fixture((_req, res) =>
+    res.end(JSON.stringify({ code: 2, message: dummyKey })),
+  );
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+  try {
+    session = await connect(api.origin);
+    const result = await session.client.callTool({
+      name: 'list_tasks',
+      arguments: { searchEngine: 'google', taskType: 'indexer', page: 0 },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain(dummyKey);
+    expect(result.content).toEqual([
+      { type: 'text', text: 'SpeedyIndex rejected the task-list request.' },
     ]);
     expect(api.requests).toHaveLength(1);
     expect(session.stderr()).toBe('');
@@ -70,6 +215,53 @@ test('F02: SDK client close reaps the server process', async () => {
   }
   expect(() => process.kill(pid!, 0)).toThrow();
   expect(session.stderr()).toBe('');
+});
+
+test('F07: SDK get_balance cancellation aborts underlying HTTP and next call succeeds', async () => {
+  const arrived = deferred<void>();
+  const disconnected = deferred<void>();
+  let first = true;
+  const api = await fixture((_req, res) => {
+    if (first) {
+      first = false;
+      res.on('close', () => disconnected.resolve());
+      arrived.resolve();
+    } else res.end(JSON.stringify(account));
+  });
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+  try {
+    session = await connect(api.origin);
+    const controller = new AbortController();
+    const cancelled = session.client
+      .callTool(
+        { name: 'get_balance', arguments: {} },
+        { signal: controller.signal },
+      )
+      .then(
+        () => 'unexpected success',
+        () => 'cancelled',
+      );
+    await bounded(arrived.promise);
+    controller.abort();
+    expect(await bounded(cancelled)).toBe('cancelled');
+    await bounded(disconnected.promise);
+    const result = await session.client.callTool({
+      name: 'get_balance',
+      arguments: {},
+    });
+    expect(result.isError).not.toBe(true);
+    expect(balanceResultSchema.parse(result.structuredContent).balance).toEqual(
+      account.balance,
+    );
+    expect(api.requests).toHaveLength(2);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
 });
 
 for (const [label, key, mode] of [
@@ -112,7 +304,7 @@ for (const [label, key, mode] of [
   });
 }
 
-test('F07: SDK cancellation aborts underlying HTTP and next call succeeds', async () => {
+test('LT-07: SDK list_tasks cancellation aborts underlying HTTP and next call succeeds', async () => {
   const arrived = deferred<void>();
   const disconnected = deferred<void>();
   let first = true;
@@ -121,7 +313,15 @@ test('F07: SDK cancellation aborts underlying HTTP and next call succeeds', asyn
       first = false;
       res.on('close', () => disconnected.resolve());
       arrived.resolve();
-    } else res.end(JSON.stringify(account));
+    } else
+      res.end(
+        JSON.stringify({
+          code: 0,
+          page: 0,
+          last_page: 0,
+          result: [{ id: 'task-a' }],
+        }),
+      );
   });
   let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
@@ -129,7 +329,14 @@ test('F07: SDK cancellation aborts underlying HTTP and next call succeeds', asyn
     const controller = new AbortController();
     const cancelled = session.client
       .callTool(
-        { name: 'get_balance', arguments: {} },
+        {
+          name: 'list_tasks',
+          arguments: {
+            searchEngine: 'google',
+            taskType: 'indexer',
+            page: 0,
+          },
+        },
         { signal: controller.signal },
       )
       .then(
@@ -141,12 +348,12 @@ test('F07: SDK cancellation aborts underlying HTTP and next call succeeds', asyn
     expect(await bounded(cancelled)).toBe('cancelled');
     await bounded(disconnected.promise);
     const result = await session.client.callTool({
-      name: 'get_balance',
-      arguments: {},
+      name: 'list_tasks',
+      arguments: { searchEngine: 'google', taskType: 'indexer', page: 0 },
     });
     expect(result.isError).not.toBe(true);
-    expect(balanceResultSchema.parse(result.structuredContent).balance).toEqual(
-      account.balance,
+    expect(listTasksResultSchema.parse(result.structuredContent).tasks).toEqual(
+      [{ id: 'task-a' }],
     );
     expect(api.requests).toHaveLength(2);
     expect(session.stderr()).toBe('');
