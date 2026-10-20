@@ -631,6 +631,21 @@ test('L01: unit reservations carry across periods and policy revisions', () => {
     });
     expect(ledger.prepareIntent(nextPeriod).kind).toBe('created');
 
+    const samePeriodControl = makeInput({
+      requestId: 'same-period-identity-control',
+      budget: { ...nextPeriod.budget },
+      submittedUrls: ['https://example.test/same-period-identity-control'],
+      reservation: { tokens: 0, indexer: 0, checker: 0 },
+    });
+    expect(ledger.prepareIntent(samePeriodControl).kind).toBe('created');
+    expect(
+      ledger.readIntent(fakeCredential, samePeriodControl.requestId),
+    ).toMatchObject({
+      periodId: nextPeriod.budget.periodId,
+      periodStartMs: nextPeriod.budget.periodStartMs,
+      reservation: { tokens: 0, indexer: 0, checker: 0 },
+    });
+
     const overNextPeriod = makeInput({
       ...nextPeriod,
       requestId: 'next-period-over-cap',
@@ -659,9 +674,8 @@ test('L01: unit reservations carry across periods and policy revisions', () => {
     const sameIdChangedStart = makeInput({
       requestId: 'same-period-id-changed-start',
       budget: {
-        periodId: 'period-current',
-        periodStartMs: 2_001,
-        caps: { tokens: 0, indexer: 0, checker: 0 },
+        ...nextPeriod.budget,
+        periodStartMs: 3_001,
       },
       submittedUrls: ['https://example.test/same-id-changed-start'],
       reservation: { tokens: 0, indexer: 0, checker: 0 },
@@ -677,9 +691,8 @@ test('L01: unit reservations carry across periods and policy revisions', () => {
     const sameStartChangedId = makeInput({
       requestId: 'same-period-start-changed-id',
       budget: {
-        periodId: 'period-current-alias',
-        periodStartMs: 2_000,
-        caps: { tokens: 0, indexer: 0, checker: 0 },
+        ...nextPeriod.budget,
+        periodId: 'period-next-alias',
       },
       submittedUrls: ['https://example.test/same-start-changed-id'],
       reservation: { tokens: 0, indexer: 0, checker: 0 },
