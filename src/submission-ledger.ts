@@ -643,7 +643,7 @@ function mintToken(): string {
 }
 
 function normalizeSql(sql: string): string {
-  return sql.trim().replace(/\s+/g, ' ').toLowerCase();
+  return sql.trim().replace(/\s+/g, ' ');
 }
 
 interface SchemaRow {

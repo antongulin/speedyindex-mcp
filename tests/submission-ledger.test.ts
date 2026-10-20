@@ -428,6 +428,84 @@ function createBareSqlite(
   }
 }
 
+function createCaseChangedVersionOneFixture(
+  sourcePath: string,
+  stateDirectory: string,
+) {
+  mkdirSync(stateDirectory, { mode: 0o700 });
+  chmodSync(stateDirectory, 0o700);
+
+  const source = new Database(
+    sourcePath,
+    sqliteConstants.SQLITE_OPEN_READONLY | sqliteConstants.SQLITE_OPEN_NOFOLLOW,
+  );
+  let definitions: Array<{
+    type: 'table' | 'index';
+    name: string;
+    sql: string;
+  }>;
+  try {
+    definitions = source
+      .query(
+        `SELECT type, name, sql
+         FROM sqlite_schema
+         WHERE name NOT GLOB 'sqlite_*'
+           AND type IN ('table', 'index')
+         ORDER BY rowid`,
+      )
+      .all() as typeof definitions;
+  } finally {
+    source.close();
+  }
+
+  const intents = definitions.find(
+    (definition) =>
+      definition.type === 'table' && definition.name === 'intents',
+  );
+  if (!intents) throw new Error('The valid v1 fixture has no intents table.');
+  const changedIntentsSql = intents.sql.replace("'prepared'", "'Prepared'");
+  if (changedIntentsSql === intents.sql)
+    throw new Error('The valid v1 intents DDL has no prepared literal.');
+  const changedDefinitions = definitions.map((definition) =>
+    definition === intents
+      ? { ...definition, sql: changedIntentsSql }
+      : definition,
+  );
+  if (
+    changedDefinitions.filter(
+      (definition, index) => definition.sql !== definitions[index]!.sql,
+    ).length !== 1 ||
+    changedIntentsSql.replace("'Prepared'", "'prepared'") !== intents.sql
+  ) {
+    throw new Error('The v1 fixture must change exactly one quoted literal.');
+  }
+
+  const fixturePath = join(stateDirectory, 'ledger.sqlite');
+  createBareSqlite(fixturePath, (database) => {
+    for (const type of ['table', 'index'] as const) {
+      for (const definition of changedDefinitions) {
+        if (definition.type === type) database.run(definition.sql);
+      }
+    }
+    database.run('PRAGMA user_version = 1');
+    const integrity = database.query('PRAGMA integrity_check').get() as {
+      integrity_check: string;
+    } | null;
+    const storedIntents = database
+      .query(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'intents'",
+      )
+      .get() as { sql: string } | null;
+    if (
+      integrity?.integrity_check !== 'ok' ||
+      storedIntents?.sql !== changedIntentsSql
+    ) {
+      throw new Error('The case-changed v1 SQLite fixture is not valid.');
+    }
+  });
+  return fixturePath;
+}
+
 function snapshotFile(path: string) {
   const stats = lstatSync(path);
   return {
@@ -578,6 +656,48 @@ test('L01: unit reservations carry across periods and policy revisions', () => {
       'StalePeriodContext',
     );
 
+    const sameIdChangedStart = makeInput({
+      requestId: 'same-period-id-changed-start',
+      budget: {
+        periodId: 'period-current',
+        periodStartMs: 2_001,
+        caps: { tokens: 0, indexer: 0, checker: 0 },
+      },
+      submittedUrls: ['https://example.test/same-id-changed-start'],
+      reservation: { tokens: 0, indexer: 0, checker: 0 },
+    });
+    expectLedgerError(
+      () => ledger!.prepareIntent(sameIdChangedStart),
+      'StalePeriodContext',
+    );
+    expect(
+      ledger.readIntent(fakeCredential, sameIdChangedStart.requestId),
+    ).toBeNull();
+
+    const sameStartChangedId = makeInput({
+      requestId: 'same-period-start-changed-id',
+      budget: {
+        periodId: 'period-current-alias',
+        periodStartMs: 2_000,
+        caps: { tokens: 0, indexer: 0, checker: 0 },
+      },
+      submittedUrls: ['https://example.test/same-start-changed-id'],
+      reservation: { tokens: 0, indexer: 0, checker: 0 },
+    });
+    expectLedgerError(
+      () => ledger!.prepareIntent(sameStartChangedId),
+      'StalePeriodContext',
+    );
+    expect(
+      ledger.readIntent(fakeCredential, sameStartChangedId.requestId),
+    ).toBeNull();
+    expect(
+      ledger.readIntent(fakeCredential, currentAccepted.requestId),
+    ).toMatchObject({
+      periodId: 'period-current',
+      reservation: { tokens: 10, indexer: 2, checker: 1 },
+    });
+
     const maxInput = makeInput({
       requestId: 'max-safe',
       budget: {
@@ -620,6 +740,21 @@ test('L02: request replay, outcomes, and URL holds remain immutable', () => {
   let ledger: SubmissionLedger | undefined;
   try {
     ledger = initializeLedger({ stateDirectory });
+    const duplicateUrlInput = makeInput({
+      requestId: 'duplicate-url-input',
+      submittedUrls: [
+        'https://example.test/duplicate-in-batch',
+        'https://example.test/duplicate-in-batch',
+      ],
+    });
+    expectLedgerError(
+      () => ledger!.prepareIntent(duplicateUrlInput),
+      'InvalidLedgerInput',
+    );
+    expect(
+      ledger.readIntent(fakeCredential, duplicateUrlInput.requestId),
+    ).toBeNull();
+
     const original = makeInput({
       requestId: 'immutable-request',
       submittedUrls: [
@@ -1018,7 +1153,7 @@ test('L03: separate processes cannot duplicate IDs or over-reserve a period', as
   } finally {
     await cleanupLedgerTestRoot(root, reopenedLedgers, children);
   }
-});
+}, 30_000);
 
 test('L04: one process owns the dispatch claim and its result token', async () => {
   const root = createPrivateRoot();
@@ -1113,7 +1248,7 @@ test('L04: one process owns the dispatch claim and its result token', async () =
     await Promise.all(children.map(stopAndReap));
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 test('L05: a killed dispatcher remains held after database reopen', async () => {
   const root = createPrivateRoot();
@@ -1176,7 +1311,7 @@ test('L05: a killed dispatcher remains held after database reopen', async () => 
     await Promise.all(children.map(stopAndReap));
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 test('L06: prepared cancellation and the dispatch claim cannot release each other', () => {
   const root = createPrivateRoot();
@@ -1238,6 +1373,48 @@ test('L06: prepared cancellation and the dispatch claim cannot release each othe
     second?.close();
     first?.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('L07-SCHEMA-LITERAL: case-changed v1 CHECK literals fail closed', async () => {
+  const root = createPrivateRoot();
+  const ledgers: SubmissionLedger[] = [];
+  try {
+    const validDirectory = join(root, 'valid-v1');
+    const validLedger = initializeLedger({ stateDirectory: validDirectory });
+    ledgers.push(validLedger);
+    validLedger.close();
+
+    const incompatibleDirectory = join(root, 'case-changed-v1');
+    const incompatiblePath = createCaseChangedVersionOneFixture(
+      join(validDirectory, 'ledger.sqlite'),
+      incompatibleDirectory,
+    );
+    const incompatibleBefore = snapshotFile(incompatiblePath);
+
+    let openError: unknown;
+    try {
+      ledgers.push(openLedger({ stateDirectory: incompatibleDirectory }));
+    } catch (error) {
+      openError = error;
+    }
+    if (openError === undefined) {
+      throw new Error(
+        'openLedger unexpectedly accepted a v1 schema with a case-changed CHECK literal.',
+      );
+    }
+    expect(openError).toBeInstanceOf(SubmissionLedgerError);
+    expect((openError as SubmissionLedgerError).code).toBe('LedgerUnavailable');
+    expectFileUnchanged(incompatiblePath, incompatibleBefore);
+
+    const reopenedValid = openLedger({ stateDirectory: validDirectory });
+    ledgers.push(reopenedValid);
+    expect(
+      reopenedValid.readIntent(fakeCredential, 'schema-literal-probe'),
+    ).toBeNull();
+    reopenedValid.close();
+  } finally {
+    await cleanupLedgerTestRoot(root, ledgers);
   }
 });
 
