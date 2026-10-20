@@ -35,7 +35,10 @@ for (const arg of ['--help', '--version', '--unsupported']) {
         expect(code).toBe(0);
         expect(stderr).toBe('');
         if (arg === '--version') expect(stdout).toBe('0.1.0\n');
-        else expect(stdout).toContain('get_balance');
+        else {
+          expect(stdout).toContain('get_balance');
+          expect(stdout).toContain('list_tasks');
+        }
       }
     } finally {
       child.kill();

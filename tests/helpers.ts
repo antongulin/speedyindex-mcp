@@ -8,7 +8,18 @@ export const account = {
   code: 0,
   balance: { tokens: 0, indexer: 27, checker: 8 },
 };
-export const officialUrl = 'https://api.speedyindex.com/v2/account';
+export const officialOrigin = 'https://api.speedyindex.com';
+export const officialUrl = `${officialOrigin}/v2/account`;
+
+function isSupportedProviderTarget(url: URL) {
+  return (
+    url.origin === officialOrigin &&
+    (url.pathname === '/v2/account' ||
+      /^\/v2\/task\/(google|yandex|bing)\/(indexer|checker)\/list\/\d+$/.test(
+        url.pathname,
+      ))
+  );
+}
 
 export function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -52,15 +63,30 @@ export async function fixture(handler: RequestListener) {
     handler(req, res);
   });
   server.listen(0, '127.0.0.1');
-  await bounded(once(server, 'listening'));
-  const address = server.address();
-  if (!address || typeof address === 'string')
-    throw new Error('No fixture port');
+  let address: ReturnType<typeof server.address>;
+  try {
+    await bounded(once(server, 'listening'));
+    address = server.address();
+    if (!address || typeof address === 'string')
+      throw new Error('No fixture port');
+  } catch (error) {
+    if (server.listening) {
+      const closed = new Promise<void>((resolve, reject) =>
+        server.close((closeError) =>
+          closeError ? reject(closeError) : resolve(),
+        ),
+      );
+      server.closeAllConnections();
+      await bounded(closed);
+    }
+    throw error;
+  }
   const origin = `http://127.0.0.1:${address.port}`;
   return {
     origin,
     requests,
     async close() {
+      if (!server.listening) return;
       const closed = new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );
@@ -75,9 +101,10 @@ export function loopbackFetch(origin: string): typeof fetch {
     input: Parameters<typeof fetch>[0],
     init?: RequestInit,
   ) => {
-    if (String(input) !== officialUrl)
+    const target = new URL(String(input));
+    if (!isSupportedProviderTarget(target))
       throw new Error('Unexpected production URL');
-    return fetch(`${origin}/v2/account`, init);
+    return fetch(new URL(`${target.pathname}${target.search}`, origin), init);
   }) as typeof fetch;
   return redirected;
 }
@@ -110,13 +137,36 @@ export async function connect(
   try {
     await bounded(client.connect(transport));
   } catch (error) {
-    await transport.close();
+    try {
+      await bounded(transport.close());
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        'MCP connection failed and its subprocess could not be closed.',
+        { cause: closeError },
+      );
+    }
     throw error;
   }
   return {
     client,
     transport,
     stderr: () => stderr,
-    close: () => bounded(client.close()),
+    async close() {
+      try {
+        await bounded(client.close());
+      } catch (error) {
+        try {
+          await bounded(transport.close());
+        } catch (closeError) {
+          throw new AggregateError(
+            [error, closeError],
+            'MCP session and subprocess could not be closed.',
+            { cause: closeError },
+          );
+        }
+        throw error;
+      }
+    },
   };
 }
