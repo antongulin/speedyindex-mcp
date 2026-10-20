@@ -241,6 +241,7 @@ interface ChildHandle {
 
 async function startChild(
   config: Record<string, unknown>,
+  cleanupChildren: ChildHandle[],
 ): Promise<ChildHandle> {
   const child = Bun.spawn(
     [process.execPath, resolve('tests/fixtures/submission-ledger-child.ts')],
@@ -274,6 +275,7 @@ async function startChild(
     decoder: new TextDecoder(),
     buffer: '',
   };
+  cleanupChildren.push(handle);
   await writeChildInput(handle, `${JSON.stringify(config)}\n`);
   return handle;
 }
@@ -314,15 +316,13 @@ async function startChildrenAtReady(
   configs: readonly Record<string, unknown>[],
   allChildren: ChildHandle[],
 ) {
-  const children: ChildHandle[] = [];
+  const firstChildIndex = allChildren.length;
   const ready: Record<string, unknown>[] = [];
   for (const config of configs) {
-    const child = await startChild(config);
-    children.push(child);
-    allChildren.push(child);
+    const child = await startChild(config, allChildren);
     ready.push(await nextChildMessage(child));
   }
-  return { children, ready };
+  return { children: allChildren.slice(firstChildIndex), ready };
 }
 
 async function expectChildExit(handle: ChildHandle, code = 0) {
@@ -1306,12 +1306,14 @@ test('L05: a killed dispatcher remains held after database reopen', async () => 
       requestId: 'crash-after-claim',
       submittedUrls: ['https://example.test/crash-after-claim'],
     });
-    const child = await startChild({
-      mode: 'crash-after-claim',
-      stateDirectory,
-      input,
-    });
-    children.push(child);
+    const child = await startChild(
+      {
+        mode: 'crash-after-claim',
+        stateDirectory,
+        input,
+      },
+      children,
+    );
     expect(await nextChildMessage(child)).toEqual({ event: 'CLAIM_COMMITTED' });
     child.process.kill('SIGKILL');
     await bounded(child.process.exited, testTimeoutMs);
