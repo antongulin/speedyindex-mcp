@@ -265,7 +265,7 @@ test('LT-03: list_tasks maps documented optional fields, strips unknowns, and ac
         JSON.stringify({
           code: 0,
           page,
-          last_page: 1,
+          last_page: 2,
           ignored: 'provider metadata',
           result: [
             {
@@ -304,7 +304,7 @@ test('LT-03: list_tasks maps documented optional fields, strips unknowns, and ac
       searchEngine: 'google',
       taskType: 'indexer',
       page: 2,
-      lastPage: 1,
+      lastPage: 2,
       tasks: [
         {
           id: ' opaque-task-id ',
@@ -531,6 +531,38 @@ test('LT-05: list_tasks rejects redirects before the destination receives a requ
   }
 });
 
+test('LT-12: list_tasks rejects non-empty pages beyond lastPage', async () => {
+  const responseMarker = 'fixture-only-response-marker';
+  const api = await fixture((_req, res) =>
+    res.end(
+      JSON.stringify({
+        code: 0,
+        page: 2,
+        last_page: 1,
+        result: [{ id: 'task-2', title: responseMarker }],
+      }),
+    ),
+  );
+  try {
+    const error = await new SpeedyIndexClient(
+      dummyKey,
+      loopbackFetch(api.origin),
+    )
+      .listTasks({ searchEngine: 'google', taskType: 'indexer', page: 2 })
+      .catch((reason: unknown) => reason);
+    expect(error).toMatchObject({
+      kind: 'response',
+      message: 'SpeedyIndex returned an invalid task-list response.',
+    });
+    const message = error instanceof Error ? error.message : '';
+    expect(message).not.toContain(dummyKey);
+    expect(message).not.toContain(responseMarker);
+    expect(api.requests).toHaveLength(1);
+  } finally {
+    await api.close();
+  }
+});
+
 for (const [label, envelope] of [
   ['page echo mismatch', { code: 0, page: 2, last_page: 0, result: [] }],
   [
@@ -564,6 +596,31 @@ for (const [label, envelope] of [
     }
   });
 }
+
+test('LT-13: list_tasks accepts exactly 1,000 valid tasks', async () => {
+  const taskIds = Array.from({ length: 1000 }, (_, index) => `task-${index}`);
+  const api = await fixture((_req, res) =>
+    res.end(
+      JSON.stringify({
+        code: 0,
+        page: 0,
+        last_page: 0,
+        result: taskIds.map((id) => ({ id })),
+      }),
+    ),
+  );
+  try {
+    const result = await new SpeedyIndexClient(
+      dummyKey,
+      loopbackFetch(api.origin),
+    ).listTasks({ searchEngine: 'google', taskType: 'indexer', page: 0 });
+    expect(result.tasks).toHaveLength(1000);
+    expect(result.tasks.map((task) => task.id)).toEqual(taskIds);
+    expect(api.requests).toHaveLength(1);
+  } finally {
+    await api.close();
+  }
+});
 
 test('F03: exact read-only HTTP contract, distinct wallets, zero and observation time', async () => {
   const api = await fixture((_req, res) =>

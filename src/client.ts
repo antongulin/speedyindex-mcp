@@ -354,6 +354,11 @@ export class SpeedyIndexClient {
       const response = taskListEnvelopeSchema.safeParse(body);
       if (!response.success || response.data.page !== args.page)
         throw new TaskListError('response');
+      if (
+        response.data.result.length > 0 &&
+        response.data.last_page < args.page
+      )
+        throw new TaskListError('response');
       return listTasksResultSchema.parse({
         searchEngine: args.searchEngine,
         taskType: args.taskType,
