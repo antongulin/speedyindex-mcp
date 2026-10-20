@@ -94,11 +94,17 @@ test('TSP-02: strict ID input preserves opaque values and enforces the batch cap
   const api = await fixture((request, response) => {
     void readBody(request).then((body) => {
       bodies.push(body);
-      const parsed = JSON.parse(body) as { task_id?: string };
+      const parsed = JSON.parse(body) as {
+        task_id?: string;
+        task_ids?: string[];
+      };
+      const result = parsed.task_ids
+        ? [...parsed.task_ids].reverse().map((id) => ({ id }))
+        : { id: parsed.task_id };
       response.end(
         JSON.stringify({
           code: 0,
-          result: parsed.task_id === undefined ? [] : { id: parsed.task_id },
+          result,
         }),
       );
     });
@@ -155,10 +161,13 @@ test('TSP-02: strict ID input preserves opaque values and enforces the batch cap
       taskIds: thousandIds,
     });
     expect(result.requestedIds).toEqual(thousandIds);
-    expect(result.tasks).toEqual([]);
-    expect(result.unreturnedIds).toEqual(thousandIds);
+    expect(result.tasks).toEqual(thousandIds.map((id) => ({ id })));
+    expect(result.unreturnedIds).toEqual([]);
     expect(bodies[1]).toBe(JSON.stringify({ task_ids: thousandIds }));
-    expect(api.requests).toHaveLength(2);
+    expect(api.requests.map(({ method, path }) => ({ method, path }))).toEqual([
+      { method: 'POST', path: '/v2/task/google/indexer/status' },
+      { method: 'POST', path: '/v2/task/backlink/checker/status' },
+    ]);
 
     for (const key of [undefined, '', '   ']) {
       await expect(
@@ -169,6 +178,44 @@ test('TSP-02: strict ID input preserves opaque values and enforces the batch cap
       ).rejects.toMatchObject({ kind: 'credentials' });
     }
     expect(api.requests).toHaveLength(2);
+  } finally {
+    await api.close();
+  }
+});
+
+test('R1-CAP-OVER: rejects 1,001 provider roots for 1,000 requested IDs', async () => {
+  const requestedIds = Array.from(
+    { length: 1000 },
+    (_, index) => `id-${index}`,
+  );
+  const returnedTasks = Array.from({ length: 1001 }, (_, index) => ({
+    id: `id-${index}`,
+  }));
+  const api = await fixture((request, response) => {
+    request.resume();
+    response.end(JSON.stringify({ code: 0, result: returnedTasks }));
+  });
+  const client = statusClient(api.origin);
+
+  try {
+    const error = await client
+      .getTaskStatus({ family: 'google/indexer', taskIds: requestedIds })
+      .then(
+        () => undefined,
+        (value: unknown) => value,
+      );
+    expect(error).toBeInstanceOf(TaskStatusError);
+    expect(error).toMatchObject({
+      kind: 'response',
+      message: 'SpeedyIndex returned an invalid task-status response.',
+    });
+    expect(api.requests).toHaveLength(1);
+    expect(api.requests).toEqual([
+      expect.objectContaining({
+        method: 'POST',
+        path: '/v2/task/google/indexer/status',
+      }),
+    ]);
   } finally {
     await api.close();
   }

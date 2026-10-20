@@ -12,14 +12,25 @@ import {
 import { verifyEof } from './stdio-eof';
 
 test('LT-06: real SDK process registers all read-only tools with structured and text output', async () => {
+  const statusBodies: string[] = [];
   const api = await fixture((request, response) => {
     if (request.url === '/v2/account') {
       response.end(JSON.stringify(account));
       return;
     }
     if (request.method === 'POST') {
-      request.resume();
-      response.end(JSON.stringify({ code: 0, result: { id: 'status-task' } }));
+      const chunks: Buffer[] = [];
+      void (async () => {
+        for await (const chunk of request) chunks.push(Buffer.from(chunk));
+        const body = Buffer.concat(chunks).toString('utf8');
+        statusBodies.push(body);
+        const parsed = JSON.parse(body) as {
+          task_id?: string;
+          task_ids?: string[];
+        };
+        const id = parsed.task_ids?.[0] ?? parsed.task_id;
+        response.end(JSON.stringify({ code: 0, result: { id } }));
+      })();
       return;
     }
     const page = Number(
@@ -166,9 +177,32 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
     expect(statusResult.content).toEqual([
       { type: 'text', text: JSON.stringify(parsedStatus) },
     ]);
+    const batchIds = ['batch-returned', 'missing-z', 'missing-a'];
+    const batchStatusResult = await session.client.callTool({
+      name: 'get_task_status',
+      arguments: { family: 'google/indexer', taskIds: batchIds },
+    });
+    expect(batchStatusResult.isError).not.toBe(true);
+    const parsedBatchStatus = taskStatusResultSchema.parse(
+      batchStatusResult.structuredContent,
+    );
+    expect(parsedBatchStatus).toEqual({
+      family: 'google/indexer',
+      requestedIds: batchIds,
+      tasks: [{ id: 'batch-returned' }],
+      unreturnedIds: ['missing-z', 'missing-a'],
+    });
+    expect(batchStatusResult.content).toEqual([
+      { type: 'text', text: JSON.stringify(parsedBatchStatus) },
+    ]);
+    expect(statusBodies).toEqual([
+      JSON.stringify({ task_id: 'status-task' }),
+      JSON.stringify({ task_ids: batchIds }),
+    ]);
     expect(api.requests.map(({ method, path }) => ({ method, path }))).toEqual([
       { method: 'GET', path: '/v2/account' },
       { method: 'GET', path: '/v2/task/google/indexer/list/0' },
+      { method: 'POST', path: '/v2/task/google/indexer/status' },
       { method: 'POST', path: '/v2/task/google/indexer/status' },
     ]);
     expect(session.stderr()).toBe('');

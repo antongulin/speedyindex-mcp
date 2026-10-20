@@ -182,7 +182,7 @@ const providerTaskSchema = z
 
 const providerResultSchema = z.union([
   providerTaskSchema,
-  z.array(providerTaskSchema),
+  z.array(providerTaskSchema).max(1000),
 ]);
 const providerCodeSchema = z.object({ code: z.number() });
 const providerEnvelopeSchema = z.object({ result: providerResultSchema });
