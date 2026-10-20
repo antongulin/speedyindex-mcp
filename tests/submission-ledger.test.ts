@@ -1431,6 +1431,57 @@ test('L07-SCHEMA-LITERAL: case-changed v1 CHECK literals fail closed', async () 
   }
 });
 
+test('R3-JOURNAL: unsafe rollback-journal metadata fails closed', async () => {
+  const root = createPrivateRoot();
+  const ledgers: SubmissionLedger[] = [];
+  const closeTrackedLedger = (ledger: SubmissionLedger) => {
+    ledger.close();
+    const index = ledgers.indexOf(ledger);
+    if (index >= 0) ledgers.splice(index, 1);
+  };
+  try {
+    const stateDirectory = join(root, 'journal-validation');
+    const initialized = initializeLedger({ stateDirectory });
+    ledgers.push(initialized);
+    closeTrackedLedger(initialized);
+
+    const normalOpen = openLedger({ stateDirectory });
+    ledgers.push(normalOpen);
+    closeTrackedLedger(normalOpen);
+
+    const databasePath = join(stateDirectory, 'ledger.sqlite');
+    const journalPath = `${databasePath}-journal`;
+    writeFileSync(journalPath, Buffer.alloc(0), { mode: 0o644, flag: 'wx' });
+    chmodSync(journalPath, 0o644);
+    expect(lstatSync(journalPath).mode & 0o777).toBe(0o644);
+
+    const databaseBefore = snapshotFile(databasePath);
+    const journalBefore = snapshotFile(journalPath);
+    let unexpectedOpen: SubmissionLedger | undefined;
+    let openError: unknown;
+    try {
+      unexpectedOpen = openLedger({ stateDirectory });
+      ledgers.push(unexpectedOpen);
+    } catch (error) {
+      openError = error;
+    }
+
+    if (unexpectedOpen) {
+      closeTrackedLedger(unexpectedOpen);
+      throw new Error(
+        'openLedger unexpectedly accepted a mode-0644 rollback-journal fixture.',
+      );
+    }
+
+    expect(openError).toBeInstanceOf(SubmissionLedgerError);
+    expect((openError as SubmissionLedgerError).code).toBe('LedgerUnavailable');
+    expectFileUnchanged(databasePath, databaseBefore);
+    expectFileUnchanged(journalPath, journalBefore);
+  } finally {
+    await cleanupLedgerTestRoot(root, ledgers);
+  }
+});
+
 test('L07: unsafe or incomplete storage fails closed without replacing state', async () => {
   const root = createPrivateRoot();
   if (typeof process.geteuid !== 'function')

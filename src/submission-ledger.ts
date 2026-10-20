@@ -243,6 +243,7 @@ const schemaStatements = [
     )
   )`,
   'CREATE INDEX intents_budget_state_idx ON intents (credential_fp, budget_scope, state, period_id)',
+  'CREATE INDEX intents_claim_token_digest_idx ON intents (claim_token_digest) WHERE claim_token_digest IS NOT NULL',
   'CREATE INDEX intent_urls_overlap_idx ON intent_urls (credential_fp, url_text)',
 ] as const;
 
@@ -547,7 +548,7 @@ function validateDatabaseFile(
 }
 
 function validateSidecars(directory: string, uid: number) {
-  for (const suffix of ['-wal', '-shm']) {
+  for (const suffix of ['-wal', '-shm', '-journal']) {
     const path = join(directory, `${databaseFilename}${suffix}`);
     const stats = lstatOrMissing(path);
     if (stats === undefined) continue;
