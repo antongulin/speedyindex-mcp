@@ -179,6 +179,7 @@ export class TaskListError extends Error {
 
 const apiOrigin = 'https://api.speedyindex.com';
 const accountEndpoint = `${apiOrigin}/v2/account`;
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 /** One authenticated GET, with the shared deadline and redirect safeguards. */
 async function getJson(
@@ -186,6 +187,7 @@ async function getJson(
   key: string,
   endpoint: string,
   timeoutMs: number,
+  maxResponseBytes: number,
   signal?: AbortSignal,
 ): Promise<unknown> {
   const deadline = new AbortController();
@@ -207,8 +209,56 @@ async function getJson(
     });
     if (!response.ok) throw new RequestError('http');
     try {
-      return await response.json();
-    } catch {
+      const body = response.body;
+      if (!body) throw new RequestError('response');
+      const reader = body.getReader();
+      let bytes = new Uint8Array(Math.min(maxResponseBytes, 1024));
+      let byteLength = 0;
+      try {
+        while (true) {
+          combined.throwIfAborted();
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const nextByteLength = byteLength + value.byteLength;
+          if (nextByteLength > maxResponseBytes) {
+            try {
+              void reader.cancel().catch(() => undefined);
+            } catch {
+              // Preserve the fixed oversized-response error if cancellation fails.
+            }
+            throw new RequestError('response');
+          }
+
+          if (nextByteLength > bytes.byteLength) {
+            let capacity = bytes.byteLength;
+            while (capacity < nextByteLength)
+              capacity = Math.min(
+                maxResponseBytes,
+                Math.max(capacity * 2, nextByteLength),
+              );
+            const expanded = new Uint8Array(capacity);
+            expanded.set(bytes.subarray(0, byteLength));
+            bytes = expanded;
+          }
+          bytes.set(value, byteLength);
+          byteLength = nextByteLength;
+        }
+
+        return JSON.parse(
+          new TextDecoder().decode(bytes.subarray(0, byteLength)),
+        ) as unknown;
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+          // Releasing the reader must not replace the request's result or error.
+        }
+      }
+    } catch (error) {
+      if (error instanceof RequestError) throw error;
+      if (signal?.aborted) throw new RequestError('cancelled');
+      if (deadline.signal.aborted) throw new RequestError('timeout');
       throw new RequestError('response');
     }
   } catch (error) {
@@ -230,7 +280,18 @@ export class SpeedyIndexClient {
     private readonly apiKey: string | undefined,
     private readonly fetchAccount: typeof fetch = fetch,
     private readonly timeoutMs = 10_000,
-  ) {}
+    private readonly maxResponseBytes = MAX_RESPONSE_BYTES,
+  ) {
+    if (
+      !Number.isSafeInteger(maxResponseBytes) ||
+      maxResponseBytes <= 0 ||
+      maxResponseBytes > MAX_RESPONSE_BYTES
+    ) {
+      throw new RangeError(
+        'maxResponseBytes must be a positive integer no greater than 16 MiB.',
+      );
+    }
+  }
 
   async getBalance(signal?: AbortSignal) {
     const key = this.apiKey?.trim();
@@ -241,6 +302,7 @@ export class SpeedyIndexClient {
         key,
         accountEndpoint,
         this.timeoutMs,
+        this.maxResponseBytes,
         signal,
       );
       const envelope = z.object({ code: z.number() }).safeParse(body);
@@ -283,6 +345,7 @@ export class SpeedyIndexClient {
         key,
         endpoint.toString(),
         this.timeoutMs,
+        this.maxResponseBytes,
         signal,
       );
       const envelope = z.object({ code: z.number() }).safeParse(body);

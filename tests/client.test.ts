@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { gzipSync } from 'node:zlib';
 import { SpeedyIndexClient } from '../src/client';
 import {
   account,
@@ -15,6 +16,88 @@ const listResponse = (page: number, result: unknown[] = []) => ({
   last_page: 0,
   result,
 });
+
+function streamedAccountResponse(totalBytes: number): Response {
+  const encoder = new TextEncoder();
+  const prefix = encoder.encode(
+    '{"code":0,"balance":{"tokens":0,"indexer":27,"checker":8},"ignored":"',
+  );
+  const suffix = encoder.encode('"}');
+  let paddingRemaining = totalBytes - prefix.byteLength - suffix.byteLength;
+  if (paddingRemaining < 0) throw new Error('Account fixture is too small.');
+  const paddingChunk = new Uint8Array(Math.min(64 * 1024, paddingRemaining));
+  paddingChunk.fill(0x78);
+  let prefixSent = false;
+  let suffixSent = false;
+
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!prefixSent) {
+        prefixSent = true;
+        controller.enqueue(prefix);
+        return;
+      }
+      if (paddingRemaining > 0) {
+        const chunkLength = Math.min(paddingChunk.byteLength, paddingRemaining);
+        controller.enqueue(paddingChunk.subarray(0, chunkLength));
+        paddingRemaining -= chunkLength;
+        return;
+      }
+      if (!suffixSent) {
+        suffixSent = true;
+        controller.enqueue(suffix);
+        controller.close();
+      }
+    },
+  });
+  return new Response(body, {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function responseFromChunks(chunks: readonly Uint8Array[]): Response {
+  let index = 0;
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index === chunks.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunks[index++]);
+      },
+    }),
+  );
+}
+
+function captureFirstResponse(
+  origin: string,
+  captured: { resolve: (response: Response) => void },
+): typeof fetch {
+  const fetchRequest = loopbackFetch(origin);
+  let capture = true;
+  return (async (input, init) => {
+    const response = await fetchRequest(input, init);
+    if (capture) {
+      capture = false;
+      captured.resolve(response);
+    }
+    return response;
+  }) as typeof fetch;
+}
+
+async function waitForBodyUse(response: Response): Promise<void> {
+  const body = response.body;
+  if (!body) throw new Error('Expected an HTTP response body.');
+  const deadline = Date.now() + 4_000;
+  while (!response.bodyUsed || !body.locked) {
+    if (Date.now() >= deadline)
+      throw new Error(
+        'Response body was not consumed before the fixture deadline.',
+      );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
 
 test('LT-01: list_tasks routes supported families and filter combinations once', async () => {
   const api = await fixture((req, res) => {
@@ -641,4 +724,373 @@ test('F07: deadline aborts an arrived HTTP request and next call recovers', asyn
   } finally {
     await api.close();
   }
+});
+
+test('RB-05: default response bound accepts 16 MiB and rejects one byte above', async () => {
+  const responseLimitBytes = 16 * 1024 * 1024;
+  const responses = [
+    streamedAccountResponse(responseLimitBytes),
+    streamedAccountResponse(responseLimitBytes + 1),
+  ];
+  const fetchAccount = (async (
+    _input: Parameters<typeof fetch>[0],
+    _init?: RequestInit,
+  ) => {
+    void _input;
+    void _init;
+    return responses.shift()!;
+  }) as typeof fetch;
+  const client = new SpeedyIndexClient(dummyKey, fetchAccount);
+
+  await expect(client.getBalance()).resolves.toMatchObject({
+    balance: { tokens: 0, indexer: 27, checker: 8 },
+  });
+  await expect(client.getBalance()).rejects.toMatchObject({
+    kind: 'response',
+    message: 'SpeedyIndex returned an invalid account response.',
+  });
+});
+
+test('RB-01: response byte boundary handles split multibyte UTF-8', async () => {
+  const limitBytes = 128;
+  const payload = new TextEncoder().encode(
+    JSON.stringify({ ...listResponse(0), ignored: 'é' }),
+  );
+  const exact = new Uint8Array(limitBytes).fill(0x20);
+  exact.set(payload);
+  const splitAt = exact.indexOf(0xc3) + 1;
+  const over = new Uint8Array(limitBytes + 1).fill(0x20);
+  over.set(payload);
+  expect(splitAt).toBeGreaterThan(0);
+  expect(exact.byteLength).toBe(limitBytes);
+  expect(new TextDecoder().decode(exact).length).toBeLessThan(exact.byteLength);
+
+  const responses = [
+    responseFromChunks([exact.subarray(0, splitAt), exact.subarray(splitAt)]),
+    responseFromChunks([over]),
+  ];
+  const fetchAccount = (async (
+    _input: Parameters<typeof fetch>[0],
+    _init?: RequestInit,
+  ) => {
+    void _input;
+    void _init;
+    return responses.shift()!;
+  }) as typeof fetch;
+  const client = new SpeedyIndexClient(
+    dummyKey,
+    fetchAccount,
+    10_000,
+    limitBytes,
+  );
+  const input = { searchEngine: 'google', taskType: 'indexer', page: 0 };
+
+  await expect(client.listTasks(input)).resolves.toMatchObject({ tasks: [] });
+  await expect(client.listTasks(input)).rejects.toMatchObject({
+    kind: 'response',
+    message: 'SpeedyIndex returned an invalid task-list response.',
+  });
+});
+
+test('RB-02: chunked and gzip responses are bounded by decoded bytes', async () => {
+  const limitBytes = 512;
+  const oversizedBody = JSON.stringify({
+    ...account,
+    ignored: 'x'.repeat(2_048),
+  });
+  const encodedBody = Buffer.from(oversizedBody);
+  const compressedBody = gzipSync(encodedBody);
+  expect(encodedBody.byteLength).toBeGreaterThan(limitBytes);
+  expect(compressedBody.byteLength).toBeLessThan(limitBytes);
+
+  let requestNumber = 0;
+  const api = await fixture((_req, res) => {
+    if (requestNumber++ === 0) {
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Transfer-Encoding': 'chunked',
+      });
+      res.write(encodedBody.subarray(0, 1_024));
+      res.end(encodedBody.subarray(1_024));
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Encoding': 'gzip',
+      'Content-Length': String(compressedBody.byteLength),
+    });
+    res.end(compressedBody);
+  });
+  const captured: Response[] = [];
+  const mappedFetch = loopbackFetch(api.origin);
+  const observingFetch = (async (input, init) => {
+    const response = await mappedFetch(input, init);
+    captured.push(response);
+    return response;
+  }) as typeof fetch;
+  const client = new SpeedyIndexClient(
+    dummyKey,
+    observingFetch,
+    10_000,
+    limitBytes,
+  );
+  try {
+    await expect(client.getBalance()).rejects.toMatchObject({
+      kind: 'response',
+    });
+    await expect(client.getBalance()).rejects.toMatchObject({
+      kind: 'response',
+    });
+    expect(captured).toHaveLength(2);
+    expect(captured[0]?.headers.get('content-length')).toBeNull();
+    expect(captured[1]?.headers.get('content-length')).toBe(
+      String(compressedBody.byteLength),
+    );
+    expect(compressedBody.byteLength).toBeLessThan(limitBytes);
+  } finally {
+    await api.close();
+  }
+});
+
+test('RB-03: overflow disconnects an open response and the next call recovers', async () => {
+  const arrived = deferred<void>();
+  const disconnected = deferred<void>();
+  const oversizedBody = JSON.stringify({
+    ...account,
+    ignored: 'x'.repeat(512),
+  });
+  let first = true;
+  const api = await fixture((_req, res) => {
+    if (first) {
+      first = false;
+      res.on('close', () => disconnected.resolve());
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Transfer-Encoding': 'chunked',
+      });
+      res.write(oversizedBody);
+      arrived.resolve();
+    } else res.end(JSON.stringify(account));
+  });
+  const client = new SpeedyIndexClient(
+    dummyKey,
+    loopbackFetch(api.origin),
+    10_000,
+    128,
+  );
+  try {
+    const outcome = client.getBalance().catch((error: unknown) => error);
+    await bounded(arrived.promise);
+    await expect(bounded(outcome, 5_000)).resolves.toMatchObject({
+      kind: 'response',
+      message: 'SpeedyIndex returned an invalid account response.',
+    });
+    await bounded(disconnected.promise);
+    await expect(client.getBalance()).resolves.toMatchObject({
+      balance: { tokens: 0, indexer: 27, checker: 8 },
+    });
+    expect(api.requests).toHaveLength(2);
+  } finally {
+    await api.close();
+  }
+});
+
+test('RB-04: oversized account and list bodies keep fixed sanitized errors', async () => {
+  const marker = 'synthetic-body-marker';
+  const oversizedAccount = JSON.stringify({
+    ...account,
+    marker,
+    ignored: dummyKey + 'x'.repeat(512),
+  });
+  const oversizedList = JSON.stringify({
+    ...listResponse(0),
+    marker,
+    ignored: dummyKey + 'x'.repeat(512),
+  });
+  const responses = [
+    responseFromChunks([new TextEncoder().encode(oversizedAccount)]),
+    responseFromChunks([new TextEncoder().encode(oversizedList)]),
+  ];
+  const fetchAccount = (async (
+    _input: Parameters<typeof fetch>[0],
+    _init?: RequestInit,
+  ) => {
+    void _input;
+    void _init;
+    return responses.shift()!;
+  }) as typeof fetch;
+  const client = new SpeedyIndexClient(dummyKey, fetchAccount, 10_000, 256);
+  const accountError = await client.getBalance().then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  const taskListError = await client
+    .listTasks({ searchEngine: 'google', taskType: 'indexer', page: 0 })
+    .then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+  expect(accountError).toBeInstanceOf(Error);
+  expect(taskListError).toBeInstanceOf(Error);
+  if (!(accountError instanceof Error) || !(taskListError instanceof Error))
+    throw new Error('Expected sanitized response errors.');
+  expect(accountError.message).toBe(
+    'SpeedyIndex returned an invalid account response.',
+  );
+  expect(taskListError.message).toBe(
+    'SpeedyIndex returned an invalid task-list response.',
+  );
+  for (const message of [accountError.message, taskListError.message]) {
+    expect(message).not.toContain(marker);
+    expect(message).not.toContain(dummyKey);
+  }
+});
+
+test('RB-07: list cancellation while consuming a partial response disconnects and recovers', async () => {
+  const arrived = deferred<void>();
+  const disconnected = deferred<void>();
+  const captured = deferred<Response>();
+  let first = true;
+  const api = await fixture((_req, res) => {
+    if (first) {
+      first = false;
+      res.on('close', () => disconnected.resolve());
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Transfer-Encoding': 'chunked',
+      });
+      res.write('{"code":0,"page":0,"last_page":0,"result":[');
+      arrived.resolve();
+    } else res.end(JSON.stringify(listResponse(0)));
+  });
+  const client = new SpeedyIndexClient(
+    dummyKey,
+    captureFirstResponse(api.origin, captured),
+  );
+  try {
+    const controller = new AbortController();
+    let settled = false;
+    const outcome = client
+      .listTasks(
+        { searchEngine: 'google', taskType: 'indexer', page: 0 },
+        controller.signal,
+      )
+      .then(
+        (value) => {
+          settled = true;
+          return value;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+    await bounded(arrived.promise);
+    const response = await bounded(captured.promise);
+    await bounded(waitForBodyUse(response), 5_000);
+    expect(response.body?.locked).toBe(true);
+    expect(response.bodyUsed).toBe(true);
+    expect(settled).toBe(false);
+    controller.abort();
+    await expect(bounded(outcome, 5_000)).resolves.toMatchObject({
+      kind: 'cancelled',
+      message: 'SpeedyIndex task-list request was cancelled.',
+    });
+    await bounded(disconnected.promise);
+    await expect(
+      client.listTasks({
+        searchEngine: 'google',
+        taskType: 'indexer',
+        page: 0,
+      }),
+    ).resolves.toMatchObject({ tasks: [] });
+    expect(api.requests).toHaveLength(2);
+  } finally {
+    await api.close();
+  }
+});
+
+test('RB-07: account deadline while consuming a partial response disconnects and recovers', async () => {
+  const arrived = deferred<void>();
+  const disconnected = deferred<void>();
+  const captured = deferred<Response>();
+  let first = true;
+  const api = await fixture((_req, res) => {
+    if (first) {
+      first = false;
+      res.on('close', () => disconnected.resolve());
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Transfer-Encoding': 'chunked',
+      });
+      res.write('{"code":0,"balance":');
+      arrived.resolve();
+    } else res.end(JSON.stringify(account));
+  });
+  const client = new SpeedyIndexClient(
+    dummyKey,
+    captureFirstResponse(api.origin, captured),
+    3_000,
+  );
+  try {
+    let settled = false;
+    const outcome = client.getBalance().then(
+      (value) => {
+        settled = true;
+        return value;
+      },
+      (error: unknown) => {
+        settled = true;
+        return error;
+      },
+    );
+    await bounded(arrived.promise);
+    const response = await bounded(captured.promise);
+    await bounded(waitForBodyUse(response), 5_000);
+    expect(response.body?.locked).toBe(true);
+    expect(response.bodyUsed).toBe(true);
+    expect(settled).toBe(false);
+    await expect(bounded(outcome, 4_500)).resolves.toMatchObject({
+      kind: 'timeout',
+      message: 'SpeedyIndex account request timed out.',
+    });
+    await bounded(disconnected.promise);
+    await expect(client.getBalance()).resolves.toMatchObject({
+      balance: { tokens: 0, indexer: 27, checker: 8 },
+    });
+    expect(api.requests).toHaveLength(2);
+  } finally {
+    await api.close();
+  }
+});
+
+test('RB-08: response limit constructor seam is positive, integral, and lower-only', () => {
+  const productionLimit = 16 * 1024 * 1024;
+  const invalidLimits = [
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    productionLimit + 1,
+  ];
+  let requests = 0;
+  const fetchAccount = (async (
+    _input: Parameters<typeof fetch>[0],
+    _init?: RequestInit,
+  ) => {
+    void _input;
+    void _init;
+    requests += 1;
+    return new Response(JSON.stringify(account));
+  }) as typeof fetch;
+
+  for (const limit of invalidLimits) {
+    expect(
+      () => new SpeedyIndexClient(dummyKey, fetchAccount, 10_000, limit),
+    ).toThrow(RangeError);
+  }
+  expect(requests).toBe(0);
 });

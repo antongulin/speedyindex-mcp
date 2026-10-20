@@ -65,6 +65,8 @@ For Google indexer tasks, optional `filter` values are `standard`, `pay_per_inde
 
 Both tools make one authenticated GET to a fixed `https://api.speedyindex.com/v2` route, using the API key as the raw `Authorization` header. Requests have a 10-second deadline, support MCP cancellation, reject redirects, and never retry automatically. Missing keys fail without network access. Tool failures return `isError: true` with a sanitized message and no structured result. Provider bodies and exception details are never reflected in those errors. Normal stdout contains MCP messages only; diagnostics use stderr. Closing stdin ends the process.
 
+Responses over this MCP's 16 MiB decoded-body safety bound are rejected; this is not a SpeedyIndex maximum.
+
 ## Development
 
 ```sh
