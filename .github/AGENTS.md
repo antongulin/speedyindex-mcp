@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Configure Robin review automation for this public repository.
+Configure CI, Robin review, and community contribution templates for this public repository.
 
 ## Ownership
 
-`workflows/code-review.yml` is the sole Robin caller. `robin.yml` owns repository review settings. No deployment, scheduling, or release automation is configured.
+`workflows/code-review.yml` is the sole Robin caller. `robin.yml` owns repository review settings. `workflows/ci.yml` owns frozen installation, typecheck, lint, format, source tests, build, and built tests on ubuntu-latest. Issue and PR templates request reproducible, sanitized evidence. No deployment, scheduling, or release automation is configured.
 
 ## Local Contracts
 

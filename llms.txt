@@ -1,0 +1,11 @@
+# SpeedyIndex MCP
+
+> Unofficial Bun/TypeScript stdio MCP server. Only get_balance is implemented; the other 11 tools are roadmap work. No npm release is published.
+
+- [README](https://github.com/antongulin/speedyindex-mcp/blob/main/README.md): Setup and tool contract
+- [Architecture](https://github.com/antongulin/speedyindex-mcp/blob/main/docs/architecture.md): Runtime boundaries
+- [Dependencies](https://github.com/antongulin/speedyindex-mcp/blob/main/docs/dependencies.md): Version decisions
+- [Roadmap](https://github.com/antongulin/speedyindex-mcp/blob/main/docs/implementation-plan.md): Unimplemented scope
+- [Contributing](https://github.com/antongulin/speedyindex-mcp/blob/main/CONTRIBUTING.md): Development and review
+- [Security](https://github.com/antongulin/speedyindex-mcp/blob/main/SECURITY.md): Private reporting
+- [Agent contract](https://github.com/antongulin/speedyindex-mcp/blob/main/AGENTS.md): Repository instructions
