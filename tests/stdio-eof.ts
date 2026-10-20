@@ -3,7 +3,10 @@ import { expect } from 'bun:test';
 import { bounded, deferred } from './helpers';
 
 export async function verifyEof(entry: string) {
-  const child = spawn(process.execPath, [entry], { env: {}, stdio: 'pipe' });
+  const child = spawn(process.execPath, ['--no-env-file', entry], {
+    env: {},
+    stdio: 'pipe',
+  });
   const initialized = deferred<unknown>();
   const exited = new Promise<number | null>((resolve, reject) => {
     child.once('error', reject);

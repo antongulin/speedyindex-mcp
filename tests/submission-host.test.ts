@@ -12,11 +12,13 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -41,7 +43,76 @@ import {
   type PrepareIntentInput,
 } from '../src/submission-ledger';
 import type { SubmissionHostOptions } from '../src/submission-host';
-import { bounded, deferred, fixture } from './helpers';
+import {
+  account,
+  bounded,
+  connect,
+  connectOwnedStdio,
+  deferred,
+  fixture,
+} from './helpers';
+
+function sdkPhases() {
+  const messages: Record<string, unknown>[] = [];
+  const errors: string[] = [];
+  const waiters: {
+    event: string;
+    operation?: number;
+    done: (message: Record<string, unknown>) => void;
+  }[] = [];
+  let buffer = '';
+  return {
+    messages,
+    errors,
+    receive(chunk: string) {
+      buffer += chunk;
+      while (buffer.includes('\n')) {
+        const end = buffer.indexOf('\n');
+        const line = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        if (!line.startsWith('SUBMISSION_PHASE ')) {
+          errors.push('Unexpected SDK fixture stderr.');
+          continue;
+        }
+        try {
+          const message = JSON.parse(
+            line.slice('SUBMISSION_PHASE '.length),
+          ) as Record<string, unknown>;
+          messages.push(message);
+          if (
+            message.event === 'PROTOCOL_ERROR' ||
+            message.event === 'FIXTURE_ERROR'
+          )
+            errors.push('SDK fixture error phase.');
+          for (const waiter of waiters)
+            if (
+              message.event === waiter.event &&
+              (waiter.operation === undefined ||
+                waiter.operation === message.operation)
+            )
+              waiter.done(message);
+        } catch {
+          errors.push('Invalid SDK fixture phase.');
+        }
+      }
+    },
+    wait(event: string, operation?: number) {
+      const existing = messages.find(
+        (m) =>
+          m.event === event &&
+          (operation === undefined || m.operation === operation),
+      );
+      if (existing) return Promise.resolve(existing);
+      const next = deferred<Record<string, unknown>>();
+      waiters.push({
+        event,
+        ...(operation === undefined ? {} : { operation }),
+        done: next.resolve,
+      });
+      return bounded(next.promise, 8_000);
+    },
+  };
+}
 
 const savedFetch = globalThis.fetch;
 const allowedOrigins = new Set<string>();
@@ -267,6 +338,8 @@ async function makeHarness() {
   const children: HostProcess[] = [];
   const childStreams: HostChild[] = [];
   const locks: (() => void)[] = [];
+  const sdkClosers: (() => Promise<void>)[] = [];
+  const phaseRecorders: ReturnType<typeof sdkPhases>[] = [];
   const fences: ReturnType<typeof deferred<void>>[] = [];
   const received = deferred<void>();
   let now = day1,
@@ -473,6 +546,39 @@ async function makeHarness() {
     rows,
     seed,
     fetchRequest,
+    async sdk(
+      instrumented = false,
+      args = [
+        '--submission-policy',
+        policyPath,
+        '--submission-state',
+        stateDirectory,
+      ],
+    ) {
+      const phases = sdkPhases();
+      if (instrumented) phaseRecorders.push(phases);
+      const register = (close: () => Promise<void>) => sdkClosers.push(close);
+      const session = instrumented
+        ? await connectOwnedStdio(
+            ['tests/fixtures/submission-sdk-child.ts'],
+            {
+              SPEEDYINDEX_API_KEY: key,
+              TEST_ACCOUNT_ORIGIN: api.origin,
+              HOME: root,
+              TEST_SUBMISSION_POLICY: policyPath,
+              TEST_SUBMISSION_STATE: stateDirectory,
+              TEST_SUBMISSION_NOW: String(now),
+            },
+            (child) => children.push(child),
+            { onStderr: phases.receive, register },
+          )
+        : await connect(api.origin, 'src/cli.ts', key, '', { args, register });
+      return { ...session, phases };
+    },
+    track<T>(operation: Promise<T>) {
+      pending.push(operation);
+      return operation;
+    },
     async child(input: unknown, mode: ChildMode = 'normal') {
       return startHostChild(
         {
@@ -543,6 +649,14 @@ async function makeHarness() {
       }
       for (const controller of controllers) controller.abort();
       for (const fence of fences) fence.resolve();
+      const sdkClosed = await Promise.allSettled(
+        sdkClosers.map((close) => close()),
+      );
+      for (const result of sdkClosed)
+        if (result.status === 'rejected') errors.push(result.reason);
+      for (const recorder of phaseRecorders)
+        if (recorder.errors.length)
+          errors.push(new Error(recorder.errors.join(' ')));
       let settled = false;
       const reaped = await Promise.allSettled(
         children.map(async (child) => {
@@ -1687,6 +1801,69 @@ test('C09 HOST: a throwing transport invocation is attempted/unknown, never refl
 });
 
 type HostHarness = Awaited<ReturnType<typeof makeHarness>>;
+function sdkApplication(value: {
+  structuredContent?: unknown;
+  content: unknown;
+  isError?: boolean | undefined;
+}) {
+  const result = createIndexingTaskResultSchema.parse(value.structuredContent);
+  expect(value.content).toEqual([
+    { type: 'text', text: JSON.stringify(result) },
+  ]);
+  expect(value.isError).toBe(
+    result.status !== 'preview' && result.status !== 'accepted',
+  );
+  return result;
+}
+function sdkWrites(session: Awaited<ReturnType<HostHarness['sdk']>>) {
+  type Write = {
+    method: string;
+    name?: string;
+    id?: string | number;
+    requestId?: unknown;
+  };
+  const messages: Write[] = [];
+  const waiters: {
+    method: string;
+    name?: string;
+    done: (write: Write) => void;
+  }[] = [];
+  const send = session.transport.send.bind(session.transport);
+  session.transport.send = async (
+    message: Parameters<typeof session.transport.send>[0],
+  ) => {
+    await send(message);
+    if (!('method' in message)) return;
+    const params = message.params as Record<string, unknown> | undefined;
+    const write: Write = {
+      method: message.method,
+      ...('id' in message ? { id: message.id } : {}),
+      ...(typeof params?.name === 'string' ? { name: params.name } : {}),
+      ...(params && 'requestId' in params
+        ? { requestId: params.requestId }
+        : {}),
+    };
+    messages.push(write);
+    for (const waiter of waiters)
+      if (
+        waiter.method === write.method &&
+        (!waiter.name || waiter.name === write.name)
+      )
+        waiter.done(write);
+  };
+  return {
+    messages,
+    wait(method: string, name?: string) {
+      const found = messages.find(
+        (m) => m.method === method && (!name || m.name === name),
+      );
+      if (found) return Promise.resolve(found);
+      const next = deferred<Write>();
+      waiters.push({ method, ...(name ? { name } : {}), done: next.resolve });
+      return bounded(next.promise, 8_000);
+    },
+  };
+}
 function events(h: HostHarness, id: string) {
   return h.rows<{ event_kind: string; state_version: number }>(
     'SELECT event_kind, state_version FROM intent_events WHERE request_id = ? ORDER BY state_version',
@@ -2252,5 +2429,388 @@ test('C13-Q HOST: queued stdin cancellation after committed claim is serviced be
     });
     expect(observed.result.error?.code).toBe('Cancelled');
     assertNoPrivate(observed.result, h);
+  });
+}, 30_000);
+
+for (const succeeds of [false, true]) {
+  test(`${succeeds ? 'C14-B' : 'C14'} SDK: cancellation is flushed while real prepare ${succeeds ? 'waits then commits' : 'waits through busy timeout'}`, async () => {
+    await withHost(async (h) => {
+      h.init();
+      h.config();
+      h.handler = (receipt, response) =>
+        response.end(
+          JSON.stringify(
+            receipt.path === '/v2/account'
+              ? account
+              : { code: 0, task_id: 'after-sql', type: 'google/indexer' },
+          ),
+        );
+      const session = await h.sdk(true);
+      await session.phases.wait('READY');
+      const writes = sdkWrites(session);
+      const release = h.writerLock();
+      const controller = new AbortController();
+      const input = request(succeeds ? 'queued-sdk-commit' : 'queued-sdk-busy');
+      const call = h.track(
+        session.client
+          .callTool(
+            { name: 'create_indexing_task', arguments: input },
+            { signal: controller.signal, timeout: 15_000 },
+          )
+          .then(
+            () => 'delivered',
+            () => 'cancelled',
+          ),
+      );
+      const sent = await writes.wait('tools/call', 'create_indexing_task');
+      await session.phases.wait('PREPARE_ENTER', 1);
+      let pingFinished = false,
+        readFinished = false;
+      const ping = h.track(
+        session.client.ping({ timeout: 15_000 }).then((value) => {
+          pingFinished = true;
+          return value;
+        }),
+      );
+      await writes.wait('ping');
+      const read = h.track(
+        session.client
+          .callTool({ name: 'get_balance', arguments: {} }, { timeout: 15_000 })
+          .then((value) => {
+            readFinished = true;
+            return value;
+          }),
+      );
+      await writes.wait('tools/call', 'get_balance');
+      controller.abort('synthetic queued cancellation');
+      const cancel = await writes.wait('notifications/cancelled');
+      expect(cancel.requestId).toBe(sent.id);
+      expect(
+        session.phases.messages.some((m) => m.event === 'PREPARE_LEAVE'),
+      ).toBe(false);
+      expect(pingFinished).toBe(false);
+      expect(readFinished).toBe(false);
+      if (succeeds) release();
+      const leave = await session.phases.wait('PREPARE_LEAVE', 1);
+      if (!succeeds) release();
+      await session.phases.wait('CLOSED', 1);
+      expect(await bounded(call, 8_000)).toBe('cancelled');
+      await bounded(ping, 8_000);
+      expect((await bounded(read, 8_000)).isError).not.toBe(true);
+      expect(
+        h.records.filter((receipt) => receipt.method === 'POST'),
+      ).toHaveLength(0);
+      expect(
+        session.phases.messages.filter(
+          (m) => m.event === 'CLAIM' && m.operation === 1,
+        ),
+      ).toEqual([]);
+      if (succeeds) {
+        expect(leave.kind).toBe('created');
+        expect(h.read(input.requestId)).toMatchObject({
+          state: 'cancelled',
+          stateVersion: 1,
+        });
+        expect(events(h, input.requestId)).toEqual([
+          { event_kind: 'prepared', state_version: 0 },
+          { event_kind: 'cancelled', state_version: 1 },
+        ]);
+        expect(
+          session.phases.messages.find((m) => m.event === 'CANCEL'),
+        ).toEqual({ event: 'CANCEL', operation: 1, kind: 'cancelled' });
+      } else {
+        expect(leave.code).toBe('LedgerBusy');
+        expect(h.read(input.requestId)).toBeNull();
+        expect(h.rows('SELECT event_id FROM intent_events')).toEqual([]);
+        expect(h.rows('SELECT period_id FROM budget_periods')).toEqual([]);
+      }
+      expect(heldTokens(h)).toBe(0);
+      console.info(
+        `${succeeds ? 'C14-B' : 'C14'} real SDK phase evidence`,
+        JSON.stringify({
+          writes: writes.messages,
+          phases: session.phases.messages,
+          createPosts: h.records.filter((r) => r.method === 'POST').length,
+          durable: h.read(input.requestId)?.state ?? 'absent',
+          events: events(h, input.requestId),
+        }),
+      );
+      const next = sdkApplication(
+        await session.client.callTool({
+          name: 'create_indexing_task',
+          arguments: request('after-sql'),
+        }),
+      );
+      expect(next.status).toBe('accepted');
+      expect(h.read('after-sql')).toMatchObject({
+        state: 'accepted',
+        stateVersion: 2,
+        providerTaskId: 'after-sql',
+      });
+      expect(
+        h.records.filter((receipt) => receipt.method === 'POST'),
+      ).toHaveLength(1);
+      expect(session.phases.errors).toEqual([]);
+    });
+  }, 30_000);
+}
+
+test('C15 SOURCE SDK: real CLI cancellation after full POST persists unknown, fresh replay sends nothing', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config();
+    const ackFence = h.fence(),
+      disconnected = deferred<void>();
+    h.handler = async (receipt, response) => {
+      if (receipt.path === '/v2/account') {
+        response.end(JSON.stringify(account));
+        return;
+      }
+      response.once('close', () => disconnected.resolve());
+      await ackFence.promise;
+      response.end(
+        JSON.stringify({
+          code: 0,
+          task_id: 'late-cli-ack',
+          type: 'google/indexer',
+        }),
+      );
+    };
+    const session = await h.sdk();
+    expect((await session.client.listTools()).tools).toHaveLength(5);
+    const controller = new AbortController();
+    const input = request('sdk-after-receipt');
+    const call = h.track(
+      session.client
+        .callTool(
+          { name: 'create_indexing_task', arguments: input },
+          { signal: controller.signal },
+        )
+        .then(
+          () => 'delivered',
+          () => 'cancelled',
+        ),
+    );
+    await bounded(h.received.promise);
+    expect(h.records[0]!.body).toBe(
+      '{"urls":["https://example.test/one"],"pay_per_indexed":true,"drip_feed":false}',
+    );
+    expectDispatchHeld(h, input);
+    controller.abort('synthetic caller stop after receipt');
+    expect(await bounded(call)).toBe('cancelled');
+    await bounded(disconnected.promise);
+    const balance = await session.client.callTool({
+      name: 'get_balance',
+      arguments: {},
+    });
+    expect(balance.isError).not.toBe(true);
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'unknown',
+      stateVersion: 2,
+    });
+    expect(events(h, input.requestId)).toEqual([
+      { event_kind: 'prepared', state_version: 0 },
+      { event_kind: 'dispatching', state_version: 1 },
+      { event_kind: 'unknown', state_version: 2 },
+    ]);
+    expect(session.stderr()).toBe('');
+    await session.close();
+    const restarted = await h.sdk();
+    const replay = sdkApplication(
+      await restarted.client.callTool({
+        name: 'create_indexing_task',
+        arguments: input,
+      }),
+    );
+    expect(replay.status).toBe('unknown');
+    expect(replay.replayed).toBe(true);
+    expect(replay.observation).toBeUndefined();
+    const overlap = sdkApplication(
+      await restarted.client.callTool({
+        name: 'create_indexing_task',
+        arguments: { ...input, requestId: 'sdk-overlap' },
+      }),
+    );
+    expect(overlap.error?.code).toBe('UrlOverlap');
+    expect(heldTokens(h)).toBe(100);
+    expect(
+      h.records.filter((receipt) => receipt.method === 'POST'),
+    ).toHaveLength(1);
+    expect(restarted.stderr()).toBe('');
+    assertNoPrivate(replay, h);
+    assertNoPrivate(overlap, h);
+    console.info(
+      'C15 source cancellation evidence',
+      JSON.stringify({
+        client: 'cancelled; server response not asserted delivered',
+        state: h.read(input.requestId)?.state,
+        events: events(h, input.requestId),
+        createPosts: 1,
+        replay: replay.status,
+        overlap: overlap.error?.code,
+      }),
+    );
+  });
+}, 30_000);
+
+for (const state of [
+  'missing',
+  'missing database',
+  'zero',
+  'truncated',
+  'wrong version',
+  'symlink',
+] as const) {
+  test(`C16 SOURCE CLI: ${state} state is untouched by startup/preview and never repaired on submit`, async () => {
+    await withHost(async (h) => {
+      h.config();
+      if (state === 'wrong version') {
+        h.init();
+        const db = new Database(join(h.stateDirectory, 'ledger.sqlite'));
+        try {
+          db.exec('PRAGMA user_version = 2');
+        } finally {
+          db.close();
+        }
+      } else if (state === 'symlink') {
+        const target = join(h.root, 'sentinel-target');
+        mkdirSync(target, { mode: 0o700 });
+        writeFileSync(join(target, 'sentinel'), 'preserve synthetic target', {
+          mode: 0o600,
+        });
+        symlinkSync(target, h.stateDirectory);
+      } else if (state !== 'missing') {
+        mkdirSync(h.stateDirectory, { mode: 0o700 });
+        writeFileSync(
+          join(
+            h.stateDirectory,
+            state === 'missing database' ? 'sentinel' : 'ledger.sqlite',
+          ),
+          state === 'zero' ? '' : 'preserve synthetic truncated bytes',
+          { mode: 0o600 },
+        );
+      }
+      const before = tree(h.root);
+      const primary =
+        state === 'wrong version'
+          ? readFileSync(join(h.stateDirectory, 'ledger.sqlite'))
+          : undefined;
+      const primaryIdentity =
+        state === 'wrong version'
+          ? lstatSync(join(h.stateDirectory, 'ledger.sqlite')).ino
+          : undefined;
+      const session = await h.sdk();
+      const preview = sdkApplication(
+        await session.client.callTool({
+          name: 'create_indexing_task',
+          arguments: {
+            mode: 'preview',
+            searchEngine: 'google',
+            urls: ['https://example.test/one'],
+          },
+        }),
+      );
+      expect(preview.status).toBe('preview');
+      expect(preview.authorization?.stateChecked).toBe(false);
+      expect(tree(h.root)).toEqual(before);
+      const blocked = sdkApplication(
+        await session.client.callTool({
+          name: 'create_indexing_task',
+          arguments: request('bad-state'),
+        }),
+      );
+      expect(blocked.error?.code).toBe('StateUnavailable');
+      if (state === 'wrong version') {
+        // Normal open can update WAL shared-memory bookkeeping before schema
+        // rejection. It must preserve the database bytes and identity.
+        expect(lstatSync(join(h.stateDirectory, 'ledger.sqlite')).ino).toBe(
+          primaryIdentity!,
+        );
+        expect(readFileSync(join(h.stateDirectory, 'ledger.sqlite'))).toEqual(
+          primary!,
+        );
+      } else expect(tree(h.root)).toEqual(before);
+      h.handler = (_receipt, response) => response.end(JSON.stringify(account));
+      expect(
+        (await session.client.callTool({ name: 'get_balance', arguments: {} }))
+          .isError,
+      ).not.toBe(true);
+      expect(
+        h.records.filter((receipt) => receipt.method === 'POST'),
+      ).toHaveLength(0);
+      expect(session.stderr()).toBe('');
+      assertNoPrivate(blocked, h);
+    });
+  }, 30_000);
+}
+
+test('C15 SOURCE CLI: incomplete or malformed trusted configuration disables writes while reads remain usable', async () => {
+  await withHost(async (h) => {
+    h.config();
+    h.handler = (_receipt, response) => response.end(JSON.stringify(account));
+    const malformedArgs = [
+      '--submission-policy',
+      h.policyPath,
+      '--submission-state',
+      h.stateDirectory,
+    ];
+    for (const args of [
+      ['--submission-policy', h.policyPath],
+      ['--submission-state', h.stateDirectory],
+      [
+        '--submission-policy',
+        join(h.root, 'absent-policy'),
+        '--submission-state',
+        h.stateDirectory,
+      ],
+      [
+        '--submission-policy',
+        h.policyPath,
+        '--submission-state',
+        'relative-state',
+      ],
+      malformedArgs,
+    ]) {
+      if (args === malformedArgs)
+        writeFileSync(h.policyPath, '{"version":1,}', { mode: 0o600 });
+      const session = await h.sdk(false, args);
+      const preview = sdkApplication(
+        await session.client.callTool({
+          name: 'create_indexing_task',
+          arguments: {
+            mode: 'preview',
+            searchEngine: 'google',
+            urls: ['https://example.test/config-preview'],
+          },
+        }),
+      );
+      expect(preview.status).toBe('preview');
+      expect(preview.authorization).toEqual({
+        state: 'invalid',
+        stateChecked: false,
+      });
+      const result = sdkApplication(
+        await session.client.callTool({
+          name: 'create_indexing_task',
+          arguments: request('disabled-config'),
+        }),
+      );
+      expect(result.error?.code).toBe('InvalidPolicy');
+      expect(result.authorization).toEqual({
+        state: 'invalid',
+        stateChecked: false,
+      });
+      expect((await session.client.listTools()).tools).toHaveLength(5);
+      expect(
+        (await session.client.callTool({ name: 'get_balance', arguments: {} }))
+          .isError,
+      ).not.toBe(true);
+      expect(session.stderr()).toBe('');
+      assertNoPrivate(result, h);
+      await session.close();
+    }
+    expect(existsSync(h.stateDirectory)).toBe(false);
+    expect(h.records).toHaveLength(5);
+    expect(h.records.every((receipt) => receipt.method === 'GET')).toBe(true);
   });
 }, 30_000);
