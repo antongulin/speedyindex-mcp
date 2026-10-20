@@ -14,6 +14,7 @@ This root owns project scope, public status, licensing, and the DOX hierarchy. `
 - Read this root and every applicable child `AGENTS.md` before editing. The nearest contract controls local details without weakening the shared DOX discipline.
 - Keep roadmap features separate from implemented behavior. `get_balance`, `list_tasks`, `get_task_status`, and `get_task_report` are implemented; other tools require later scoped work.
 - Keep public documentation free of credentials, account data, private task records, and machine-specific paths. Provider calls and paid submissions require task-specific authority.
+- In public SpeedyIndex onboarding copy, include the referral link [SpeedyIndex referral link](https://app.speedyindex.com/r/zqgax9) with an adjacent disclosure that it may support this project. Keep the official [account API page](https://app.speedyindex.com/cabinet/api) and [public API reference](https://en.speedyindex.com/api.php) direct; never use the referral URL for technical documentation or API endpoints.
 - Adapted DOX guidance is credited in [provenance](docs/provenance.md); preserve the [upstream MIT notice](docs/dox-LICENSE.txt).
 
 CodeGraph initialization is authorized here after source exists: inspect installed help, then run `CODEGRAPH_TELEMETRY=0 codegraph init .` and `sync` after source changes. Keep `.codegraph/` ignored; exclude dependencies/build output. Use actual call/impact and affected-test queries, verifying findings in source. Do not install or upgrade CodeGraph. Its committed MCP configuration is for source navigation only.
