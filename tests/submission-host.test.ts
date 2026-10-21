@@ -152,7 +152,7 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = savedFetch;
   allowedOrigins.clear();
-  expect(networkViolations).toEqual([]);
+  expect(networkViolations.splice(0)).toEqual([]);
 });
 afterAll(() => {
   globalThis.fetch = savedFetch;
