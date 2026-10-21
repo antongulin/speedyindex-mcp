@@ -6,7 +6,7 @@ Serve SpeedyIndex account/task reads and guarded indexing previews/submissions o
 
 ## Ownership
 
-`cli.ts` owns arguments, local fingerprint/init modes, trusted configuration and transport; `server.ts` registers tools. `client.ts`, `task-status.ts` and `task-report.ts` own read HTTP, schemas and normalization. `create-indexing-task.ts` owns pure public schemas, frozen bodies, quotes and ACK classification; `submission-policy.ts` owns private policy loading and trusted context; `submission-host.ts` owns guarded paid dispatch. `submission-ledger.ts` owns the V1 SQLite intent/reservation core. The five files under `tools/` own their public adapters.
+`cli.ts` owns arguments, local fingerprint/init modes, trusted configuration and transport; `server.ts` registers tools. `client.ts`, `task-status.ts` and `task-report.ts` own read HTTP, schemas and normalization. `submission-contract.ts` owns pure submission scalar/unit/authorization contracts and coordinator DTOs; `create-indexing-task.ts` retains their public indexing aliases and owns indexing schemas, frozen bodies, quotes and ACK classification. `submission-policy.ts` owns private policy loading and trusted context; `submission-host.ts` owns the shared coordinator, internal indexing strategy and guarded paid dispatch. `submission-ledger.ts` owns the V1 SQLite intent/reservation core. The five files under `tools/` own their public adapters.
 
 ## Local Contracts
 

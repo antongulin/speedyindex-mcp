@@ -1,86 +1,38 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import {
+  submissionLimits as indexingLimits,
+  modeSchema,
+  digestSchema,
+  visibleLabelSchema,
+  safeInteger,
+  safeNonnegativeInteger,
+  submittedUrlSchema,
+  titleSchema,
+  providerTaskIdSchema,
+  acknowledgementSchema,
+  submissionUnitVectorSchema as indexingUnitVectorSchema,
+  submissionErrorCodeSchema as createIndexingTaskErrorCodeSchema,
+  submissionAuthorizationSchema as indexingAuthorizationSchema,
+  type SubmissionUnitVector as IndexingUnitVector,
+  type SubmissionErrorCode as CreateIndexingTaskErrorCode,
+} from './submission-contract';
+export {
+  submissionLimits as indexingLimits,
+  submissionUnitVectorSchema as indexingUnitVectorSchema,
+  submissionErrorCodeSchema as createIndexingTaskErrorCodeSchema,
+  submissionAuthorizationSchema as indexingAuthorizationSchema,
+  type SubmissionUnitVector as IndexingUnitVector,
+  type SubmissionErrorCode as CreateIndexingTaskErrorCode,
+  type SubmissionAuthorization as IndexingAuthorization,
+} from './submission-contract';
 
 export const indexingQuoteVersion = 'speedyindex-indexing-batch-2026-10-20-v1';
-export const indexingLimits = Object.freeze({
-  urls: 10_000,
-  urlBytes: 8_192,
-  titleBytes: 1_024,
-  taskIdBytes: 4_096,
-  providerBodyBytes: 2_097_152,
-  responseBytes: 65_536,
-});
-
-const modeSchema = z.enum(['preview', 'submit']);
 const indexingFamilySchema = z.enum(['google/indexer', 'yandex/indexer']);
-const digestSchema = z.string().regex(/^[0-9a-f]{64}$/);
-const visibleLabelSchema = z.string().regex(/^[\x21-\x7e]{1,128}$/);
-const safeInteger = z
-  .number()
-  .int()
-  .min(Number.MIN_SAFE_INTEGER)
-  .max(Number.MAX_SAFE_INTEGER);
-const safeNonnegativeInteger = safeInteger.nonnegative();
 const routes = {
   'google/indexer': '/v2/task/google/indexer/create',
   'yandex/indexer': '/v2/task/yandex/indexer/create',
 } as const;
-
-function validText(value: string, maxBytes: number) {
-  if (Buffer.byteLength(value, 'utf8') > maxBytes) return false;
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code < 32 || code === 127) return false;
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(++i);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return false;
-    }
-  }
-  return true;
-}
-
-const submittedUrlSchema = z.string().refine((value) => {
-  if (
-    !validText(value, indexingLimits.urlBytes) ||
-    value.includes(' ') ||
-    value.trim() !== value ||
-    !/^https?:\/\//i.test(value)
-  )
-    return false;
-  try {
-    const parsed = new URL(value);
-    const authority = value
-      .slice(value.indexOf('//') + 2)
-      .split(/[/?#\\]/, 1)[0]!;
-    return (
-      parsed.host.length > 0 &&
-      parsed.username === '' &&
-      parsed.password === '' &&
-      !authority.includes('@')
-    );
-  } catch {
-    return false;
-  }
-}, 'Invalid submitted URL.');
-const titleSchema = z
-  .string()
-  .refine(
-    (value) => validText(value, indexingLimits.titleBytes),
-    'Invalid submission title.',
-  );
-const providerTaskIdSchema = z
-  .string()
-  .refine(
-    (value) =>
-      value.trim().length > 0 && validText(value, indexingLimits.taskIdBytes),
-    'Invalid provider task ID.',
-  );
-const acknowledgementSchema = z.strictObject({
-  quoteFingerprint: digestSchema,
-  authorizationFingerprint: digestSchema,
-});
 
 function serializeProviderBody(input: {
   searchEngine: 'google' | 'yandex';
@@ -145,12 +97,6 @@ export type CreateIndexingTaskInput = z.infer<
   typeof createIndexingTaskInputSchema
 >;
 export type IndexingFamily = z.infer<typeof indexingFamilySchema>;
-export const indexingUnitVectorSchema = z.strictObject({
-  tokens: safeNonnegativeInteger,
-  indexer: safeNonnegativeInteger,
-  checker: safeNonnegativeInteger,
-});
-export type IndexingUnitVector = z.infer<typeof indexingUnitVectorSchema>;
 const requestSchema = z.strictObject({
   family: indexingFamilySchema,
   providerRoute: z.enum([routes['google/indexer'], routes['yandex/indexer']]),
@@ -259,31 +205,6 @@ export function buildCreateIndexingRequest(
   return Object.freeze({ input, body, request, quote });
 }
 
-export const createIndexingTaskErrorCodeSchema = z.enum([
-  'InvalidInput',
-  'InternalError',
-  'WritesDisabled',
-  'InvalidPolicy',
-  'MissingCredentials',
-  'CredentialMismatch',
-  'AcknowledgementRequired',
-  'AcknowledgementMismatch',
-  'StateUnavailable',
-  'SubmissionBusy',
-  'RequestIdConflict',
-  'UrlOverlap',
-  'BudgetExceeded',
-  'StalePeriodContext',
-  'LedgerBusy',
-  'DispatchClaimLost',
-  'OutcomePersistenceFailed',
-  'ProviderRejected',
-  'OutcomeUnknown',
-  'Cancelled',
-]);
-export type CreateIndexingTaskErrorCode = z.infer<
-  typeof createIndexingTaskErrorCodeSchema
->;
 const errorMessages: Record<CreateIndexingTaskErrorCode, string> = {
   InvalidInput: 'Invalid create-indexing request.',
   InternalError: 'Could not produce a valid create-indexing result.',
@@ -332,54 +253,6 @@ const errorSchema = z
       (error.lastObservedState === undefined ||
         error.code === 'StateUnavailable'),
   );
-export const indexingAuthorizationSchema = z
-  .strictObject({
-    state: z.enum([
-      'unconfigured',
-      'disabled',
-      'invalid',
-      'credential_missing',
-      'credential_mismatch',
-      'configured',
-    ]),
-    stateChecked: z.boolean(),
-    mode: z.enum(['caller_acknowledgement', 'operator_policy']).optional(),
-    policyRevision: visibleLabelSchema.optional(),
-    policyDigest: digestSchema.optional(),
-    budgetScope: visibleLabelSchema.optional(),
-    caps: indexingUnitVectorSchema.optional(),
-    period: z
-      .strictObject({
-        id: visibleLabelSchema,
-        startMs: safeInteger,
-        endMs: safeInteger,
-      })
-      .refine((p) => p.endMs > p.startMs)
-      .optional(),
-    fingerprint: digestSchema.optional(),
-  })
-  .superRefine((authorization, context) => {
-    const metadata = [
-      authorization.mode,
-      authorization.policyRevision,
-      authorization.policyDigest,
-      authorization.budgetScope,
-      authorization.caps,
-      authorization.period,
-      authorization.fingerprint,
-    ];
-    if (
-      ((authorization.state === 'configured' ||
-        metadata.some((v) => v !== undefined)) &&
-        metadata.some((v) => v === undefined)) ||
-      (authorization.stateChecked && authorization.state !== 'configured')
-    )
-      context.addIssue({
-        code: 'custom',
-        message: 'Invalid authorization summary.',
-      });
-  });
-export type IndexingAuthorization = z.infer<typeof indexingAuthorizationSchema>;
 const intentSchema = z
   .strictObject({
     requestId: visibleLabelSchema,

@@ -43,6 +43,7 @@ import {
   type PrepareIntentInput,
 } from '../src/submission-ledger';
 import type { SubmissionHostOptions } from '../src/submission-host';
+import identity from './fixtures/indexing-v1-identity.json';
 import {
   account,
   bounded,
@@ -1274,6 +1275,177 @@ test('C05 HOST: expired preview cannot create a new-period intent; core-seeded u
     expect(h.read('seed-dispatching')?.state).toBe('dispatching');
     expect(h.records).toHaveLength(0);
     expect(h.attempts).toBe(0);
+  });
+});
+
+test('IC01 HOST: literal V1 accepted and held identities reopen and replay without new authority', async () => {
+  await withHost(async (h) => {
+    const policy = JSON.parse(identity.policyCanonical) as SubmissionPolicy;
+    const config = h.config(policy, identity.syntheticKey);
+    if (config.state !== 'configured')
+      throw new Error('Expected legacy configuration.');
+    expect(JSON.stringify(config.snapshot.policy)).toBe(
+      identity.policyCanonical,
+    );
+    expect(config.snapshot.digest).toBe(identity.policyDigest);
+    expect(config.credential.fingerprint).toBe(identity.credentialFingerprint);
+    expect(
+      createHash('sha256')
+        .update('speedyindex-submission-policy-v1\0' + identity.policyCanonical)
+        .digest('hex'),
+    ).toBe(identity.policyDigest);
+    h.init();
+    const ledger = openLedger({ stateDirectory: h.stateDirectory });
+    try {
+      for (const vector of identity.vectors) {
+        const quote = JSON.parse(vector.quoteCanonical);
+        const auth = JSON.parse(vector.authorizationCanonical);
+        const context = createSubmissionContext(
+          config,
+          vector.quoteFingerprint,
+          identity.nowMs,
+        );
+        expect(context.authorization.fingerprint).toBe(
+          vector.authorizationFingerprint,
+        );
+        expect(
+          createHash('sha256')
+            .update(
+              'speedyindex-submission-authorization-v1\0' +
+                vector.authorizationCanonical,
+            )
+            .digest('hex'),
+        ).toBe(vector.authorizationFingerprint);
+        expect(
+          JSON.stringify({
+            quoteFingerprint: vector.quoteFingerprint,
+            policyDigest: context.budget.policyDigest,
+            credentialFingerprint: context.budget.credentialFingerprint,
+            budgetScope: context.budget.budgetScope,
+            periodId: context.budget.periodId,
+            periodStartMs: context.budget.periodStartMs,
+          }),
+        ).toBe(vector.authorizationCanonical);
+        // Identity inputs come from portable literals, never the current builder.
+        const made = ledger.prepareIntent({
+          requestId: vector.input.requestId,
+          budget: {
+            credentialFingerprint: auth.credentialFingerprint,
+            budgetScope: auth.budgetScope,
+            periodId: auth.periodId,
+            periodStartMs: auth.periodStartMs,
+            policyRevision: policy.policyRevision,
+            policyDigest: identity.policyDigest,
+            caps: policy.caps,
+          },
+          taskFamily: quote.family,
+          providerRoute: quote.providerRoute,
+          payloadDigest: vector.payloadDigest,
+          submittedUrls: vector.input.urls,
+          quoteVersion: quote.version,
+          quoteFingerprint: vector.quoteFingerprint,
+          reservation: quote.maximumExposure,
+        });
+        if (made.kind !== 'created')
+          throw new Error('Expected a new literal intent.');
+        const claim = ledger.claimDispatch(made.dispatchCapability, 0);
+        if (claim.kind !== 'claimed')
+          throw new Error('Expected literal dispatch claim.');
+        ledger.recordDispatchOutcome({
+          credentialFingerprint: identity.credentialFingerprint,
+          requestId: vector.input.requestId,
+          expectedStateVersion: claim.stateVersion,
+          outcomeToken: claim.outcomeToken,
+          outcome:
+            vector.storedState === 'accepted'
+              ? {
+                  kind: 'accepted',
+                  providerTaskId: vector.providerTaskId!,
+                  providerType: quote.family,
+                }
+              : { kind: 'unknown' },
+        });
+      }
+    } finally {
+      ledger.close();
+    }
+    const tables = [
+      'budget_periods',
+      'intents',
+      'intent_urls',
+      'intent_events',
+    ];
+    const snapshot = () =>
+      tables.map((table) => h.rows(`SELECT * FROM ${table} ORDER BY rowid`));
+    const before = snapshot();
+    let replays = 0,
+      claims = 0,
+      records = 0,
+      cancels = 0;
+    h.now = identity.replayNowMs;
+    const instance = h.host(h.config(policy, identity.syntheticKey), {
+      openLedger(options) {
+        const reopened = openLedger(options);
+        return {
+          prepareIntent(input) {
+            const result = reopened.prepareIntent(input);
+            expect(result.kind).toBe('replay');
+            expect('dispatchCapability' in result).toBe(false);
+            replays++;
+            return result;
+          },
+          claimDispatch(...args) {
+            claims++;
+            return reopened.claimDispatch(...args);
+          },
+          recordDispatchOutcome(input) {
+            records++;
+            return reopened.recordDispatchOutcome(input);
+          },
+          cancelPrepared(...args) {
+            cancels++;
+            return reopened.cancelPrepared(...args);
+          },
+          readIntent: reopened.readIntent.bind(reopened),
+          close: reopened.close.bind(reopened),
+        };
+      },
+    });
+    for (const vector of identity.vectors) {
+      for (const acknowledgement of [
+        undefined,
+        {
+          quoteFingerprint: vector.quoteFingerprint,
+          authorizationFingerprint: vector.authorizationFingerprint,
+        },
+      ]) {
+        const result = await h.call(instance, {
+          ...vector.input,
+          ...(acknowledgement ? { acknowledgement } : {}),
+        });
+        expect(String(result.status)).toBe(vector.storedState);
+        expect(result.replayed).toBe(true);
+        expect(result.quote?.fingerprint).toBe(vector.quoteFingerprint);
+        expect(result.authorization?.fingerprint).not.toBe(
+          vector.authorizationFingerprint,
+        );
+        expect(result.intent?.periodId).toBe('utc-day:2026-10-20');
+        expect(result.intent?.periodStartMs).toBe(1_792_454_400_000);
+        expect(result.intent?.policyDigest).toBe(identity.policyDigest);
+        expect(result.intent?.reservation).toEqual(
+          JSON.parse(vector.quoteCanonical).maximumExposure,
+        );
+        if (vector.storedState === 'accepted')
+          expect(result.intent?.providerTaskId).toBe(vector.providerTaskId!);
+        expect(result.observation).toBeUndefined();
+        assertNoPrivate(result, h);
+      }
+    }
+    expect(replays).toBe(4);
+    expect([claims, records, cancels]).toEqual([0, 0, 0]);
+    expect(snapshot()).toEqual(before);
+    expect(h.attempts).toBe(0);
+    expect(h.records).toHaveLength(0);
   });
 });
 
