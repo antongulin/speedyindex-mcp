@@ -764,6 +764,19 @@ function verifyV2Data(database: Database) {
     database
       .query(
         `SELECT 1 FROM intents i
+      LEFT JOIN (
+        SELECT credential_fp, request_id, COUNT(*) AS event_count,
+          SUM(CASE WHEN state_version = 0 AND event_kind = 'prepared' THEN 1 ELSE 0 END) AS prepared_count,
+          MAX(CASE WHEN state_version = 1 THEN event_kind END) AS phase_one_kind,
+          MAX(CASE WHEN state_version = 2 THEN event_kind END) AS terminal_kind,
+          MAX(CASE WHEN state_version = 2 THEN provider_task_id END) AS terminal_task_id,
+          MAX(CASE WHEN state_version = 2 THEN provider_type END) AS terminal_type,
+          MIN(CASE WHEN state_version = 0 THEN event_id END) AS prepared_event_id,
+          MIN(CASE WHEN state_version = 1 THEN event_id END) AS phase_one_event_id,
+          MIN(CASE WHEN state_version = 2 THEN event_id END) AS terminal_event_id
+        FROM intent_events
+        GROUP BY credential_fp, request_id
+      ) e USING (credential_fp, request_id)
       WHERE NOT EXISTS (SELECT 1 FROM budget_periods b
         WHERE b.credential_fp = i.credential_fp AND b.budget_scope = i.budget_scope
           AND b.period_id = i.period_id AND b.period_start_ms = i.period_start_ms)
@@ -772,30 +785,15 @@ function verifyV2Data(database: Database) {
           GROUP BY u.credential_fp, u.request_id
           HAVING MIN(u.ordinal) = 0 AND MAX(u.ordinal) = COUNT(*) - 1
             AND COUNT(DISTINCT u.url_text) = COUNT(*))
-        OR (SELECT COUNT(*) FROM intent_events e
-          WHERE e.credential_fp = i.credential_fp AND e.request_id = i.request_id) != i.state_version + 1
-        OR NOT EXISTS (SELECT 1 FROM intent_events e
-          WHERE e.credential_fp = i.credential_fp AND e.request_id = i.request_id
-            AND e.state_version = 0 AND e.event_kind = 'prepared')
-        OR (i.state_version >= 1 AND NOT EXISTS (SELECT 1 FROM intent_events e
-          WHERE e.credential_fp = i.credential_fp AND e.request_id = i.request_id
-            AND e.state_version = 1
-            AND e.event_kind = CASE WHEN i.state = 'cancelled' THEN 'cancelled' ELSE 'dispatching' END))
-        OR (i.state_version = 2 AND NOT EXISTS (SELECT 1 FROM intent_events e
-          WHERE e.credential_fp = i.credential_fp AND e.request_id = i.request_id
-            AND e.state_version = 2 AND e.event_kind = i.state
-            AND e.provider_task_id IS i.provider_task_id AND e.provider_type IS i.provider_type))
-      LIMIT 1`,
-      )
-      .get()
-  )
-    fail('LedgerUnavailable');
-  if (
-    database
-      .query(
-        `SELECT 1 FROM intent_events earlier JOIN intent_events later
-      USING (credential_fp, request_id)
-      WHERE earlier.state_version < later.state_version AND earlier.event_id >= later.event_id
+        OR e.event_count IS NULL OR e.event_count != i.state_version + 1
+        OR e.prepared_count != 1
+        OR (i.state_version >= 1 AND (
+          e.phase_one_kind IS NOT CASE WHEN i.state = 'cancelled' THEN 'cancelled' ELSE 'dispatching' END
+          OR e.prepared_event_id >= e.phase_one_event_id))
+        OR (i.state_version = 2 AND (
+          e.terminal_kind IS NOT i.state
+          OR e.terminal_task_id IS NOT i.provider_task_id OR e.terminal_type IS NOT i.provider_type
+          OR e.phase_one_event_id >= e.terminal_event_id))
       LIMIT 1`,
       )
       .get()
