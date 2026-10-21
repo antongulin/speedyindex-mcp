@@ -518,6 +518,55 @@ test('BC04 PURE: accepted intents allow durable replay without observation but r
   expect(createBacklinkCheckResultSchema.safeParse(replay).success).toBe(true);
 });
 
+test('BC04 PURE: unrecorded ACK remains a legal public held result when persistence or final read fails', () => {
+  const { providerTaskId, providerType, ...intent } = acceptedIntent;
+  const dispatchingIntent = { ...intent, state: 'dispatching' as const };
+  const unrecorded = {
+    kind: 'accepted_ack' as const,
+    recorded: false,
+    taskId: providerTaskId,
+    type: providerType,
+  };
+  const base = {
+    mode: 'submit',
+    request: prepared.request,
+    quote: quoted,
+    authorization,
+    observation: unrecorded,
+  } as const;
+  for (const result of [
+    {
+      ...base,
+      status: 'dispatching',
+      intent: dispatchingIntent,
+      error: createBacklinkCheckError('OutcomePersistenceFailed'),
+    },
+    {
+      ...base,
+      status: 'blocked',
+      error: {
+        ...createBacklinkCheckError('StateUnavailable'),
+        lastObservedState: 'dispatching',
+      },
+    },
+  ] as const) {
+    expect(createBacklinkCheckResultSchema.safeParse(result).success).toBe(
+      true,
+    );
+    const wire = createBacklinkCheckToolResult(result);
+    expect(wire.isError).toBe(true);
+    expect(wire.structuredContent).toEqual(result);
+    expect(JSON.parse(wire.content[0]!.text)).toEqual(result);
+    expect(wire.structuredContent.observation).toEqual(unrecorded);
+  }
+  expect(
+    createBacklinkCheckResultSchema.safeParse({
+      ...acceptedResult,
+      observation: unrecorded,
+    }).success,
+  ).toBe(false);
+});
+
 test('BC04 PURE: tool formatter reports safe application errors and text/structured parity', () => {
   const preview = {
     mode: 'preview',

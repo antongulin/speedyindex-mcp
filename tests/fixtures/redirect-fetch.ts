@@ -6,6 +6,7 @@ const createPaths = new Set([
   '/v2/task/google/checker/create',
   '/v2/task/yandex/checker/create',
   '/v2/task/bing/checker/create',
+  '/v2/task/backlink/checker/create',
 ]);
 const statusPaths = new Set([
   '/v2/task/google/indexer/status',

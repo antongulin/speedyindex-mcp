@@ -17,6 +17,14 @@ import {
   type IndexCheckAuthorization,
 } from './create-index-check';
 import {
+  buildCreateBacklinkCheckRequest,
+  createBacklinkCheckError,
+  createBacklinkCheckToolResult,
+  normalizeCreateBacklinkCheckOutcome,
+  quoteBacklinkCheckRequest,
+  type CreateBacklinkCheckResult,
+} from './create-backlink-check';
+import {
   submissionLimits,
   type PreparedSubmission,
   type SubmissionAuthorization,
@@ -121,6 +129,51 @@ const checkerStrategy: SubmissionStrategy<CreateIndexCheckResult> =
     checked: (value: unknown) =>
       createIndexCheckToolResult(value).structuredContent,
     error: createIndexCheckError,
+  });
+
+const backlinkStrategy: SubmissionStrategy<CreateBacklinkCheckResult> =
+  Object.freeze({
+    build(value: unknown, configuration: SubmissionConfiguration) {
+      const prepared = buildCreateBacklinkCheckRequest(value);
+      const source =
+        configuration.state === 'configured'
+          ? {
+              state: 'loaded' as const,
+              ...(configuration.snapshot.policy.backlinkCheckReservations ===
+              undefined
+                ? {}
+                : {
+                    profile:
+                      configuration.snapshot.policy.backlinkCheckReservations,
+                  }),
+            }
+          : (configuration.backlinkCheckReservationSource ?? {
+              state: 'unconfigured' as const,
+            });
+      const quote = quoteBacklinkCheckRequest(prepared, source);
+      return Object.freeze({
+        ...prepared,
+        quote,
+        ...(quote.availability === 'available'
+          ? { reservation: quote.reservation }
+          : {
+              unavailableError: createBacklinkCheckError(
+                quote.reason === 'reservation_overflow'
+                  ? 'ReservationOverflow'
+                  : quote.reason === 'policy_invalid'
+                    ? 'InvalidPolicy'
+                    : 'ReservationProfileRequired',
+              ),
+            }),
+        normalizeOutcome: (status: number, decoded: unknown) =>
+          normalizeCreateBacklinkCheckOutcome(prepared, status, decoded),
+      });
+    },
+    permitted: (configuration: ConfiguredSubmission) =>
+      configuration.snapshot.policy.allowBacklinkChecks === true,
+    checked: (value: unknown) =>
+      createBacklinkCheckToolResult(value).structuredContent,
+    error: createBacklinkCheckError,
   });
 
 export interface SubmissionHostOptions {
@@ -355,6 +408,13 @@ export class SubmissionHost {
     signal?: AbortSignal,
   ): Promise<CreateIndexCheckResult> {
     return this.execute(checkerStrategy, value, signal);
+  }
+
+  async createBacklinkCheck(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<CreateBacklinkCheckResult> {
+    return this.execute(backlinkStrategy, value, signal);
   }
 
   private async execute<Result>(
