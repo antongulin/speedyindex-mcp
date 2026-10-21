@@ -1,9 +1,20 @@
 import { spawn } from 'node:child_process';
+import { chmodSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { expect } from 'bun:test';
 import { bounded, deferred } from './helpers';
 
 export async function verifyEof(entry: string) {
-  const child = spawn(process.execPath, [entry], { env: {}, stdio: 'pipe' });
+  const fixtureHome = realpathSync(
+    mkdtempSync(join(realpathSync(tmpdir()), 'speedyindex-eof-')),
+  );
+  chmodSync(fixtureHome, 0o700);
+  const child = spawn(
+    process.execPath,
+    ['--no-env-file', '--preload', './tests/fixtures/redirect-fetch.ts', entry],
+    { env: { HOME: fixtureHome }, stdio: 'pipe' },
+  );
   const initialized = deferred<unknown>();
   const exited = new Promise<number | null>((resolve, reject) => {
     child.once('error', reject);
@@ -41,5 +52,6 @@ export async function verifyEof(entry: string) {
     if (child.exitCode === null && child.signalCode === null)
       child.kill('SIGKILL');
     await bounded(exited);
+    rmSync(fixtureHome, { recursive: true, force: true });
   }
 }

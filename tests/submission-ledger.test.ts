@@ -244,7 +244,11 @@ async function startChild(
   cleanupChildren: ChildHandle[],
 ): Promise<ChildHandle> {
   const child = Bun.spawn(
-    [process.execPath, resolve('tests/fixtures/submission-ledger-child.ts')],
+    [
+      process.execPath,
+      '--no-env-file',
+      resolve('tests/fixtures/submission-ledger-child.ts'),
+    ],
     {
       cwd: process.cwd(),
       env: {},

@@ -2,7 +2,7 @@
   "name": "speedyindex-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Unofficial read-only SpeedyIndex MCP server",
+  "description": "Unofficial SpeedyIndex MCP server with read tools and guarded indexing submissions",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -15,8 +15,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "bun test tests/client.test.ts tests/task-status.test.ts tests/task-report.test.ts tests/stdio.test.ts tests/cli.test.ts tests/submission-ledger.test.ts",
-    "test:built": "bun test tests/distribution.test.ts"
+    "test": "bun test --no-env-file tests/client.test.ts tests/task-status.test.ts tests/task-report.test.ts tests/stdio.test.ts tests/cli.test.ts tests/submission-ledger.test.ts tests/create-indexing-task.test.ts tests/submission-policy.test.ts tests/submission-host.test.ts",
+    "test:built": "bun test --no-env-file tests/distribution.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",

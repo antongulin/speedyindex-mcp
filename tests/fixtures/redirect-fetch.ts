@@ -1,5 +1,9 @@
 // Test preload only: the shipped CLI has no endpoint override.
 const originalFetch = globalThis.fetch;
+const createPaths = new Set([
+  '/v2/task/google/indexer/create',
+  '/v2/task/yandex/indexer/create',
+]);
 const statusPaths = new Set([
   '/v2/task/google/indexer/status',
   '/v2/task/google/checker/status',
@@ -34,16 +38,35 @@ globalThis.fetch = ((
     method === 'POST' && reportPaths.has(target.pathname);
   const supportedTarget =
     target.origin === 'https://api.speedyindex.com' &&
-    (supportedGet || supportedStatusPost || supportedReportPost);
+    !target.username &&
+    !target.password &&
+    !target.search &&
+    !target.hash &&
+    (supportedGet ||
+      supportedStatusPost ||
+      supportedReportPost ||
+      (method === 'POST' && createPaths.has(target.pathname)));
   if (!supportedTarget) {
+    console.error('Test network isolation violation.');
     throw new Error('Unexpected production URL');
   }
   if (process.env.TEST_FETCH_MODE === 'throw') {
     throw new Error(`network failure ${process.env.SPEEDYINDEX_API_KEY}`);
   }
   const origin = process.env.TEST_ACCOUNT_ORIGIN;
-  if (!origin?.startsWith('http://127.0.0.1:'))
+  const loopback = origin ? new URL(origin) : undefined;
+  if (
+    !loopback ||
+    loopback.origin !== origin ||
+    loopback.protocol !== 'http:' ||
+    loopback.hostname !== '127.0.0.1' ||
+    loopback.username ||
+    loopback.password ||
+    init?.redirect !== 'error'
+  ) {
+    console.error('Test network isolation violation.');
     throw new Error('Missing loopback fixture');
+  }
   return originalFetch(
     new URL(`${target.pathname}${target.search}`, origin),
     init,

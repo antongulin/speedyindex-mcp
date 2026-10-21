@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { balanceResultSchema, listTasksResultSchema } from '../src/client';
 import { taskStatusResultSchema } from '../src/task-status';
 import { taskReportOutputSchema } from '../src/task-report';
+import { createIndexingTaskResultSchema } from '../src/create-indexing-task';
 import {
   account,
   bounded,
@@ -109,6 +110,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       'list_tasks',
       'get_task_status',
       'get_task_report',
+      'create_indexing_task',
     ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
@@ -633,6 +635,110 @@ test('LT-04: MCP list_tasks errors are sanitized and omit structured output', as
 
 test('F02: direct stdin EOF after initialize exits successfully', async () => {
   await verifyEof('src/cli.ts');
+});
+
+test('C15 SOURCE SDK: fifth tool has explicit strict input, paid annotations, pure preview and validated disabled results', async () => {
+  const api = await fixture((_request, response) => response.end('unexpected'));
+  let session: Awaited<ReturnType<typeof connect>> | undefined;
+  try {
+    session = await connect(api.origin, 'src/cli.ts', '');
+    const { tools } = await session.client.listTools();
+    expect(tools.map((tool) => tool.name)).toEqual([
+      'get_balance',
+      'list_tasks',
+      'get_task_status',
+      'get_task_report',
+      'create_indexing_task',
+    ]);
+    const create = tools[4]!;
+    expect(create.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+    expect(create.inputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['mode', 'searchEngine', 'urls'],
+    });
+    const mode = create.inputSchema.properties?.mode as {
+      enum?: string[];
+      default?: unknown;
+    };
+    expect(mode.enum).toEqual(['preview', 'submit']);
+    expect(mode.default).toBeUndefined();
+    expect(create.outputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+    });
+    const input = {
+      mode: 'preview',
+      searchEngine: 'google',
+      urls: ['https://example.test/sdk-preview'],
+    };
+    const preview = await session.client.callTool({
+      name: 'create_indexing_task',
+      arguments: input,
+    });
+    const parsedPreview = createIndexingTaskResultSchema.parse(
+      preview.structuredContent,
+    );
+    expect(preview.isError).toBe(false);
+    expect(parsedPreview.status).toBe('preview');
+    expect(parsedPreview.authorization).toEqual({
+      state: 'unconfigured',
+      stateChecked: false,
+    });
+    expect(parsedPreview.quote?.maximumExposure).toEqual({
+      tokens: 100,
+      indexer: 0,
+      checker: 0,
+    });
+    expect(preview.content).toEqual([
+      { type: 'text', text: JSON.stringify(parsedPreview) },
+    ]);
+    const blocked = await session.client.callTool({
+      name: 'create_indexing_task',
+      arguments: { ...input, mode: 'submit', requestId: 'disabled-submit' },
+    });
+    // SDK2.3.1 skips output validation on isError; explicitly validate this
+    // application result and compare its identical safe text representation.
+    const parsedBlocked = createIndexingTaskResultSchema.parse(
+      blocked.structuredContent,
+    );
+    expect(blocked.isError).toBe(true);
+    expect(parsedBlocked.error?.code).toBe('WritesDisabled');
+    expect(blocked.content).toEqual([
+      { type: 'text', text: JSON.stringify(parsedBlocked) },
+    ]);
+    for (const invalid of [
+      { searchEngine: 'google', urls: input.urls },
+      { ...input, mode: 'submit' },
+      { ...input, requestId: 'preview-authority' },
+      { ...input, caps: { tokens: 999999, indexer: 999, checker: 999 } },
+      {
+        ...input,
+        stateDirectory: '/synthetic-caller-path',
+        period: 'caller-period',
+      },
+    ]) {
+      const rejected = await session.client.callTool({
+        name: 'create_indexing_task',
+        arguments: invalid,
+      });
+      expect(rejected.isError).toBe(true);
+      expect(rejected.structuredContent).toBeUndefined();
+    }
+    expect(api.requests).toHaveLength(0);
+    expect(session.stderr()).toBe('');
+  } finally {
+    try {
+      await session?.close();
+    } finally {
+      await api.close();
+    }
+  }
 });
 
 test('F02: SDK client close reaps the server process', async () => {

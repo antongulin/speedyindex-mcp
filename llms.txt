@@ -1,6 +1,6 @@
 # SpeedyIndex MCP
 
-> Unofficial Bun/TypeScript stdio MCP server. Read-only get_balance, list_tasks, get_task_status, and get_task_report are implemented; the other 8 tools are roadmap work. No npm release is published.
+> Unofficial Bun/TypeScript stdio MCP server. Five implemented tools: get_balance, list_tasks, get_task_status, get_task_report, and guarded create_indexing_task. Writes default off; pure previews require no key/state, and submissions need explicit private policy and existing V1 state. Seven tools and one-shot retry automation remain roadmap work. No npm release is published.
 
 - [README](https://github.com/antongulin/speedyindex-mcp/blob/main/README.md): Setup and tool contract
 - [Architecture](https://github.com/antongulin/speedyindex-mcp/blob/main/docs/architecture.md): Runtime boundaries
@@ -12,6 +12,6 @@
 
 ## Official provider resources
 
-- [SpeedyIndex](https://speedyindex.com/): Official provider website; this MCP integration is unofficial
+- [SpeedyIndex signup](https://app.speedyindex.com/r/zqgax9): This referral link may support project maintenance; this MCP integration is unofficial
 - [Public API reference](https://en.speedyindex.com/api.php): Official provider API documentation
 - [API key setup](https://app.speedyindex.com/cabinet/api): Official API page; sign in to obtain your key
