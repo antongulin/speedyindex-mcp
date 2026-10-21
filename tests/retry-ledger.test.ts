@@ -22,10 +22,15 @@ import {
   migrateLedgerV2,
   LedgerMigrationError,
   openLedger,
+  openRetryLedgerV2,
+  RetryLedgerError,
   readRetrySnapshot,
   SubmissionLedgerError,
   type PrepareIntentInput,
   type SubmissionLedger,
+  type PrepareRetryIntentInput,
+  type RetryPrepareHooks,
+  type RetrySubmissionLedger,
 } from '../src/submission-ledger';
 import {
   type AvailableRetrySnapshot,
@@ -2788,3 +2793,1189 @@ test('V2-05 post-read identity validation rejects a changed private file mode wi
     });
   });
 });
+
+const parentUrls = [
+  'HTTP://Example.test/Case?q=1#F',
+  'http://example.test/Case?q=1#f/',
+  'https://example.test/é/',
+  'https://example.test/second',
+];
+function retryFixture(
+  f: ReturnType<typeof fixture>,
+  hooks: RetryPrepareHooks = {},
+) {
+  const state = join(f.root, 'state');
+  const ordinary = f.init(state);
+  seedRetryParent(ordinary);
+  const writer = f.track(openRetryLedgerV2({ stateDirectory: state }, hooks));
+  return { state, ordinary, writer, db: f.raw(state) };
+}
+function seedRetryParent(
+  ledger: SubmissionLedger,
+  id = 'parent',
+  providerTaskId = ' Parent-é ',
+  urls: readonly string[] = parentUrls,
+  family: 'google/indexer' | 'yandex/indexer' = 'google/indexer',
+  selected = binding,
+) {
+  seedSnapshotState(
+    ledger,
+    {
+      ...input(id),
+      taskFamily: family,
+      providerRoute: `/v2/task/${family}/create`,
+      budget: {
+        ...input().budget,
+        credentialFingerprint: selected,
+        budgetScope: `parent-${id}`,
+      },
+      submittedUrls: urls,
+    },
+    'accepted',
+    providerTaskId,
+  );
+}
+function retryInput(
+  state: string,
+  requestId = 'retry-one',
+  taskId = ' Parent-é ',
+  family: 'google/indexer' | 'yandex/indexer' = 'google/indexer',
+): PrepareRetryIntentInput {
+  const snap = availableSnapshot(state);
+  const parent = snap.acceptedManifests.find(
+    (row) => row.taskFamily === family && row.providerTaskId === taskId,
+  );
+  if (!parent) throw new Error('Expected synthetic parent manifest.');
+  return {
+    intent: {
+      ...input(requestId),
+      taskFamily: family,
+      providerRoute: `/v2/task/${family}/create`,
+      budget: { ...input().budget, budgetScope: 'retry-scope' },
+      submittedUrls: parent.submittedUrls.slice(0, 2),
+    },
+    parent: { family, taskId },
+    sourceManifestDigest: parent.manifestDigest,
+    planFingerprint: hash('retry-plan'),
+    expectedRevision: snap.revision,
+  };
+}
+function createRetry(
+  writer: RetrySubmissionLedger,
+  value: PrepareRetryIntentInput,
+) {
+  const result = writer.prepareRetryIntent(value);
+  expect(result.kind).toBe('created');
+  if (result.kind !== 'created')
+    throw new Error('Expected synthetic retry creator.');
+  return result;
+}
+function claimRetry(
+  writer: SubmissionLedger,
+  prepared: ReturnType<typeof createRetry>,
+) {
+  const result = writer.claimDispatch(prepared.dispatchCapability, 0);
+  expect(result.kind).toBe('claimed');
+  if (result.kind !== 'claimed')
+    throw new Error('Expected synthetic retry claim.');
+  return result;
+}
+function expectRetryError(
+  operation: () => unknown,
+  code: RetryLedgerError['code'],
+  reason?: RetryLedgerError['reason'],
+) {
+  let caught: unknown;
+  try {
+    operation();
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(RetryLedgerError);
+  const error = caught as RetryLedgerError;
+  expect(error.code).toBe(code);
+  expect(error.message).toBe(new RetryLedgerError(code).message);
+  expect(error.reason).toBe(reason);
+}
+function assertNoRetryWrite(db: Database, operation: () => void) {
+  const before = snapshot(db);
+  const exactBefore = exactCoreRows(db);
+  operation();
+  expect(snapshot(db)).toEqual(before);
+  expect(exactCoreRows(db)).toEqual(exactBefore);
+}
+
+test('V2-07 factory rejects valid V1 as UpgradeRequired without migration, and ordinary legacy replay remains unchanged', () =>
+  snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state, 1);
+    const manual = input('manual');
+    newIntent(ledger, manual);
+    const db = f.raw(state);
+    const before = snapshotWithMissingTables(db);
+    const exact = exactCoreRows(db);
+    expectRetryError(
+      () => openRetryLedgerV2({ stateDirectory: state }),
+      'UpgradeRequired',
+    );
+    expect(snapshotWithMissingTables(db)).toEqual(before);
+    expect(exactCoreRows(db)).toEqual(exact);
+    expect(ledger.prepareIntent(manual).kind).toBe('replay');
+  }));
+
+for (const status of [
+  'prepared',
+  'dispatching',
+  'accepted',
+  'rejected',
+  'unknown',
+  'cancelled',
+] as const) {
+  test(`V2-07 exact retry replay in ${status} survives stale revision and reopen without minting ownership or rows`, () =>
+    snapshotCase((f) => {
+      const { state, writer, db } = retryFixture(f);
+      const value = retryInput(state);
+      const prepared = createRetry(writer, value);
+      const stale = value.expectedRevision;
+      if (status === 'cancelled') {
+        expect(
+          writer.cancelPrepared(binding, value.intent.requestId, 0),
+        ).toEqual({ kind: 'cancelled', stateVersion: 1 });
+        expect(writer.claimDispatch(prepared.dispatchCapability, 0)).toEqual({
+          kind: 'lost',
+        });
+      } else if (status !== 'prepared') {
+        const claim = claimRetry(writer, prepared);
+        expect(
+          writer.cancelPrepared(binding, value.intent.requestId, 0),
+        ).toEqual({ kind: 'lost' });
+        if (status !== 'dispatching') {
+          const outcome = {
+            credentialFingerprint: binding,
+            requestId: value.intent.requestId,
+            expectedStateVersion: 1,
+            outcomeToken: claim.outcomeToken,
+            outcome:
+              status === 'accepted'
+                ? {
+                    kind: status,
+                    providerTaskId: ' Child-é ',
+                    providerType: value.intent.taskFamily,
+                  }
+                : { kind: status },
+          };
+          expect(writer.recordDispatchOutcome(outcome).state).toBe(status);
+          expectLedgerError(
+            () => writer.recordDispatchOutcome(outcome),
+            'DispatchOutcomeClaimLost',
+          );
+        }
+      }
+      const current = availableSnapshot(state);
+      expect(current.revision).not.toBe(stale);
+      const contextBefore = db
+        .query('SELECT * FROM intent_context WHERE request_id=?')
+        .get(value.intent.requestId);
+      for (const revision of [stale, current.revision]) {
+        const replayInput = {
+          ...value,
+          expectedRevision: revision,
+          intent: {
+            ...value.intent,
+            budget: {
+              ...value.intent.budget,
+              periodId: 'later-context',
+              periodStartMs: 9999,
+              caps: { tokens: 0, indexer: 0, checker: 0 },
+            },
+          },
+        };
+        assertNoRetryWrite(db, () => {
+          const replay = writer.prepareRetryIntent(replayInput);
+          expect(replay).toEqual({
+            kind: 'replay',
+            intent: writer.readIntent(binding, value.intent.requestId)!,
+          });
+          expect('dispatchCapability' in replay).toBe(false);
+        });
+      }
+      writer.close();
+      const reopened = f.track(openRetryLedgerV2({ stateDirectory: state }));
+      assertNoRetryWrite(db, () => {
+        expect(reopened.prepareRetryIntent(value).kind).toBe('replay');
+        expectLedgerError(
+          () => reopened.prepareIntent(value.intent),
+          'RequestIdConflict',
+        );
+      });
+      expect(
+        db
+          .query('SELECT * FROM intent_context WHERE request_id=?')
+          .get(value.intent.requestId),
+      ).toEqual(contextBefore);
+      const relation = availableSnapshot(state).retryChildren[0]!;
+      expect(relation.requestId).toBe(value.intent.requestId);
+      expect(relation.state).toBe(status);
+      expect(relation.parentTaskId).toBe(value.parent.taskId);
+      expect(relation.sourceManifestDigest).toBe(value.sourceManifestDigest);
+      expect(relation.providerTaskId).toBe(
+        status === 'accepted' ? ' Child-é ' : null,
+      );
+      if (status === 'accepted') {
+        const ownManifest = availableSnapshot(state).acceptedManifests.find(
+          (row) => row.requestId === value.intent.requestId,
+        )!;
+        expect(ownManifest.originKind).toBe('retry');
+        expect(ownManifest.submittedUrls).toEqual([
+          ...value.intent.submittedUrls,
+        ]);
+      }
+    }));
+}
+
+const retryIdentityChanges: [
+  string,
+  (value: PrepareRetryIntentInput) => void,
+][] = [
+  [
+    'parent family',
+    (v) => {
+      v.parent.family = 'yandex/indexer';
+    },
+  ],
+  [
+    'parent exact ID',
+    (v) => {
+      v.parent.taskId = ' Parent-É ';
+    },
+  ],
+  [
+    'source digest',
+    (v) => {
+      v.sourceManifestDigest = hash('other-source');
+    },
+  ],
+  [
+    'plan',
+    (v) => {
+      v.planFingerprint = hash('other-plan');
+    },
+  ],
+  [
+    'scope',
+    (v) => {
+      v.intent.budget.budgetScope = 'other-scope';
+    },
+  ],
+  [
+    'policy revision',
+    (v) => {
+      v.intent.budget.policyRevision = 'other-revision';
+    },
+  ],
+  [
+    'policy digest',
+    (v) => {
+      v.intent.budget.policyDigest = hash('other-policy');
+    },
+  ],
+  [
+    'family and route',
+    (v) => {
+      v.intent.taskFamily = 'yandex/indexer';
+      v.intent.providerRoute = '/v2/task/yandex/indexer/create';
+      v.parent.family = 'yandex/indexer';
+    },
+  ],
+  [
+    'payload',
+    (v) => {
+      v.intent.payloadDigest = hash('other-payload');
+    },
+  ],
+  [
+    'quote version',
+    (v) => {
+      v.intent.quoteVersion = 'other-quote';
+    },
+  ],
+  [
+    'quote digest',
+    (v) => {
+      v.intent.quoteFingerprint = hash('other-quote');
+    },
+  ],
+  [
+    'tokens',
+    (v) => {
+      v.intent.reservation = {
+        ...v.intent.reservation,
+        tokens: v.intent.reservation.tokens + 1,
+      };
+    },
+  ],
+  [
+    'indexer',
+    (v) => {
+      v.intent.reservation = {
+        ...v.intent.reservation,
+        indexer: v.intent.reservation.indexer + 1,
+      };
+    },
+  ],
+  [
+    'checker',
+    (v) => {
+      v.intent.reservation = {
+        ...v.intent.reservation,
+        checker: v.intent.reservation.checker + 1,
+      };
+    },
+  ],
+  [
+    'URL order',
+    (v) => {
+      v.intent.submittedUrls = [...v.intent.submittedUrls].reverse();
+    },
+  ],
+  [
+    'URL exact case',
+    (v) => {
+      v.intent.submittedUrls = [
+        v.intent.submittedUrls[0]!.replace('Example', 'example'),
+        v.intent.submittedUrls[1]!,
+      ];
+    },
+  ],
+  [
+    'URL membership',
+    (v) => {
+      v.intent.submittedUrls = [v.intent.submittedUrls[0]!];
+    },
+  ],
+];
+for (const [name, change] of retryIdentityChanges) {
+  test(`V2-07 stored retry ${name} mutation is RequestIdConflict before revision or admission`, () =>
+    snapshotCase((f) => {
+      const { state, writer, db } = retryFixture(f);
+      const value = retryInput(state);
+      createRetry(writer, value);
+      const changed = structuredClone(value);
+      change(changed);
+      assertNoRetryWrite(db, () =>
+        expectLedgerError(
+          () => writer.prepareRetryIntent(changed),
+          'RequestIdConflict',
+        ),
+      );
+    }));
+}
+
+for (const origin of ['standalone', 'legacy_unattributed'] as const) {
+  test(`V2-07 ${origin} request cannot acquire lineage; exact ordinary replay leaves attribution intact`, () =>
+    snapshotCase((f) => {
+      const state = join(f.root, 'state');
+      const ordinary = f.init(state, origin === 'standalone' ? 2 : 1);
+      seedRetryParent(ordinary);
+      const manual = {
+        ...input('manual'),
+        budget: { ...input().budget, budgetScope: 'manual' },
+        submittedUrls: parentUrls.slice(0, 2),
+      };
+      newIntent(ordinary, manual);
+      ordinary.close();
+      if (origin === 'legacy_unattributed')
+        migrateLedgerV2({
+          stateDirectory: state,
+          backupDirectory: join(f.root, 'backup'),
+        });
+      const writer = f.track(openRetryLedgerV2({ stateDirectory: state }));
+      const db = f.raw(state);
+      const retry = { ...retryInput(state, 'manual'), intent: manual };
+      assertNoRetryWrite(db, () => {
+        expectLedgerError(
+          () => writer.prepareRetryIntent(retry),
+          'RequestIdConflict',
+        );
+        expect(writer.prepareIntent(manual).kind).toBe('replay');
+      });
+      expect(
+        (
+          db
+            .query('SELECT origin_kind FROM intent_context WHERE request_id=?')
+            .get('manual') as { origin_kind: string }
+        ).origin_kind,
+      ).toBe(origin);
+    }));
+}
+
+for (const fault of [
+  'checker child',
+  'checker parent',
+  'bad route',
+  'extra approval',
+  'extra parent field',
+  'bad revision',
+  'bad plan',
+  'bad manifest',
+  'unsafe parent',
+  'blank parent',
+  'oversized parent',
+  'invalid unit',
+] as const) {
+  test(`V2-07 strict trusted DTO rejects ${fault} before writes`, () =>
+    snapshotCase((f) => {
+      const { state, writer, db } = retryFixture(f);
+      const value = retryInput(state);
+      let invalid: unknown = value;
+      switch (fault) {
+        case 'checker child':
+          value.intent.taskFamily = 'google/checker';
+          value.intent.providerRoute = '/v2/task/google/checker/create';
+          break;
+        case 'checker parent':
+          invalid = {
+            ...value,
+            parent: { ...value.parent, family: 'google/checker' },
+          };
+          break;
+        case 'bad route':
+          value.intent.providerRoute = '/v2/task/yandex/indexer/create';
+          break;
+        case 'extra approval':
+          invalid = { ...value, approved: true };
+          break;
+        case 'extra parent field':
+          invalid = { ...value, parent: { ...value.parent, approved: true } };
+          break;
+        case 'bad revision':
+          value.expectedRevision = 'not-a-digest';
+          break;
+        case 'bad plan':
+          value.planFingerprint = 'A'.repeat(64);
+          break;
+        case 'bad manifest':
+          value.sourceManifestDigest = 'missing';
+          break;
+        case 'unsafe parent':
+          value.parent.taskId = 'unsafe\nID';
+          break;
+        case 'blank parent':
+          value.parent.taskId = '\u2003';
+          break;
+        case 'oversized parent':
+          value.parent.taskId = 'é'.repeat(2049);
+          break;
+        case 'invalid unit':
+          value.intent.reservation = {
+            ...value.intent.reservation,
+            checker: -1,
+          };
+          break;
+      }
+      assertNoRetryWrite(db, () =>
+        expectLedgerError(
+          () => writer.prepareRetryIntent(invalid as PrepareRetryIntentInput),
+          'InvalidLedgerInput',
+        ),
+      );
+    }));
+}
+
+for (const fault of [
+  'missing',
+  'cross-engine',
+  'digest',
+  'exact subset',
+  'other binding',
+  'unaccepted',
+  'ambiguous',
+  'accepted own retry child',
+] as const) {
+  test(`V2-07 fresh current revision reaches local-parent ${fault} barrier`, () =>
+    snapshotCase((f) => {
+      const { state, ordinary, writer, db } = retryFixture(f);
+      let value = retryInput(state);
+      switch (fault) {
+        case 'missing':
+          value.parent.taskId = ' External-only ';
+          break;
+        case 'cross-engine':
+          value.parent.family = 'yandex/indexer';
+          break;
+        case 'digest':
+          value.sourceManifestDigest = hash('supplied-external-digest');
+          break;
+        case 'exact subset':
+          value.intent.submittedUrls = [
+            parentUrls[0]!.replace('Example', 'example'),
+          ];
+          break;
+        case 'other binding':
+          seedRetryParent(
+            ordinary,
+            'foreign',
+            ' Foreign ',
+            ['https://example.test/foreign'],
+            'google/indexer',
+            'b'.repeat(64),
+          );
+          value.parent.taskId = ' Foreign ';
+          break;
+        case 'unaccepted':
+          newIntent(ordinary, {
+            ...input('not-acked'),
+            submittedUrls: ['https://example.test/not-acked'],
+          });
+          value.parent.taskId = 'not-acked';
+          break;
+        case 'ambiguous': {
+          // Existing V1 duplicates remain legal after migration; a raw valid fixture
+          // produces the same ambiguity without weakening the new V2 ACK guard.
+          seedRetryParent(
+            ordinary,
+            'duplicate',
+            ' Unique-before-legacy-rewrite ',
+            ['https://example.test/duplicate'],
+          );
+          db.run(
+            "UPDATE intents SET provider_task_id=' Parent-é ' WHERE request_id='duplicate'; UPDATE intent_events SET provider_task_id=' Parent-é ' WHERE request_id='duplicate' AND state_version=2",
+          );
+          break;
+        }
+        case 'accepted own retry child': {
+          const child = createRetry(writer, value);
+          const claim = claimRetry(writer, child);
+          writer.recordDispatchOutcome({
+            credentialFingerprint: binding,
+            requestId: value.intent.requestId,
+            expectedStateVersion: 1,
+            outcomeToken: claim.outcomeToken,
+            outcome: {
+              kind: 'accepted',
+              providerTaskId: ' Own-child ',
+              providerType: 'google/indexer',
+            },
+          });
+          value = retryInput(state, 'grandchild', ' Own-child ');
+          break;
+        }
+      }
+      value.expectedRevision = availableSnapshot(state).revision;
+      assertNoRetryWrite(db, () =>
+        expectRetryError(
+          () => writer.prepareRetryIntent(value),
+          'RetryLineageConflict',
+        ),
+      );
+    }));
+}
+
+test('V2-08 deterministic admission separates stale revision, fresh cross-scope/family URL overlap and period gates', () =>
+  snapshotCase((f) => {
+    const { state, ordinary, writer, db } = retryFixture(f);
+    const stale = retryInput(state);
+    newIntent(ordinary, {
+      ...input('other-family-hold'),
+      budget: {
+        ...input().budget,
+        budgetScope: 'elsewhere',
+        periodId: 'other',
+        periodStartMs: 2000,
+      },
+      taskFamily: 'backlink/checker',
+      providerRoute: '/v2/task/backlink/checker/create',
+      submittedUrls: [parentUrls[0]!],
+    });
+    assertNoRetryWrite(db, () =>
+      expectRetryError(
+        () => writer.prepareRetryIntent(stale),
+        'SnapshotConflict',
+      ),
+    );
+    const fresh = {
+      ...stale,
+      expectedRevision: availableSnapshot(state).revision,
+    };
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(() => writer.prepareRetryIntent(fresh), 'UrlOverlap'),
+    );
+    expect(ordinary.cancelPrepared(binding, 'other-family-hold', 0).kind).toBe(
+      'cancelled',
+    );
+    newIntent(ordinary, {
+      ...input('period-control'),
+      budget: { ...input().budget, budgetScope: 'retry-scope' },
+      submittedUrls: ['https://example.test/period-control'],
+    });
+    const badPeriod = retryInput(state, 'bad-period');
+    badPeriod.intent.budget.periodId = 'old';
+    badPeriod.intent.budget.periodStartMs = 0;
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(
+        () => writer.prepareRetryIntent(badPeriod),
+        'StalePeriodContext',
+      ),
+    );
+  }));
+
+for (const unit of ['tokens', 'indexer', 'checker'] as const) {
+  test(`V2-08 fresh revision reaches independent ${unit} cap without partial reservations`, () =>
+    snapshotCase((f) => {
+      const { state, ordinary, writer, db } = retryFixture(f);
+      const held = {
+        ...input('cap-hold'),
+        budget: { ...input().budget, budgetScope: 'retry-scope' },
+        submittedUrls: ['https://example.test/cap-hold'],
+      };
+      newIntent(ordinary, held);
+      const value = retryInput(state);
+      value.intent.budget.caps = {
+        ...value.intent.budget.caps,
+        [unit]: held.reservation[unit] + value.intent.reservation[unit] - 1,
+      };
+      assertNoRetryWrite(db, () => {
+        let caught: unknown;
+        try {
+          writer.prepareRetryIntent(value);
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toBeInstanceOf(SubmissionLedgerError);
+        expect((caught as SubmissionLedgerError).code).toBe('BudgetExceeded');
+        expect((caught as SubmissionLedgerError).unit).toBe(unit);
+        expect((caught as SubmissionLedgerError).message).toBe(
+          new SubmissionLedgerError('BudgetExceeded', unit).message,
+        );
+      });
+    }));
+}
+
+test('V2-08 injected synchronous before-context exception rolls back actual core, URLs, event, period and reservation', () =>
+  snapshotCase((f) => {
+    const phases: string[] = [];
+    const { state, writer, db } = retryFixture(f, {
+      onPhase(phase) {
+        phases.push(phase);
+        throw new Error('owned private fault detail');
+      },
+    });
+    const value = retryInput(state);
+    value.intent.budget.budgetScope = 'new-rollback-scope';
+    value.intent.budget.periodId = 'new-rollback-period';
+    value.intent.budget.periodStartMs = 3000;
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(
+        () => writer.prepareRetryIntent(value),
+        'LedgerUnavailable',
+      ),
+    );
+    expect(phases).toEqual(['before_context']);
+    expect(
+      db
+        .query('SELECT 1 FROM intents WHERE request_id=?')
+        .get(value.intent.requestId),
+    ).toBeNull();
+    expect(
+      db
+        .query('SELECT 1 FROM intent_context WHERE request_id=?')
+        .get(value.intent.requestId),
+    ).toBeNull();
+    expect(
+      db
+        .query('SELECT 1 FROM budget_periods WHERE budget_scope=?')
+        .get('new-rollback-scope'),
+    ).toBeNull();
+    expect(availableSnapshot(state).acceptedManifests.length).toBe(1);
+    expect(availableSnapshot(state).retryChildren).toEqual([]);
+  }));
+
+for (const status of ['dispatching', 'unknown'] as const) {
+  test(`V2-09 fresh valid different parent reaches ${status} no-ID retry barrier while exact replay and ordinary creates survive`, () =>
+    snapshotCase((f) => {
+      const { state, ordinary, writer, db } = retryFixture(f);
+      seedRetryParent(ordinary, 'other-parent', ' Other-parent ', [
+        'https://example.test/other/1',
+        'https://example.test/other/2',
+      ]);
+      const value = retryInput(state);
+      const child = createRetry(writer, value);
+      const claim = claimRetry(writer, child);
+      if (status === 'unknown')
+        writer.recordDispatchOutcome({
+          credentialFingerprint: binding,
+          requestId: value.intent.requestId,
+          expectedStateVersion: 1,
+          outcomeToken: claim.outcomeToken,
+          outcome: { kind: 'unknown' },
+        });
+      const fresh = retryInput(state, 'different-parent', ' Other-parent ');
+      assertNoRetryWrite(db, () =>
+        expectRetryError(
+          () => writer.prepareRetryIntent(fresh),
+          'UnknownRetryDispatch',
+        ),
+      );
+      assertNoRetryWrite(db, () =>
+        expect(writer.prepareRetryIntent(value).kind).toBe('replay'),
+      );
+      const snap = availableSnapshot(state);
+      expect(snap.retryChildren[0]!.state).toBe(status);
+      expect(snap.retryChildren[0]!.providerTaskId).toBeNull();
+      expect(
+        snap.unresolvedHistory.find(
+          (row) => row.requestId === value.intent.requestId,
+        )!.reservation,
+      ).toEqual({ tokens: '3', indexer: '2', checker: '1' });
+      newIntent(ordinary, {
+        ...input('ordinary-still-allowed'),
+        submittedUrls: ['https://example.test/ordinary-unique'],
+      });
+      expectLedgerError(
+        () =>
+          ordinary.prepareIntent({
+            ...input('ordinary-overlap'),
+            budget: { ...input().budget, budgetScope: 'elsewhere' },
+            submittedUrls: [value.intent.submittedUrls[0]!],
+          }),
+        'UrlOverlap',
+      );
+    }));
+}
+
+for (const status of ['prepared', 'rejected', 'cancelled'] as const) {
+  test(`V2-09 ${status} retry context is retained without inventing a dispatched-unknown barrier`, () =>
+    snapshotCase((f) => {
+      const { state, writer } = retryFixture(f);
+      const value = retryInput(state);
+      value.intent.submittedUrls = parentUrls.slice(0, 1);
+      const child = createRetry(writer, value);
+      if (status === 'cancelled')
+        writer.cancelPrepared(binding, value.intent.requestId, 0);
+      if (status === 'rejected') {
+        const claim = claimRetry(writer, child);
+        writer.recordDispatchOutcome({
+          credentialFingerprint: binding,
+          requestId: value.intent.requestId,
+          expectedStateVersion: 1,
+          outcomeToken: claim.outcomeToken,
+          outcome: { kind: 'rejected' },
+        });
+      }
+      const next = retryInput(state, 'next');
+      next.intent.submittedUrls =
+        status === 'prepared'
+          ? parentUrls.slice(2, 3)
+          : value.intent.submittedUrls;
+      createRetry(writer, next);
+      const snap = availableSnapshot(state);
+      expect(snap.retryChildren.length).toBe(2);
+      expect(
+        snap.retryChildren.find(
+          (row) => row.requestId === value.intent.requestId,
+        )!.state,
+      ).toBe(status);
+      expect(
+        snap.holds.some((row) => row.requestId === value.intent.requestId),
+      ).toBe(status === 'prepared');
+    }));
+}
+
+test('V2-09 owner-token, family and duplicate ACK guards leave retry dispatch/context/events/three-unit holds intact until one legitimate result', () =>
+  snapshotCase((f) => {
+    const { state, ordinary, writer, db } = retryFixture(f);
+    seedRetryParent(ordinary, 'another-ack', ' Another-ACK ', [
+      'https://example.test/another-ack',
+    ]);
+    const value = retryInput(state);
+    const child = createRetry(writer, value);
+    const secondValue = retryInput(state, 'second-owner');
+    secondValue.intent.submittedUrls = parentUrls.slice(2, 3);
+    const second = createRetry(writer, secondValue);
+    const claim = claimRetry(writer, child);
+    const otherClaim = claimRetry(writer, second);
+    const outcome = {
+      credentialFingerprint: binding,
+      requestId: value.intent.requestId,
+      expectedStateVersion: 1,
+      outcomeToken: claim.outcomeToken,
+      outcome: {
+        kind: 'accepted' as const,
+        providerType: value.intent.taskFamily,
+        providerTaskId: ' Another-ACK ',
+      },
+    };
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(
+        () =>
+          writer.recordDispatchOutcome({
+            ...outcome,
+            outcomeToken: otherClaim.outcomeToken,
+          }),
+        'DispatchOutcomeClaimLost',
+      ),
+    );
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(
+        () =>
+          writer.recordDispatchOutcome({
+            ...outcome,
+            outcome: { ...outcome.outcome, providerType: 'yandex/indexer' },
+          }),
+        'ProviderTypeMismatch',
+      ),
+    );
+    assertNoRetryWrite(db, () =>
+      expectRetryError(
+        () => writer.recordDispatchOutcome(outcome),
+        'RetryLineageConflict',
+      ),
+    );
+    const unresolved = availableSnapshot(state);
+    const history = unresolved.unresolvedHistory.find(
+      (row) => row.requestId === value.intent.requestId,
+    )!;
+    expect(history.state).toBe('dispatching');
+    expect(history.reservation).toEqual({
+      tokens: '3',
+      indexer: '2',
+      checker: '1',
+    });
+    expect(history.events.map((row) => row.kind)).toEqual([
+      'prepared',
+      'dispatching',
+    ]);
+    expect(history.urls.map((row) => row.url)).toEqual([
+      ...value.intent.submittedUrls,
+    ]);
+    expect(
+      unresolved.retryChildren.find(
+        (row) => row.requestId === value.intent.requestId,
+      )!.providerTaskId,
+    ).toBeNull();
+    const accepted = {
+      ...outcome,
+      outcome: { ...outcome.outcome, providerTaskId: ' Child-é-accepted ' },
+    };
+    expect(writer.recordDispatchOutcome(accepted).state).toBe('accepted');
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(
+        () => writer.recordDispatchOutcome(accepted),
+        'DispatchOutcomeClaimLost',
+      ),
+    );
+    const joined = availableSnapshot(state);
+    const relation = joined.retryChildren.find(
+      (row) => row.requestId === value.intent.requestId,
+    )!;
+    expect(relation.state).toBe('accepted');
+    expect(relation.providerTaskId).toBe(' Child-é-accepted ');
+    expect(relation.parentTaskId).toBe(' Parent-é ');
+    expect(
+      joined.acceptedManifests.find(
+        (row) => row.providerTaskId === ' Child-é-accepted ',
+      )!.originKind,
+    ).toBe('retry');
+  }));
+
+test('V2-09 self-parent ACK is rejected even without any other accepted local provider row; exact opaque identity is preserved', () =>
+  snapshotCase((f) => {
+    const { state, ordinary, writer, db } = retryFixture(f);
+    const value = {
+      ...input('external-looking-context'),
+      submittedUrls: ['https://example.test/external-looking'],
+    };
+    const prepared = newIntent(ordinary, value);
+    // Controlled complete valid context, not an external-admission API. No local
+    // accepted parent row exists, so this isolates self-parent from duplicate guard.
+    db.query(
+      `UPDATE intent_context SET origin_kind='retry',parent_family='google/indexer',parent_task_id=?,source_manifest_digest=?,plan_fingerprint=? WHERE request_id=?`,
+    ).run(
+      ' External-é ',
+      hash('external-manifest'),
+      hash('external-plan'),
+      value.requestId,
+    );
+    expect(
+      db
+        .query(
+          "SELECT 1 FROM intents WHERE state='accepted' AND provider_task_id=' External-é '",
+        )
+        .get(),
+    ).toBeNull();
+    const claim = claimRetry(writer, prepared);
+    const outcome = {
+      credentialFingerprint: binding,
+      requestId: value.requestId,
+      expectedStateVersion: 1,
+      outcomeToken: claim.outcomeToken,
+      outcome: {
+        kind: 'accepted' as const,
+        providerType: value.taskFamily,
+        providerTaskId: ' External-é ',
+      },
+    };
+    assertNoRetryWrite(db, () =>
+      expectRetryError(
+        () => writer.recordDispatchOutcome(outcome),
+        'RetryLineageConflict',
+      ),
+    );
+    const snap = availableSnapshot(state);
+    expect(snap.retryChildren[0]!.state).toBe('dispatching');
+    expect(snap.retryChildren[0]!.parentTaskId).toBe(' External-é ');
+    expect(
+      snap.holds.find((row) => row.requestId === value.requestId)!.urls[0]!.url,
+    ).toBe(value.submittedUrls[0]!);
+    // Distinct surrounding whitespace remains distinct; no ID trimming/casefolding.
+    expect(
+      writer.recordDispatchOutcome({
+        ...outcome,
+        outcome: { ...outcome.outcome, providerTaskId: 'External-é' },
+      }).state,
+    ).toBe('accepted');
+    expect(availableSnapshot(state).retryChildren[0]!.providerTaskId).toBe(
+      'External-é',
+    );
+  }));
+
+for (const version of [1, 2] as const) {
+  test(`V2-09 ordinary V${version} duplicate ACK behavior preserves V1 compatibility and V2 held-state guard`, () =>
+    snapshotCase((f) => {
+      const state = join(f.root, 'state');
+      const ledger = f.init(state, version);
+      seedRetryParent(ledger);
+      const value = {
+        ...input('ordinary-duplicate'),
+        submittedUrls: ['https://example.test/ordinary-duplicate'],
+      };
+      const prepared = newIntent(ledger, value);
+      const claim = claimRetry(ledger, prepared);
+      const db = f.raw(state);
+      const outcome = {
+        credentialFingerprint: binding,
+        requestId: value.requestId,
+        expectedStateVersion: 1,
+        outcomeToken: claim.outcomeToken,
+        outcome: {
+          kind: 'accepted' as const,
+          providerType: value.taskFamily,
+          providerTaskId: ' Parent-é ',
+        },
+      };
+      if (version === 1) {
+        expect(ledger.recordDispatchOutcome(outcome).state).toBe('accepted');
+        expect(
+          (
+            db
+              .query(
+                "SELECT COUNT(*) AS n FROM intents WHERE state='accepted' AND provider_task_id=' Parent-é '",
+              )
+              .get() as { n: number }
+          ).n,
+        ).toBe(2);
+      } else {
+        assertNoRetryWrite(db, () =>
+          expectRetryError(
+            () => ledger.recordDispatchOutcome(outcome),
+            'RetryLineageConflict',
+          ),
+        );
+        expect(ledger.readIntent(binding, value.requestId)!.state).toBe(
+          'dispatching',
+        );
+        expect(
+          availableSnapshot(state).holds.find(
+            (row) => row.requestId === value.requestId,
+          )!.urls[0]!.url,
+        ).toBe(value.submittedUrls[0]!);
+        expectLedgerError(
+          () =>
+            ledger.prepareIntent({
+              ...input('overlap-after-conflict'),
+              budget: { ...input().budget, budgetScope: 'other' },
+              submittedUrls: value.submittedUrls,
+            }),
+          'UrlOverlap',
+        );
+        expect(
+          ledger.recordDispatchOutcome({
+            ...outcome,
+            outcome: { ...outcome.outcome, providerTaskId: ' Parent-É ' },
+          }).state,
+        ).toBe('accepted');
+      }
+    }));
+}
+
+test('V2-09 V2 ACK association is scoped to exact binding and family, with no global provider-ID uniqueness', () =>
+  snapshotCase((f) => {
+    const { state, ordinary } = retryFixture(f);
+    seedRetryParent(
+      ordinary,
+      'same-id-other-family',
+      ' Parent-é ',
+      ['https://example.test/other-family'],
+      'yandex/indexer',
+    );
+    seedRetryParent(
+      ordinary,
+      'same-id-other-binding',
+      ' Parent-é ',
+      ['https://example.test/other-binding'],
+      'google/indexer',
+      'b'.repeat(64),
+    );
+    const snap = availableSnapshot(state);
+    expect(
+      snap.acceptedManifests.filter(
+        (row) => row.providerTaskId === ' Parent-é ',
+      ).length,
+    ).toBe(2);
+    expect(snap.ambiguousProviderRefs).toEqual([]);
+    expect(
+      availableSnapshot(state, {}, 'b'.repeat(64)).acceptedManifests[0]!
+        .providerTaskId,
+    ).toBe(' Parent-é ');
+  }));
+
+test('V2-09 an ordinary unknown remains visible but does not become the retry-only unknown dispatch barrier', () =>
+  snapshotCase((f) => {
+    const { state, ordinary, writer } = retryFixture(f);
+    seedSnapshotState(
+      ordinary,
+      {
+        ...input('ordinary-unknown'),
+        submittedUrls: ['https://example.test/ordinary-unknown'],
+      },
+      'unknown',
+    );
+    createRetry(writer, retryInput(state));
+    const snap = availableSnapshot(state);
+    expect(
+      snap.unresolvedHistory.find(
+        (row) => row.requestId === 'ordinary-unknown',
+      )!.context.originKind,
+    ).toBe('standalone');
+    expect(snap.retryChildren.length).toBe(1);
+  }));
+
+test('V2-07 exact replay bypasses snapshot resource limits while new retry fails SnapshotLimitExceeded with no new rows', () =>
+  snapshotCase((f) => {
+    const { state, ordinary, writer, db } = retryFixture(f);
+    const value = retryInput(state);
+    createRetry(writer, value);
+    const large = {
+      ...input('large-legacy-value'),
+      submittedUrls: ['https://example.test/large-legacy-value'],
+    };
+    newIntent(ordinary, large);
+    ordinary.cancelPrepared(binding, large.requestId, 0);
+    db.query('UPDATE intents SET quote_version=? WHERE request_id=?').run(
+      'x'.repeat(16 * 1024 * 1024 + 1),
+      large.requestId,
+    );
+    expect(readRetrySnapshot({ stateDirectory: state }, binding)).toEqual({
+      availability: 'unavailable',
+      reason: 'LimitExceeded',
+    });
+    const replay = writer.prepareRetryIntent({
+      ...value,
+      expectedRevision: hash('valid-stale-revision'),
+    });
+    expect(replay.kind).toBe('replay');
+    expect('dispatchCapability' in replay).toBe(false);
+    const before = db.query('SELECT COUNT(*) AS n FROM intents').get();
+    const seq = db.query('SELECT * FROM sqlite_sequence').all();
+    const freshId = {
+      ...value,
+      intent: {
+        ...value.intent,
+        requestId: 'resource-blocked',
+        submittedUrls: parentUrls.slice(2, 3),
+      },
+    };
+    expectRetryError(
+      () => writer.prepareRetryIntent(freshId),
+      'SnapshotLimitExceeded',
+      'LimitExceeded',
+    );
+    expect(db.query('SELECT COUNT(*) AS n FROM intents').get()).toEqual(before);
+    expect(db.query('SELECT * FROM sqlite_sequence').all()).toEqual(seq);
+    expect(
+      db
+        .query(
+          "SELECT 1 FROM intent_context WHERE request_id='resource-blocked'",
+        )
+        .get(),
+    ).toBeNull();
+    expect(
+      (
+        db
+          .query(
+            'SELECT length(quote_version) AS n FROM intents WHERE request_id=?',
+          )
+          .get(large.requestId) as { n: number }
+      ).n,
+    ).toBe(16 * 1024 * 1024 + 1);
+    writer.close();
+    const reopened = f.track(openRetryLedgerV2({ stateDirectory: state }));
+    const replayAfterReopen = reopened.prepareRetryIntent(value);
+    expect(replayAfterReopen.kind).toBe('replay');
+    expect('dispatchCapability' in replayAfterReopen).toBe(false);
+  }));
+
+test('V2-08 selected malformed scalar maps to fixed SnapshotUnavailable; replay still rejects corrupted context', () =>
+  snapshotCase((f) => {
+    const { state, ordinary, writer, db } = retryFixture(f);
+    const value = retryInput(state);
+    createRetry(writer, value);
+    newIntent(ordinary, {
+      ...input('malformed-scalar'),
+      submittedUrls: ['https://example.test/malformed'],
+    });
+    db.run(
+      "UPDATE intents SET quote_version=X'' WHERE request_id='malformed-scalar'",
+    );
+    const freshId = {
+      ...value,
+      intent: {
+        ...value.intent,
+        requestId: 'malformed-blocked',
+        submittedUrls: parentUrls.slice(2, 3),
+      },
+    };
+    assertNoRetryWrite(db, () =>
+      expectRetryError(
+        () => writer.prepareRetryIntent(freshId),
+        'SnapshotUnavailable',
+        'InvalidState',
+      ),
+    );
+    db.run(
+      "UPDATE intents SET quote_version='restored' WHERE request_id='malformed-scalar'",
+    );
+    db.query('DELETE FROM intent_context WHERE request_id=?').run(
+      value.intent.requestId,
+    );
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(
+        () => writer.prepareRetryIntent(value),
+        'LedgerUnavailable',
+      ),
+    );
+  }));
+
+test('V2-08 asynchronous trusted phase result is rejected and rolled back without crossing await', () =>
+  snapshotCase((f) => {
+    const { state, writer, db } = retryFixture(f, {
+      onPhase: () => Promise.resolve(),
+    });
+    const value = retryInput(state);
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(
+        () => writer.prepareRetryIntent(value),
+        'LedgerUnavailable',
+      ),
+    );
+  }));
