@@ -19,6 +19,8 @@ import { expect, test } from 'bun:test';
 import {
   initializeLedger,
   initializeLedgerV2,
+  migrateLedgerV2,
+  LedgerMigrationError,
   openLedger,
   SubmissionLedgerError,
   type PrepareIntentInput,
@@ -827,3 +829,689 @@ test('V2-01 open: V1 labelled V2 is incomplete, not an implicit migration', () =
     f.cleanup();
   }
 });
+
+function exactCoreRows(database: Database) {
+  const result: Record<string, unknown[]> = {};
+  // Independent full-column oracle; no production projection/hash helper reused.
+  for (const table of [
+    'budget_periods',
+    'intents',
+    'intent_urls',
+    'intent_events',
+    'sqlite_sequence',
+  ]) {
+    const columns = database.query(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+      type: string;
+    }[];
+    const select = columns.map(({ name, type }) =>
+      type === 'INTEGER' || (table === 'sqlite_sequence' && name === 'seq')
+        ? `CAST("${name}" AS TEXT) AS "${name}"`
+        : `"${name}"`,
+    );
+    result[table] = database
+      .query(
+        `SELECT CAST(rowid AS TEXT) AS _rowid, ${select.join(', ')} FROM ${table} ORDER BY rowid`,
+      )
+      .all();
+  }
+  return result;
+}
+function expectMigrationError(
+  operation: () => unknown,
+  code: LedgerMigrationError['code'],
+) {
+  let caught: unknown;
+  try {
+    operation();
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(LedgerMigrationError);
+  expect((caught as LedgerMigrationError).code).toBe(code);
+  expect((caught as LedgerMigrationError).message).toBe(
+    new LedgerMigrationError(code).message,
+  );
+}
+function expectV1Unchanged(
+  database: Database,
+  before: ReturnType<typeof exactCoreRows>,
+) {
+  expect(database.query('PRAGMA user_version').get()).toEqual({
+    user_version: 1,
+  });
+  expect(
+    database
+      .query(
+        "SELECT name FROM sqlite_schema WHERE name IN ('intent_context', 'retry_ledger_meta')",
+      )
+      .all(),
+  ).toEqual([]);
+  expect(exactCoreRows(database)).toEqual(before);
+}
+
+test('V2-02 migration: exact all-family/state/column/sequence preservation and retained ownership', () => {
+  const f = fixture();
+  try {
+    const state = join(f.root, 'v1');
+    const backup = join(f.root, 'backup');
+    const ledger = f.init(state, 1);
+    const retainedPrepared: ReturnType<typeof newIntent>[] = [];
+    const retainedDispatch: {
+      value: PrepareIntentInput;
+      token: Extract<
+        ReturnType<SubmissionLedger['claimDispatch']>,
+        { kind: 'claimed' }
+      >['outcomeToken'];
+    }[] = [];
+    const originals: PrepareIntentInput[] = [];
+    const families = [
+      'google/indexer',
+      'google/checker',
+      'yandex/indexer',
+      'yandex/checker',
+      'bing/checker',
+      'backlink/checker',
+    ] as const;
+    const states = [
+      'prepared',
+      'dispatching',
+      'accepted',
+      'rejected',
+      'unknown',
+      'cancelled',
+    ] as const;
+    for (const [fi, family] of families.entries()) {
+      for (const [si, kind] of states.entries()) {
+        const value: PrepareIntentInput = {
+          ...input(`preserve-${fi}-${kind}`),
+          taskFamily: family,
+          providerRoute: `/v2/task/${family}/create`,
+          budget: {
+            ...input().budget,
+            credentialFingerprint: (fi % 2 ? 'b' : 'a').repeat(64),
+            budgetScope: `scope-${si % 2}`,
+            caps: { tokens: 100000, indexer: 100000, checker: 100000 },
+          },
+          submittedUrls: [`https://example.test/${fi}/${kind}?Case=1#Exact`],
+        };
+        originals.push(value);
+        const prepared = newIntent(ledger, value);
+        if (kind === 'prepared') {
+          retainedPrepared.push(prepared);
+          continue;
+        }
+        if (kind === 'cancelled') {
+          ledger.cancelPrepared(
+            value.budget.credentialFingerprint,
+            value.requestId,
+            0,
+          );
+          continue;
+        }
+        const claim = ledger.claimDispatch(prepared.dispatchCapability, 0);
+        if (claim.kind !== 'claimed')
+          throw new Error('Expected synthetic retained claim.');
+        if (kind === 'dispatching') {
+          retainedDispatch.push({ value, token: claim.outcomeToken });
+          continue;
+        }
+        ledger.recordDispatchOutcome({
+          credentialFingerprint: value.budget.credentialFingerprint,
+          requestId: value.requestId,
+          expectedStateVersion: 1,
+          outcomeToken: claim.outcomeToken,
+          outcome:
+            kind === 'accepted'
+              ? { kind, providerType: family, providerTaskId: ' Legacy-é-ID ' }
+              : { kind },
+        });
+      }
+    }
+    // V1 permits a duplicated accepted provider reference; migration must retain it.
+    const duplicate = {
+      ...originals[2]!,
+      requestId: 'legacy-duplicate-ack',
+      submittedUrls: ['https://example.test/legacy-duplicate'],
+    };
+    const dp = newIntent(ledger, duplicate);
+    const dc = ledger.claimDispatch(dp.dispatchCapability, 0);
+    if (dc.kind !== 'claimed')
+      throw new Error('Expected synthetic duplicate claim.');
+    ledger.recordDispatchOutcome({
+      credentialFingerprint: binding,
+      requestId: duplicate.requestId,
+      expectedStateVersion: 1,
+      outcomeToken: dc.outcomeToken,
+      outcome: {
+        kind: 'accepted',
+        providerType: 'google/indexer',
+        providerTaskId: ' Legacy-é-ID ',
+      },
+    });
+    const bulk: PrepareIntentInput = {
+      ...input('preserve-10000'),
+      budget: { ...input().budget, budgetScope: 'bulk' },
+      submittedUrls: Array.from(
+        { length: 10000 },
+        (_, i) => `https://example.test/bulk/${i}`,
+      ),
+    };
+    bulk.submittedUrls = [
+      'HTTP://Example.test/Case?x=1#Frag',
+      'http://example.test/Case?x=1#frag',
+      'https://example.test/path/',
+      'https://example.test/é',
+      ...bulk.submittedUrls.slice(4),
+    ];
+    originals.push(bulk);
+    newIntent(ledger, bulk);
+    const large = {
+      ...input('near-safe-units'),
+      budget: {
+        ...input().budget,
+        budgetScope: 'large',
+        caps: {
+          tokens: Number.MAX_SAFE_INTEGER,
+          indexer: Number.MAX_SAFE_INTEGER,
+          checker: Number.MAX_SAFE_INTEGER,
+        },
+      },
+      reservation: {
+        tokens: Number.MAX_SAFE_INTEGER,
+        indexer: Number.MAX_SAFE_INTEGER - 1,
+        checker: Number.MAX_SAFE_INTEGER - 2,
+      },
+    };
+    large.submittedUrls = ['https://example.test/' + 'x'.repeat(9000)];
+    newIntent(ledger, large);
+    ledger.cancelPrepared(binding, large.requestId, 0);
+    const later = {
+      ...input('later-period'),
+      budget: {
+        ...input().budget,
+        budgetScope: 'scope-0',
+        periodId: 'two',
+        periodStartMs: 2000,
+        caps: { tokens: 100000, indexer: 100000, checker: 100000 },
+      },
+      submittedUrls: ['https://example.test/later'],
+    };
+    newIntent(ledger, later);
+    ledger.close();
+    const db = f.raw(state);
+    db.run('UPDATE intent_events SET event_id = event_id + 9007199254740992');
+    db.run('UPDATE sqlite_sequence SET seq = 9007199254745999');
+    const before = exactCoreRows(db);
+    expect((before.intent_events![0] as { event_id: string }).event_id).toBe(
+      '9007199254740993',
+    );
+    expect((before.sqlite_sequence![0] as { seq: string }).seq).toBe(
+      '9007199254745999',
+    );
+    const inode = lstatSync(join(state, 'ledger.sqlite')).ino;
+    expect(
+      migrateLedgerV2({ stateDirectory: state, backupDirectory: backup }),
+    ).toEqual({ migrated: true, schemaVersion: 2, backupVerified: true });
+    expect(exactCoreRows(db)).toEqual(before);
+    expect(lstatSync(join(state, 'ledger.sqlite')).ino).toBe(inode);
+    expect(
+      db
+        .query(
+          'SELECT DISTINCT origin_kind, parent_family, parent_task_id, source_manifest_digest, plan_fingerprint FROM intent_context',
+        )
+        .all(),
+    ).toEqual([
+      {
+        origin_kind: 'legacy_unattributed',
+        parent_family: null,
+        parent_task_id: null,
+        source_manifest_digest: null,
+        plan_fingerprint: null,
+      },
+    ]);
+    expect(
+      db.query('SELECT COUNT(*) AS count FROM intent_context').get(),
+    ).toEqual({ count: before.intents!.length });
+    expect(
+      db
+        .query(
+          "SELECT COUNT(*) AS count FROM intents WHERE task_family = 'google/indexer' AND provider_task_id = ' Legacy-é-ID '",
+        )
+        .get(),
+    ).toEqual({ count: 2 });
+    const manifest = JSON.parse(
+      readFileSync(join(backup, 'backup-manifest.json'), 'utf8'),
+    ) as { files: Record<string, { size: string; sha256: string }> };
+    for (const [name, file] of Object.entries(manifest.files)) {
+      const bytes = readFileSync(join(backup, name));
+      expect(createHash('sha256').update(bytes).digest('hex')).toBe(
+        file.sha256,
+      );
+      expect(String(bytes.length)).toBe(file.size);
+      expect(lstatSync(join(backup, name)).mode & 0o777).toBe(0o600);
+    }
+    expect(lstatSync(backup).mode & 0o777).toBe(0o700);
+    expect(lstatSync(join(backup, 'backup-manifest.json')).mode & 0o777).toBe(
+      0o600,
+    );
+    const backupDb = f.raw(backup);
+    expect(exactCoreRows(backupDb)).toEqual(before);
+    expect(backupDb.query('PRAGMA user_version').get()).toEqual({
+      user_version: 1,
+    });
+    const reopened = f.open(state);
+    for (const original of originals) {
+      const replay = reopened.prepareIntent(original);
+      expect(replay.kind).toBe('replay');
+      expect(replay).not.toHaveProperty('dispatchCapability');
+    }
+    expect(exactCoreRows(db)).toEqual(before);
+    const cap = retainedPrepared[0]!.dispatchCapability;
+    expect(reopened.claimDispatch(cap, 0).kind).toBe('claimed');
+    expect(reopened.claimDispatch(cap, 0)).toEqual({ kind: 'lost' });
+    const owned = retainedDispatch[0]!;
+    const wrong = retainedDispatch[1]!;
+    const outcomeInput = {
+      credentialFingerprint: owned.value.budget.credentialFingerprint,
+      requestId: owned.value.requestId,
+      expectedStateVersion: 1,
+      outcomeToken: wrong.token,
+      outcome: { kind: 'unknown' as const },
+    };
+    expectLedgerError(
+      () => reopened.recordDispatchOutcome(outcomeInput),
+      'DispatchOutcomeClaimLost',
+    );
+    expect(
+      reopened.recordDispatchOutcome({
+        ...outcomeInput,
+        outcomeToken: owned.token,
+      }).state,
+    ).toBe('unknown');
+    expectLedgerError(
+      () =>
+        reopened.recordDispatchOutcome({
+          ...outcomeInput,
+          outcomeToken: owned.token,
+        }),
+      'DispatchOutcomeClaimLost',
+    );
+    expectLedgerError(
+      () =>
+        reopened.prepareIntent({
+          ...input('overlap-after-migration'),
+          budget: { ...input().budget, budgetScope: 'other-scope' },
+          submittedUrls: originals[0]!.submittedUrls,
+        }),
+      'UrlOverlap',
+    );
+    for (const unit of ['tokens', 'indexer', 'checker'] as const) {
+      let error: unknown;
+      try {
+        reopened.prepareIntent({
+          ...later,
+          requestId: `cap-${unit}`,
+          submittedUrls: [`https://example.test/cap/${unit}`],
+          budget: {
+            ...later.budget,
+            periodId: 'three',
+            periodStartMs: 3000,
+            caps: {
+              tokens: 100000,
+              indexer: 100000,
+              checker: 100000,
+              [unit]: 0,
+            },
+          },
+        });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeInstanceOf(SubmissionLedgerError);
+      expect((error as SubmissionLedgerError).code).toBe('BudgetExceeded');
+      expect((error as SubmissionLedgerError).unit).toBe(unit);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('V2-02 migration: new binary V1 handles fail closed after actual migration; already V2 creates no backup', () => {
+  const f = fixture();
+  try {
+    const state = join(f.root, 'v1');
+    const ledger = f.init(state, 1);
+    const original = newIntent(ledger);
+    expect(
+      migrateLedgerV2({
+        stateDirectory: state,
+        backupDirectory: join(f.root, 'backup'),
+      }).migrated,
+    ).toBe(true);
+    expectUnavailable(() =>
+      ledger.claimDispatch(original.dispatchCapability, 0),
+    );
+    const newBackup = join(f.root, 'unused-backup');
+    const db = f.raw(state);
+    const before = snapshot(db);
+    expect(
+      migrateLedgerV2({ stateDirectory: state, backupDirectory: newBackup }),
+    ).toEqual({ migrated: false, schemaVersion: 2, reason: 'AlreadyV2' });
+    expect(existsSync(newBackup)).toBe(false);
+    expect(snapshot(db)).toEqual(before);
+    expect(
+      f.open(state).claimDispatch(original.dispatchCapability, 0).kind,
+    ).toBe('claimed');
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const kind of [
+  'missing-event',
+  'gapped-url',
+  'partial-v2',
+  'foreign-index',
+  'not-wal',
+] as const) {
+  test(`V2-03 audit: ${kind} fails before backup or DDL`, () => {
+    const f = fixture();
+    try {
+      const state = join(f.root, 'v1');
+      const ledger = f.init(state, 1);
+      newIntent(ledger);
+      ledger.close();
+      const db = f.raw(state);
+      if (kind === 'missing-event') db.run('DELETE FROM intent_events');
+      if (kind === 'gapped-url')
+        db.run('UPDATE intent_urls SET ordinal = ordinal + 10');
+      if (kind === 'partial-v2') db.run('PRAGMA user_version = 2');
+      if (kind === 'foreign-index')
+        db.run('CREATE INDEX foreign_extra ON intents (request_id)');
+      if (kind === 'not-wal') db.run('PRAGMA journal_mode = DELETE');
+      const before = exactCoreRows(db);
+      const backup = join(f.root, 'backup');
+      expectMigrationError(
+        () =>
+          migrateLedgerV2({ stateDirectory: state, backupDirectory: backup }),
+        'InvalidState',
+      );
+      expect(exactCoreRows(db)).toEqual(before);
+      expect(existsSync(backup)).toBe(false);
+      expect(db.query('PRAGMA user_version').get()).toEqual({
+        user_version: kind === 'partial-v2' ? 2 : 1,
+      });
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+for (const lock of ['reader', 'writer'] as const) {
+  test(`V2-03 checkpoint: real ${lock} prevents truncation and preserves V1`, () => {
+    const f = fixture();
+    try {
+      const state = join(f.root, 'v1');
+      const ledger = f.init(state, 1);
+      const db = f.raw(state);
+      const blocker = f.raw(state);
+      f.track({
+        close() {
+          if (blocker.inTransaction) blocker.run('ROLLBACK');
+        },
+      });
+      newIntent(ledger);
+      blocker.run(lock === 'reader' ? 'BEGIN' : 'BEGIN IMMEDIATE');
+      blocker.query('SELECT * FROM intents').all();
+      if (lock === 'reader')
+        newIntent(ledger, {
+          ...input('newer-than-reader'),
+          submittedUrls: ['https://example.test/newer'],
+        });
+      const before = exactCoreRows(db);
+      const backup = join(f.root, 'backup');
+      expectMigrationError(
+        () =>
+          migrateLedgerV2({ stateDirectory: state, backupDirectory: backup }),
+        'LedgerBusy',
+      );
+      expectV1Unchanged(db, before);
+      expect(existsSync(backup)).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test('V2-03 checkpoint: a commit in the checkpoint-to-lock gap stops before backup/DDL', () => {
+  const f = fixture();
+  try {
+    const state = join(f.root, 'v1');
+    const ledger = f.init(state, 1);
+    newIntent(ledger);
+    const db = f.raw(state);
+    const backup = join(f.root, 'backup');
+    let calls = 0;
+    let afterWriter: ReturnType<typeof exactCoreRows> | undefined;
+    expectMigrationError(
+      () =>
+        migrateLedgerV2(
+          { stateDirectory: state, backupDirectory: backup },
+          {
+            afterCheckpoint() {
+              calls++;
+              newIntent(ledger, {
+                ...input('gap-writer'),
+                submittedUrls: ['https://example.test/gap-writer'],
+              });
+              expect(
+                lstatSync(join(state, 'ledger.sqlite-wal')).size,
+              ).toBeGreaterThan(0);
+              afterWriter = exactCoreRows(db);
+            },
+          },
+        ),
+      'InvalidState',
+    );
+    expect(calls).toBe(1);
+    expect(afterWriter).toBeDefined();
+    expectV1Unchanged(db, afterWriter!);
+    expect(existsSync(backup)).toBe(false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const fault of [
+  'copy',
+  'zero-write',
+  'fileSync',
+  'directorySync',
+  'parentSync',
+] as const) {
+  test(`V2-03 backup: ${fault} retains private unverified backup and exact V1`, () => {
+    const f = fixture();
+    try {
+      const state = join(f.root, 'v1');
+      const ledger = f.init(state, 1);
+      newIntent(ledger);
+      ledger.close();
+      const db = f.raw(state);
+      const before = exactCoreRows(db);
+      const backup = join(f.root, 'backup');
+      const hooks =
+        fault === 'zero-write'
+          ? { maxWriteBytes: 0 }
+          : fault === 'copy'
+            ? { fault, maxWriteBytes: 17 }
+            : { fault };
+      expectMigrationError(
+        () =>
+          migrateLedgerV2(
+            { stateDirectory: state, backupDirectory: backup },
+            hooks,
+          ),
+        'BackupFailed',
+      );
+      expectV1Unchanged(db, before);
+      expect(existsSync(join(backup, 'ledger.sqlite'))).toBe(true);
+      expect(lstatSync(backup).mode & 0o777).toBe(0o700);
+      expect(lstatSync(join(backup, 'ledger.sqlite')).mode & 0o777).toBe(0o600);
+      expect(existsSync(join(backup, 'backup-manifest.json'))).toBe(false);
+      if (fault === 'zero-write')
+        expect(lstatSync(join(backup, 'ledger.sqlite')).size).toBe(0);
+      if (fault === 'copy') {
+        expect(lstatSync(join(backup, 'ledger.sqlite')).size).toBe(17);
+        expect(lstatSync(join(state, 'ledger.sqlite')).size).toBeGreaterThan(
+          17,
+        );
+      }
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test('V2-03 backup: bounded partial writes preserve committed WAL rows in verified recovery image', () => {
+  const f = fixture();
+  try {
+    const state = join(f.root, 'v1');
+    const ledger = f.init(state, 1);
+    const db = f.raw(state);
+    db.run('PRAGMA wal_autocheckpoint = 0');
+    db.query('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    const checkpointedEmptyMain = readFileSync(join(state, 'ledger.sqlite'));
+    newIntent(ledger);
+    expect(readFileSync(join(state, 'ledger.sqlite'))).toEqual(
+      checkpointedEmptyMain,
+    );
+    expect(lstatSync(join(state, 'ledger.sqlite-wal')).size).toBeGreaterThan(0);
+    const before = exactCoreRows(db);
+    const backup = join(f.root, 'backup');
+    expect(
+      migrateLedgerV2(
+        { stateDirectory: state, backupDirectory: backup },
+        { maxWriteBytes: 17 },
+      ).migrated,
+    ).toBe(true);
+    expect(exactCoreRows(f.raw(backup))).toEqual(before);
+    expect(exactCoreRows(db)).toEqual(before);
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const shape of [
+  'existing-directory',
+  'existing-file',
+  'symlink',
+  'hardlink',
+  'unsafe-parent',
+  'unsafe-source',
+  'unsafe-main-file',
+  'source-symlink',
+  'source-hardlink',
+  'unsafe-journal',
+] as const) {
+  test(`V2-03 paths: ${shape} preserves sentinels/source and never overwrites`, () => {
+    const f = fixture();
+    try {
+      const state = join(f.root, 'v1');
+      const ledger = f.init(state, 1);
+      newIntent(ledger);
+      ledger.close();
+      const db = f.raw(state);
+      const before = exactCoreRows(db);
+      const sentinel = join(f.root, 'sentinel');
+      writeFileSync(sentinel, 'synthetic existing backup sentinel', {
+        flag: 'wx',
+        mode: 0o600,
+      });
+      let backup = join(f.root, 'backup');
+      const sourceInode = lstatSync(join(state, 'ledger.sqlite')).ino;
+      let selectedState = state;
+      if (shape === 'existing-directory') {
+        mkdirSync(backup, { mode: 0o700 });
+        writeFileSync(join(backup, 'sentinel'), 'preexisting private backup', {
+          mode: 0o600,
+          flag: 'wx',
+        });
+      }
+      if (shape === 'existing-file')
+        writeFileSync(backup, 'existing file', { mode: 0o600, flag: 'wx' });
+      if (shape === 'symlink') symlinkSync(sentinel, backup);
+      if (shape === 'hardlink') linkSync(sentinel, backup);
+      if (shape === 'unsafe-parent') {
+        const parent = join(f.root, 'unsafe');
+        mkdirSync(parent, { mode: 0o700 });
+        chmodSync(parent, 0o777);
+        backup = join(parent, 'new-backup');
+      }
+      if (shape === 'unsafe-source') chmodSync(state, 0o755);
+      if (shape === 'unsafe-main-file')
+        chmodSync(join(state, 'ledger.sqlite'), 0o644);
+      if (shape === 'source-symlink') {
+        selectedState = join(f.root, 'source-alias');
+        symlinkSync(state, selectedState);
+      }
+      if (shape === 'source-hardlink') {
+        db.close();
+        linkSync(join(state, 'ledger.sqlite'), join(f.root, 'source-hardlink'));
+      }
+      if (shape === 'unsafe-journal')
+        writeFileSync(
+          join(state, 'ledger.sqlite-journal'),
+          'owned nonempty journal',
+          { flag: 'wx', mode: 0o600 },
+        );
+      const sourceBytes =
+        shape === 'source-hardlink'
+          ? readFileSync(join(state, 'ledger.sqlite'))
+          : undefined;
+      expectMigrationError(
+        () =>
+          migrateLedgerV2({
+            stateDirectory: selectedState,
+            backupDirectory: backup,
+          }),
+        [
+          'unsafe-source',
+          'unsafe-main-file',
+          'source-symlink',
+          'source-hardlink',
+          'unsafe-journal',
+        ].includes(shape)
+          ? 'InvalidState'
+          : 'BackupFailed',
+      );
+      if (shape === 'source-hardlink') {
+        expect(lstatSync(join(state, 'ledger.sqlite')).nlink).toBe(2);
+        expect(readFileSync(join(state, 'ledger.sqlite'))).toEqual(
+          sourceBytes!,
+        );
+        rmSync(join(f.root, 'source-hardlink')); // Remove only the owned negative-fixture alias before SQLite inspection.
+      }
+      expectV1Unchanged(
+        shape === 'source-hardlink' ? f.raw(state) : db,
+        before,
+      );
+      expect(readFileSync(sentinel, 'utf8')).toBe(
+        'synthetic existing backup sentinel',
+      );
+      if (shape === 'existing-file')
+        expect(readFileSync(backup, 'utf8')).toBe('existing file');
+      if (shape === 'existing-directory')
+        expect(readFileSync(join(backup, 'sentinel'), 'utf8')).toBe(
+          'preexisting private backup',
+        );
+      expect(lstatSync(join(state, 'ledger.sqlite')).ino).toBe(sourceInode);
+      if (shape === 'unsafe-journal')
+        expect(readFileSync(join(state, 'ledger.sqlite-journal'), 'utf8')).toBe(
+          'owned nonempty journal',
+        );
+    } finally {
+      f.cleanup();
+    }
+  });
+}

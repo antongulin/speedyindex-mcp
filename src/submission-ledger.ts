@@ -3,10 +3,13 @@ import {
   closeSync,
   constants as fsConstants,
   fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   realpathSync,
+  readSync,
+  writeSync,
   type Stats,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -739,7 +742,7 @@ function readLedgerId(database: Database): string {
   return rows[0]!.ledger_id;
 }
 
-function verifyV2Data(database: Database) {
+function verifyCoreData(database: Database) {
   const check = database.query('PRAGMA quick_check').get() as {
     quick_check: string;
   } | null;
@@ -748,17 +751,6 @@ function verifyV2Data(database: Database) {
     database.query('PRAGMA foreign_key_check').get()
   )
     fail('LedgerUnavailable');
-  if (
-    database
-      .query(
-        `SELECT 1 FROM intents i
-      LEFT JOIN intent_context c USING (credential_fp, request_id)
-      WHERE c.request_id IS NULL LIMIT 1`,
-      )
-      .get()
-  )
-    fail('LedgerUnavailable');
-
   // These are consistency checks, not snapshot resource limits or new V1 scalar limits.
   if (
     database
@@ -795,6 +787,20 @@ function verifyV2Data(database: Database) {
           OR e.terminal_task_id IS NOT i.provider_task_id OR e.terminal_type IS NOT i.provider_type
           OR e.phase_one_event_id >= e.terminal_event_id))
       LIMIT 1`,
+      )
+      .get()
+  )
+    fail('LedgerUnavailable');
+}
+
+function verifyV2Data(database: Database) {
+  verifyCoreData(database);
+  if (
+    database
+      .query(
+        `SELECT 1 FROM intents i
+      LEFT JOIN intent_context c USING (credential_fp, request_id)
+      WHERE c.request_id IS NULL LIMIT 1`,
       )
       .get()
   )
@@ -1765,4 +1771,555 @@ export function openLedger(options: LedgerPathOptions): SubmissionLedger {
     }
     throw toLedgerError(error);
   }
+}
+
+export class LedgerMigrationError extends Error {
+  constructor(
+    readonly code:
+      'InvalidState' | 'LedgerBusy' | 'BackupFailed' | 'MigrationFailed',
+  ) {
+    super(
+      {
+        InvalidState: 'Submission migration state is invalid.',
+        LedgerBusy: 'Submission migration state is busy.',
+        BackupFailed: 'Submission migration backup could not be verified.',
+        MigrationFailed:
+          'Submission migration could not be confirmed; inspect state before retrying.',
+      }[code],
+    );
+    this.name = 'LedgerMigrationError';
+  }
+}
+
+export type MigrationReceipt =
+  | { migrated: true; schemaVersion: 2; backupVerified: true }
+  | { migrated: false; schemaVersion: 2; reason: 'AlreadyV2' };
+
+// Trusted in-process test wiring only; never supplied by CLI, MCP, policy or environment.
+export interface MigrationTestHooks {
+  afterCheckpoint?: () => void;
+  maxWriteBytes?: number;
+  fault?: 'copy' | 'fileSync' | 'directorySync' | 'parentSync';
+}
+
+const copyBufferBytes = 64 * 1024;
+const coreTableOrder = {
+  budget_periods:
+    'credential_fp COLLATE BINARY, budget_scope COLLATE BINARY, period_id COLLATE BINARY',
+  intents: 'credential_fp COLLATE BINARY, request_id COLLATE BINARY',
+  intent_urls:
+    'credential_fp COLLATE BINARY, request_id COLLATE BINARY, ordinal',
+  intent_events: 'event_id',
+  sqlite_sequence: 'name COLLATE BINARY, seq',
+} as const;
+
+function coreProjectionDigest(database: Database): string {
+  const digest = createHash('sha256');
+  const frame = (text: string) => {
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64BE(BigInt(Buffer.byteLength(text, 'utf8')));
+    digest.update(length).update(text, 'utf8');
+  };
+  frame('speedyindex-core-preservation-v1');
+  for (const [table, order] of Object.entries(coreTableOrder)) {
+    frame(table);
+    const columns = database.query(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+    }[];
+    const projection = columns.flatMap(({ name }, index) => {
+      // Names are from the exact allowlisted schema, never caller input.
+      const column = `"${name}"`;
+      return [
+        `typeof(${column}) AS t${index}`,
+        `CASE WHEN typeof(${column}) = 'integer' THEN CAST(${column} AS TEXT) WHEN typeof(${column}) = 'real' THEN ${column} ELSE hex(${column}) END AS v${index}`,
+      ];
+    });
+    for (const column of columns) frame(column.name);
+    const query = database.query<Record<string, string | number>, []>(
+      `SELECT ${projection.join(', ')} FROM ${table} ORDER BY ${order}`,
+    );
+    for (const row of query.iterate()) {
+      frame('row');
+      for (const [index] of columns.entries()) {
+        frame(row[`t${index}`] as string);
+        const value = row[`v${index}`]!;
+        if (typeof value === 'number') {
+          const binary = Buffer.alloc(8);
+          binary.writeDoubleBE(value);
+          frame(binary.toString('hex'));
+        } else frame(value);
+      }
+    }
+    frame('end');
+  }
+  return digest.digest('hex');
+}
+
+function verifyMigrationCoreData(database: Database) {
+  const check = database.query('PRAGMA integrity_check').get() as {
+    integrity_check: string;
+  } | null;
+  if (check?.integrity_check !== 'ok') maintenanceFailure();
+  verifyCoreData(database);
+}
+
+function maintenanceFailure(): never {
+  throw new LedgerMigrationError('InvalidState');
+}
+
+function sameDirectoryIdentity(left: FileIdentity, right: FileIdentity) {
+  // Directory link counts may change when SQLite creates WAL/SHM entries (APFS).
+  // Files still require exactly one link through validateDatabaseFile.
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.uid === right.uid
+  );
+}
+
+function assertStorageIdentity(
+  directory: string,
+  uid: number,
+  identity: FileIdentity,
+  directoryIdentity: FileIdentity,
+) {
+  const currentDirectory = validateCanonicalPathComponents(directory, uid);
+  if (
+    !sameDirectoryIdentity(directoryIdentity, identityFrom(currentDirectory)) ||
+    !sameIdentity(
+      identity,
+      validateDatabaseFile(join(directory, databaseFilename), uid, true),
+    )
+  )
+    maintenanceFailure();
+  validateSidecars(directory, uid);
+}
+
+function requireEmptyWal(directory: string) {
+  const stats = lstatOrMissing(join(directory, `${databaseFilename}-wal`));
+  if (stats && stats.size !== 0) maintenanceFailure();
+}
+
+function requireWal(database: Database) {
+  const journal = database.query('PRAGMA journal_mode').get() as {
+    journal_mode: string;
+  } | null;
+  if (journal?.journal_mode.toLowerCase() !== 'wal') maintenanceFailure();
+}
+
+function checkpointForMigration(database: Database, directory: string) {
+  const result = database.query('PRAGMA wal_checkpoint(TRUNCATE)').get() as {
+    busy: number;
+    log: number;
+    checkpointed: number;
+  } | null;
+  if (result?.busy !== 0) throw new LedgerMigrationError('LedgerBusy');
+  if (result.log !== 0 || result.checkpointed !== 0) maintenanceFailure();
+  requireEmptyWal(directory);
+}
+
+function checkedFile<T>(
+  path: string,
+  uid: number,
+  operation: (fd: number) => T,
+): T {
+  const identity = validateDatabaseFile(path, uid, false);
+  const fd = openSync(path, fsConstants.O_RDONLY | openFlags().fileNoFollow);
+  try {
+    if (!sameIdentity(identity, identityFrom(fstatSync(fd))))
+      maintenanceFailure();
+    const result = operation(fd);
+    if (
+      !sameIdentity(identity, validateDatabaseFile(path, uid, false)) ||
+      !sameIdentity(identity, identityFrom(fstatSync(fd)))
+    )
+      maintenanceFailure();
+    return result;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function hashFile(path: string, uid: number) {
+  return checkedFile(path, uid, (fd) => {
+    const before = fstatSync(fd, { bigint: true });
+    const digest = createHash('sha256');
+    const buffer = Buffer.alloc(copyBufferBytes);
+    let size = 0n;
+    for (;;) {
+      const count = readSync(fd, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      digest.update(buffer.subarray(0, count));
+      size += BigInt(count);
+    }
+    const after = fstatSync(fd, { bigint: true });
+    if (
+      before.size !== size ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs
+    )
+      maintenanceFailure();
+    return { size: size.toString(), sha256: digest.digest('hex') };
+  });
+}
+
+function copyCheckpointedMain(
+  source: string,
+  backup: string,
+  uid: number,
+  hooks: MigrationTestHooks,
+) {
+  return checkedFile(source, uid, (sourceFd) => {
+    const before = fstatSync(sourceFd, { bigint: true });
+    const backupIdentity = validateDatabaseFile(backup, uid, false);
+    const targetFd = openSync(
+      backup,
+      fsConstants.O_RDWR | openFlags().fileNoFollow,
+    );
+    try {
+      if (
+        fstatSync(targetFd).size !== 0 ||
+        !sameIdentity(backupIdentity, identityFrom(fstatSync(targetFd)))
+      )
+        maintenanceFailure();
+      const buffer = Buffer.alloc(copyBufferBytes);
+      const digest = createHash('sha256');
+      let copied = 0n;
+      for (;;) {
+        const read = readSync(sourceFd, buffer, 0, buffer.length, null);
+        if (read === 0) break;
+        digest.update(buffer.subarray(0, read));
+        let offset = 0;
+        while (offset < read) {
+          const count = writeSync(
+            targetFd,
+            buffer,
+            offset,
+            Math.min(read - offset, hooks.maxWriteBytes ?? buffer.length),
+            null,
+          );
+          if (count <= 0 || count > read - offset)
+            throw new LedgerMigrationError('BackupFailed');
+          offset += count;
+          if (hooks.fault === 'copy')
+            throw new LedgerMigrationError('BackupFailed');
+        }
+        copied += BigInt(read);
+      }
+      const after = fstatSync(sourceFd, { bigint: true });
+      if (
+        copied !== before.size ||
+        before.size !== after.size ||
+        before.mtimeNs !== after.mtimeNs ||
+        before.ctimeNs !== after.ctimeNs ||
+        fstatSync(targetFd, { bigint: true }).size !== copied ||
+        !sameIdentity(backupIdentity, validateDatabaseFile(backup, uid, true))
+      )
+        maintenanceFailure();
+      return { size: copied.toString(), sha256: digest.digest('hex') };
+    } finally {
+      closeSync(targetFd);
+    }
+  });
+}
+
+function syncDirectory(directory: string, uid: number, privateLeaf: boolean) {
+  if (privateLeaf) validateCanonicalPathComponents(directory, uid);
+  else validateCreationParent(directory, uid);
+  const identity = identityFrom(lstatSync(directory));
+  const fd = openSync(
+    directory,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | openFlags().fileNoFollow,
+  );
+  try {
+    if (!sameDirectoryIdentity(identity, identityFrom(fstatSync(fd))))
+      maintenanceFailure();
+    fsyncSync(fd);
+    if (!sameDirectoryIdentity(identity, identityFrom(lstatSync(directory))))
+      maintenanceFailure();
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function verifyBackup(
+  source: Database,
+  sourceDirectory: string,
+  backupDirectory: string,
+  uid: number,
+  hooks: MigrationTestHooks,
+) {
+  const backupPath = createNewState(backupDirectory, uid);
+  const directoryIdentity = identityFrom(
+    validateCanonicalPathComponents(backupDirectory, uid),
+  );
+  const identity = validateDatabaseFile(backupPath, uid, false);
+  const copied = copyCheckpointedMain(
+    join(sourceDirectory, databaseFilename),
+    backupPath,
+    uid,
+    hooks,
+  );
+  requireEmptyWal(sourceDirectory);
+  const rawCopy = hashFile(backupPath, uid);
+  if (rawCopy.size !== copied.size || rawCopy.sha256 !== copied.sha256)
+    throw new LedgerMigrationError('BackupFailed');
+  const coreDigest = coreProjectionDigest(source);
+  let verifier: Database | undefined;
+  try {
+    assertStorageIdentity(backupDirectory, uid, identity, directoryIdentity);
+    verifier = openDatabase(backupPath);
+    assertStorageIdentity(backupDirectory, uid, identity, directoryIdentity);
+    if (verifySchema(verifier).version !== 1) maintenanceFailure();
+    requireWal(verifier);
+    configureConnection(verifier);
+    verifier.run('PRAGMA query_only = ON');
+    verifier
+      .transaction(() => {
+        verifyMigrationCoreData(verifier!);
+        if (coreProjectionDigest(verifier!) !== coreDigest)
+          throw new LedgerMigrationError('BackupFailed');
+      })
+      .deferred();
+    assertStorageIdentity(backupDirectory, uid, identity, directoryIdentity);
+  } finally {
+    verifier?.close();
+  }
+
+  // Closing/checkpointing the verifier may change main/sidecar bytes. Only these
+  // final retained files, after verification and close, enter the recovery manifest.
+  const files: Record<string, { size: string; sha256: string }> = {};
+  assertStorageIdentity(backupDirectory, uid, identity, directoryIdentity);
+  for (const name of [
+    databaseFilename,
+    `${databaseFilename}-wal`,
+    `${databaseFilename}-shm`,
+  ]) {
+    const path = join(backupDirectory, name);
+    if (lstatOrMissing(path) === undefined) continue;
+    if (hooks.fault === 'fileSync')
+      throw new LedgerMigrationError('BackupFailed');
+    checkedFile(path, uid, (fd) => fsyncSync(fd));
+    files[name] = hashFile(path, uid);
+  }
+  if (hooks.fault === 'directorySync')
+    throw new LedgerMigrationError('BackupFailed');
+  syncDirectory(backupDirectory, uid, true);
+  if (hooks.fault === 'parentSync')
+    throw new LedgerMigrationError('BackupFailed');
+  syncDirectory(dirname(backupDirectory), uid, false);
+  const manifestPath = join(backupDirectory, 'backup-manifest.json');
+  const fd = openSync(
+    manifestPath,
+    fsConstants.O_CREAT |
+      fsConstants.O_EXCL |
+      fsConstants.O_RDWR |
+      openFlags().fileNoFollow,
+    0o600,
+  );
+  try {
+    const manifestIdentity = validateDatabaseFile(manifestPath, uid, false);
+    if (!sameIdentity(manifestIdentity, identityFrom(fstatSync(fd))))
+      maintenanceFailure();
+    const bytes = Buffer.from(
+      JSON.stringify({
+        format: 'speedyindex-backup-v1',
+        schemaVersion: 1,
+        coreDigest,
+        initialImage: copied,
+        files,
+      }) + '\n',
+    );
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = writeSync(fd, bytes, offset, bytes.length - offset, null);
+      if (count <= 0 || count > bytes.length - offset)
+        throw new LedgerMigrationError('BackupFailed');
+      offset += count;
+    }
+    fsyncSync(fd);
+    if (
+      !sameIdentity(
+        manifestIdentity,
+        validateDatabaseFile(manifestPath, uid, true),
+      )
+    )
+      maintenanceFailure();
+  } finally {
+    closeSync(fd);
+  }
+  syncDirectory(backupDirectory, uid, true);
+  syncDirectory(dirname(backupDirectory), uid, false);
+  assertStorageIdentity(backupDirectory, uid, identity, directoryIdentity);
+  for (const [name, expected] of Object.entries(files)) {
+    const final = hashFile(join(backupDirectory, name), uid);
+    if (final.sha256 !== expected.sha256 || final.size !== expected.size)
+      throw new LedgerMigrationError('BackupFailed');
+  }
+  return coreDigest;
+}
+
+// Explicit offline maintenance only. Operators must drain in-flight work and stop
+// every cooperating host; a lock/checkpoint cannot prove that or recover lost tokens.
+export function migrateLedgerV2(
+  options: { stateDirectory: string; backupDirectory: string },
+  hooks: MigrationTestHooks = {},
+): MigrationReceipt {
+  let database: Database | undefined;
+  let phase: 'audit' | 'backup' | 'migration' = 'audit';
+  let receipt: MigrationReceipt | undefined;
+  let failure: LedgerMigrationError | undefined;
+  try {
+    requireKeys(options, ['stateDirectory', 'backupDirectory']);
+    validatePathInput({ stateDirectory: options.stateDirectory });
+    validatePathInput({ stateDirectory: options.backupDirectory });
+    if (
+      hooks.maxWriteBytes !== undefined &&
+      (!Number.isInteger(hooks.maxWriteBytes) ||
+        hooks.maxWriteBytes < 0 ||
+        hooks.maxWriteBytes > copyBufferBytes)
+    )
+      maintenanceFailure();
+    const uid = ensurePosixRuntime();
+    const directoryIdentity = identityFrom(
+      validateCanonicalPathComponents(options.stateDirectory, uid),
+    );
+    validateSidecars(options.stateDirectory, uid);
+    const path = join(options.stateDirectory, databaseFilename);
+    const identity = validateDatabaseFile(path, uid, true);
+    database = openDatabase(path);
+    assertStorageIdentity(
+      options.stateDirectory,
+      uid,
+      identity,
+      directoryIdentity,
+    );
+    const initial = database
+      .transaction(() => {
+        const schema = verifySchema(database!);
+        if (schema.version === 1) verifyMigrationCoreData(database!);
+        return schema;
+      })
+      .deferred();
+    requireWal(database);
+    if (initial.version === 2) {
+      receipt = { migrated: false, schemaVersion: 2, reason: 'AlreadyV2' };
+    } else {
+      configureConnection(database);
+      checkpointForMigration(database, options.stateDirectory);
+      if (hooks.afterCheckpoint) {
+        if (hooks.afterCheckpoint.constructor.name === 'AsyncFunction')
+          maintenanceFailure();
+        const result = hooks.afterCheckpoint();
+        if (result !== undefined) maintenanceFailure();
+      }
+      const coreDigest = database
+        .transaction(() => {
+          assertStorageIdentity(
+            options.stateDirectory,
+            uid,
+            identity,
+            directoryIdentity,
+          );
+          requireEmptyWal(options.stateDirectory);
+          if (verifySchema(database!).version !== 1) maintenanceFailure();
+          verifyMigrationCoreData(database!);
+          phase = 'backup';
+          const digest = verifyBackup(
+            database!,
+            options.stateDirectory,
+            options.backupDirectory,
+            uid,
+            hooks,
+          );
+          assertStorageIdentity(
+            options.stateDirectory,
+            uid,
+            identity,
+            directoryIdentity,
+          );
+          requireEmptyWal(options.stateDirectory);
+          phase = 'migration';
+          for (const sql of v2SchemaStatements) database!.run(sql);
+          database!
+            .query(
+              'INSERT INTO retry_ledger_meta (singleton, ledger_id) VALUES (1, ?)',
+            )
+            .run(randomBytes(32).toString('hex'));
+          database!.run(
+            "INSERT INTO intent_context (credential_fp, request_id, origin_kind) SELECT credential_fp, request_id, 'legacy_unattributed' FROM intents",
+          );
+          database!.run('PRAGMA user_version = 2');
+          if (
+            verifySchema(database!).version !== 2 ||
+            coreProjectionDigest(database!) !== digest
+          )
+            throw new LedgerMigrationError('MigrationFailed');
+          return digest;
+        })
+        .immediate();
+      database.close();
+      database = undefined;
+      assertStorageIdentity(
+        options.stateDirectory,
+        uid,
+        identity,
+        directoryIdentity,
+      );
+      database = openDatabase(path);
+      assertStorageIdentity(
+        options.stateDirectory,
+        uid,
+        identity,
+        directoryIdentity,
+      );
+      database
+        .transaction(() => {
+          if (
+            verifySchema(database!).version !== 2 ||
+            coreProjectionDigest(database!) !== coreDigest
+          )
+            throw new LedgerMigrationError('MigrationFailed');
+        })
+        .deferred();
+      assertStorageIdentity(
+        options.stateDirectory,
+        uid,
+        identity,
+        directoryIdentity,
+      );
+      receipt = { migrated: true, schemaVersion: 2, backupVerified: true };
+    }
+  } catch (error) {
+    if (error instanceof LedgerMigrationError) failure = error;
+    else {
+      if (
+        (error instanceof SQLiteError &&
+          error.code?.startsWith('SQLITE_BUSY')) ||
+        (error instanceof SubmissionLedgerError && error.code === 'LedgerBusy')
+      )
+        failure = new LedgerMigrationError('LedgerBusy');
+      else
+        failure = new LedgerMigrationError(
+          phase === 'audit'
+            ? 'InvalidState'
+            : phase === 'backup'
+              ? 'BackupFailed'
+              : 'MigrationFailed',
+        );
+    }
+  } finally {
+    if (database) {
+      try {
+        database.close();
+      } catch {
+        failure = new LedgerMigrationError('MigrationFailed');
+      }
+    }
+  }
+  if (failure) throw failure;
+  if (!receipt) throw new LedgerMigrationError('MigrationFailed');
+  return receipt;
 }
