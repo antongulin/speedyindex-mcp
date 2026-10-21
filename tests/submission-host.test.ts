@@ -599,6 +599,7 @@ async function makeHarness() {
         '--submission-state',
         stateDirectory,
       ],
+      apiKey = key,
     ) {
       const phases = sdkPhases();
       if (instrumented) phaseRecorders.push(phases);
@@ -607,7 +608,7 @@ async function makeHarness() {
         ? await connectOwnedStdio(
             ['tests/fixtures/submission-sdk-child.ts'],
             {
-              SPEEDYINDEX_API_KEY: key,
+              SPEEDYINDEX_API_KEY: apiKey,
               TEST_ACCOUNT_ORIGIN: api.origin,
               HOME: root,
               TEST_SUBMISSION_POLICY: policyPath,
@@ -617,7 +618,10 @@ async function makeHarness() {
             (child) => children.push(child),
             { onStderr: phases.receive, register },
           )
-        : await connect(api.origin, 'src/cli.ts', key, '', { args, register });
+        : await connect(api.origin, 'src/cli.ts', apiKey, '', {
+            args,
+            register,
+          });
       return { ...session, phases };
     },
     track<T>(operation: Promise<T>) {
@@ -2800,7 +2804,7 @@ test('C15 SOURCE SDK: real CLI cancellation after full POST persists unknown, fr
       );
     };
     const session = await h.sdk();
-    expect((await session.client.listTools()).tools).toHaveLength(5);
+    expect((await session.client.listTools()).tools).toHaveLength(6);
     const controller = new AbortController();
     const input = request('sdk-after-receipt');
     const call = h.track(
@@ -3023,7 +3027,7 @@ test('C15 SOURCE CLI: incomplete or malformed trusted configuration disables wri
         state: 'invalid',
         stateChecked: false,
       });
-      expect((await session.client.listTools()).tools).toHaveLength(5);
+      expect((await session.client.listTools()).tools).toHaveLength(6);
       expect(
         (await session.client.callTool({ name: 'get_balance', arguments: {} }))
           .isError,
@@ -3853,6 +3857,217 @@ test('IC09 HOST: checker ACK under actual SQLite writer lock remains held/unreco
         status: observed.result.status,
         writeCode: failed[0]!.code,
         reservation: checkerVector,
+      }),
+    );
+  });
+}, 30_000);
+
+function sdkCheckerApplication(value: {
+  structuredContent?: unknown;
+  content: unknown;
+  isError?: boolean | undefined;
+}) {
+  const result = createIndexCheckResultSchema.parse(value.structuredContent);
+  expect(value.content).toEqual([
+    { type: 'text', text: JSON.stringify(result) },
+  ]);
+  expect(value.isError).toBe(!['preview', 'accepted'].includes(result.status));
+  return result;
+}
+
+test('IC05/10 SOURCE SDK: injected current ACK accepts checker, next-day restart replays without ACK', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config({ ...checkerPolicy, mode: 'caller_acknowledgement' });
+    const session = await h.sdk(true);
+    await session.phases.wait('READY');
+    const input = checkRequest('sdk-check-ack', 'yandex');
+    const preview = sdkCheckerApplication(
+      await session.client.callTool({
+        name: 'create_index_check',
+        arguments: {
+          mode: 'preview',
+          searchEngine: input.searchEngine,
+          urls: input.urls,
+        },
+      }),
+    );
+    expect(preview.quote).toMatchObject({
+      availability: 'available',
+      reservation: checkerVector,
+    });
+    const accepted = sdkCheckerApplication(
+      await session.client.callTool({
+        name: 'create_index_check',
+        arguments: { ...input, acknowledgement: checkerAck(preview) },
+      }),
+    );
+    expect(accepted.status).toBe('accepted');
+    expect(accepted.intent?.providerType).toBe('yandex/checker');
+    await session.phases.wait('CLOSED', 1);
+    const originalEvents = events(h, input.requestId);
+    await session.close();
+    h.now += 86_400_000;
+    const restarted = await h.sdk(true);
+    await restarted.phases.wait('READY');
+    const replay = sdkCheckerApplication(
+      await restarted.client.callTool({
+        name: 'create_index_check',
+        arguments: input,
+      }),
+    );
+    expect(replay.replayed).toBe(true);
+    expect(replay.intent).toEqual(accepted.intent);
+    expect(replay.observation).toBeUndefined();
+    expect(events(h, input.requestId)).toEqual(originalEvents);
+    expect(h.records).toHaveLength(1);
+    expect(h.records[0]?.path).toBe('/v2/task/yandex/checker/create');
+    expect(h.records[0]?.body).toBe('{"urls":["https://example.test/check"]}');
+    assertNoPrivate(accepted, h);
+    assertNoPrivate(replay, h);
+  });
+}, 30_000);
+
+test('IC03/10 SOURCE SDK: policy-only and missing-key previews quote without granting authority or opening state', async () => {
+  await withHost(async (h) => {
+    h.config(checkerPolicy);
+    for (const args of [
+      ['--submission-policy', h.policyPath],
+      [
+        '--submission-policy',
+        h.policyPath,
+        '--submission-state',
+        h.stateDirectory,
+      ],
+    ]) {
+      const session = await h.sdk(false, args, '');
+      const input = checkRequest('sdk-keyless', 'bing');
+      const preview = sdkCheckerApplication(
+        await session.client.callTool({
+          name: 'create_index_check',
+          arguments: {
+            mode: 'preview',
+            searchEngine: input.searchEngine,
+            urls: input.urls,
+          },
+        }),
+      );
+      expect(preview.quote).toMatchObject({
+        availability: 'available',
+        reservation: checkerVector,
+      });
+      expect(preview.authorization?.stateChecked).toBe(false);
+      expect(preview.authorization?.fingerprint).toBeUndefined();
+      const blocked = sdkCheckerApplication(
+        await session.client.callTool({
+          name: 'create_index_check',
+          arguments: input,
+        }),
+      );
+      expect(blocked.status).toBe('blocked');
+      expect(blocked.error?.code).toBe(
+        args.length === 2 ? 'InvalidPolicy' : 'MissingCredentials',
+      );
+      assertNoPrivate(preview, h);
+      assertNoPrivate(blocked, h);
+      expect(session.stderr()).toBe('');
+      await session.close();
+    }
+    expect(existsSync(h.stateDirectory)).toBe(false);
+    expect(h.records).toEqual([]);
+  });
+}, 30_000);
+
+test('IC09 SOURCE SDK: checker cancellation after full POST persists all-unit hold and restart blocks indexer overlap', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config(checkerPolicy);
+    const release = h.fence(),
+      disconnected = deferred<void>();
+    h.handler = async (_receipt, response) => {
+      response.once('close', () => disconnected.resolve());
+      await release.promise;
+      response.end('no valid acknowledgement');
+    };
+    const session = await h.sdk(true);
+    await session.phases.wait('READY');
+    const writes = sdkWrites(session);
+    const controller = new AbortController();
+    const input = checkRequest('sdk-check-cancel', 'bing');
+    const call = h.track(
+      session.client
+        .callTool(
+          { name: 'create_index_check', arguments: input },
+          { signal: controller.signal },
+        )
+        .then(
+          () => 'delivered',
+          () => 'cancelled',
+        ),
+    );
+    const sent = await writes.wait('tools/call', 'create_index_check');
+    await bounded(h.received.promise);
+    expect(h.records[0]?.body).toBe('{"urls":["https://example.test/check"]}');
+    expect(h.records[0]?.path).toBe('/v2/task/bing/checker/create');
+    expect(h.read(input.requestId)?.state).toBe('dispatching');
+    controller.abort('synthetic checker cancellation after full receipt');
+    expect((await writes.wait('notifications/cancelled')).requestId).toBe(
+      sent.id,
+    );
+    expect(await bounded(call)).toBe('cancelled');
+    await bounded(disconnected.promise);
+    // This phase is emitted only after shared outcome recording/reread and DB close.
+    await session.phases.wait('CLOSED', 1);
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'unknown',
+      stateVersion: 2,
+    });
+    expect(events(h, input.requestId)).toEqual([
+      { event_kind: 'prepared', state_version: 0 },
+      { event_kind: 'dispatching', state_version: 1 },
+      { event_kind: 'unknown', state_version: 2 },
+    ]);
+    expect(storedUnits(h, "state = 'unknown'")).toEqual(checkerVector);
+    expect(session.phases.errors).toEqual([]);
+    await session.close();
+    const restarted = await h.sdk(true);
+    await restarted.phases.wait('READY');
+    const replay = sdkCheckerApplication(
+      await restarted.client.callTool({
+        name: 'create_index_check',
+        arguments: input,
+      }),
+    );
+    expect(replay.status).toBe('unknown');
+    expect(replay.replayed).toBe(true);
+    expect(replay.observation).toBeUndefined();
+    expect(replay.intent?.reservation).toEqual(checkerVector);
+    const overlap = sdkApplication(
+      await restarted.client.callTool({
+        name: 'create_indexing_task',
+        arguments: {
+          ...request('sdk-indexer-overlap'),
+          urls: input.urls,
+        },
+      }),
+    );
+    expect(overlap.error?.code).toBe('UrlOverlap');
+    expect(h.records).toHaveLength(1);
+    expect(storedUnits(h)).toEqual(checkerVector);
+    expect(h.read('sdk-indexer-overlap')).toBeNull();
+    assertNoPrivate(replay, h);
+    assertNoPrivate(overlap, h);
+    console.info(
+      'IC09 actual SDK checker cancellation evidence',
+      JSON.stringify({
+        writes: writes.messages,
+        phases: session.phases.messages,
+        state: h.read(input.requestId)?.state,
+        events: events(h, input.requestId),
+        held: storedUnits(h),
+        createPosts: h.records.length,
+        replay: replay.status,
+        overlap: overlap.error?.code,
       }),
     );
   });

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Verify the public account/task reads, guarded indexing, local operator commands, and source/built stdio contracts using synthetic data.
+Verify the public account/task reads, guarded indexing/checker reservations, local operator commands, and source/built stdio contracts using synthetic data.
 
 ## Ownership
 
@@ -14,7 +14,7 @@ Never call the live provider. All keys/data/caps are synthetic. Endpoint rewrite
 
 `submission-ledger.test.ts` uses only synthetic IDs, fingerprints, URLs, limits, and private temporary POSIX directories with real Bun SQLite. Its child fixture receives an empty allowlisted environment and uses READY/release messages; deadlines only bound hangs. Release or terminate and reap every child, close every database handle, then remove only the test-owned temporary tree. These cases prove local SQLite coordination and startup checks; they do not simulate provider HTTP or prove provider-side idempotency.
 
-`create-indexing-task.test.ts`, `submission-policy.test.ts` and `submission-host.test.ts` are explicit source-suite entries. Prefer their lowest useful layers over duplicating core invariants in stdio. Actual host crash/concurrency/persistence cases use real SQLite, owned HTTP receivers and phase barriers, not seeded-state claims of crash proof. Queued cancellation tests use real SDK frames/pipe flush and SQL locks; timing observations supply no hard latency guarantee. SDK child stdout contains protocol frames only, with safe phase markers on stderr. Own result validation must cover `isError` application results; SDK-owned input rejection has a different boundary.
+`create-indexing-task.test.ts`, `create-index-check.test.ts`, `submission-policy.test.ts` and `submission-host.test.ts` are explicit source-suite entries. Prefer their lowest useful layers over duplicating core invariants in stdio. Actual host crash/concurrency/persistence cases use real SQLite, owned HTTP receivers and phase barriers, not seeded-state claims of crash proof. Queued cancellation tests use real SDK frames/pipe flush and SQL locks; timing observations supply no hard latency guarantee. Source and built SDK cases list six tools, validate the checker quote union and exercise exact replay. A checker cancellation after full POST receipt waits for durable outcome/close before inspecting all three held units and restart overlap; built writes use operator policy without acknowledgement, while the source SDK fixture injects a clock for current-acknowledgement coverage. SDK child stdout contains protocol frames only, with safe phase markers on stderr. Own result validation must cover `isError` application results; SDK-owned input rejection has a different boundary.
 
 Spawn children with Bun `--no-env-file` before the entrypoint and an allowlisted synthetic environment. MCP server children also use a private HOME and the guarded fetch preload; other fixtures must install a guard before constructing an HTTP transport. Register handles/SDK cleanup before startup serialization, reads or writes. Release all fences/locks, settle calls and receivers, attempt cleanup for every child with allSettled, kill only owned children (SIGKILL for stopped children), reap and close streams/databases/listeners before removing owned temporary roots. Preserve fixtures and fail on cleanup/receiver errors. No arbitrary sleeps for synchronization, live operator state, shared environment-file reads or network probes.
 

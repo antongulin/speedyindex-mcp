@@ -6,6 +6,7 @@ import { registerListTasks } from './tools/list-tasks';
 import { registerGetTaskStatus } from './tools/get-task-status';
 import { registerGetTaskReport } from './tools/get-task-report';
 import { registerCreateIndexingTask } from './tools/create-indexing-task';
+import { registerCreateIndexCheck } from './tools/create-index-check';
 import { SubmissionHost } from './submission-host';
 
 export function createServer(
@@ -18,5 +19,6 @@ export function createServer(
   registerGetTaskStatus(server, client);
   registerGetTaskReport(server, client);
   registerCreateIndexingTask(server, submissionHost);
+  registerCreateIndexCheck(server, submissionHost);
   return server;
 }
