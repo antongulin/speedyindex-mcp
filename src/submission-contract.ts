@@ -81,6 +81,19 @@ export const submissionUnitVectorSchema = z.strictObject({
   checker: safeNonnegativeInteger,
 });
 export type SubmissionUnitVector = z.infer<typeof submissionUnitVectorSchema>;
+
+export type IndexCheckEngine = 'google' | 'yandex' | 'bing';
+export type IndexCheckReservationProfiles = Readonly<
+  Partial<Record<IndexCheckEngine, Readonly<SubmissionUnitVector> | undefined>>
+>;
+export type IndexCheckReservationSource =
+  | { readonly state: 'unconfigured' }
+  | { readonly state: 'invalid' }
+  | {
+      readonly state: 'loaded';
+      readonly profiles?: IndexCheckReservationProfiles;
+    };
+
 export const submissionErrorCodeSchema = z.enum([
   'InvalidInput',
   'InternalError',

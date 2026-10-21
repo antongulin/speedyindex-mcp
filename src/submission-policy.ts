@@ -11,6 +11,10 @@ import {
 } from 'node:fs';
 import { posix } from 'node:path';
 import { z } from 'zod';
+import type {
+  IndexCheckReservationProfiles,
+  IndexCheckReservationSource,
+} from './submission-contract';
 import {
   CreateIndexingTaskError,
   createIndexingTaskError,
@@ -26,6 +30,13 @@ const dayMs = 86_400_000;
 const digestPattern = /^[0-9a-f]{64}$/;
 const visibleLabel = z.string().regex(/^[\x21-\x7e]{1,128}$/);
 
+// Dated local admission floors, not a provider fee or wallet-spend guarantee.
+const indexCheckReservationsSchema = z.strictObject({
+  google: indexingUnitVectorSchema.refine((v) => v.tokens >= 3).optional(),
+  yandex: indexingUnitVectorSchema.refine((v) => v.tokens >= 2).optional(),
+  bing: indexingUnitVectorSchema.refine((v) => v.tokens >= 2).optional(),
+});
+
 export const submissionPolicySchema = z.strictObject({
   version: z.literal(1),
   enabled: z.boolean(),
@@ -35,11 +46,16 @@ export const submissionPolicySchema = z.strictObject({
   credentialFingerprint: z.string().regex(digestPattern),
   period: z.strictObject({ kind: z.literal('utc_day') }),
   caps: indexingUnitVectorSchema,
+  allowIndexChecks: z.boolean().optional(),
+  indexCheckReservations: indexCheckReservationsSchema.optional(),
 });
 export type SubmissionPolicy = z.infer<typeof submissionPolicySchema>;
-type FrozenPolicy = Readonly<Omit<SubmissionPolicy, 'caps' | 'period'>> & {
+type FrozenPolicy = Readonly<
+  Omit<SubmissionPolicy, 'caps' | 'period' | 'indexCheckReservations'>
+> & {
   readonly caps: Readonly<IndexingUnitVector>;
   readonly period: Readonly<SubmissionPolicy['period']>;
+  readonly indexCheckReservations?: IndexCheckReservationProfiles | undefined;
 };
 export interface LoadedSubmissionPolicy {
   readonly policy: FrozenPolicy;
@@ -195,6 +211,32 @@ export function loadSubmissionPolicy(path: unknown): LoadedSubmissionPolicy {
         indexer: value.caps.indexer,
         checker: value.caps.checker,
       }),
+      ...(value.allowIndexChecks === undefined
+        ? {}
+        : { allowIndexChecks: value.allowIndexChecks }),
+      ...(value.indexCheckReservations === undefined
+        ? {}
+        : {
+            indexCheckReservations: Object.freeze(
+              Object.fromEntries(
+                (['google', 'yandex', 'bing'] as const).flatMap((engine) => {
+                  const vector = value.indexCheckReservations![engine];
+                  return vector === undefined
+                    ? []
+                    : [
+                        [
+                          engine,
+                          Object.freeze({
+                            tokens: vector.tokens,
+                            indexer: vector.indexer,
+                            checker: vector.checker,
+                          }),
+                        ],
+                      ];
+                }),
+              ),
+            ),
+          }),
     });
     return Object.freeze({
       policy,
@@ -233,12 +275,14 @@ type InactiveState =
 interface InactiveConfiguration {
   readonly state: InactiveState;
   readonly error: Readonly<ReturnType<typeof createIndexingTaskError>>;
+  readonly indexCheckReservationSource: IndexCheckReservationSource;
 }
 export interface ConfiguredSubmission {
   readonly state: 'configured';
   readonly snapshot: LoadedSubmissionPolicy;
   readonly credential: Readonly<{ effectiveKey: string; fingerprint: string }>;
   readonly stateDirectory: string;
+  readonly indexCheckReservationSource: IndexCheckReservationSource;
 }
 export type SubmissionConfiguration =
   InactiveConfiguration | ConfiguredSubmission;
@@ -251,10 +295,12 @@ export interface SubmissionConfigurationOptions {
 function inactive(
   state: InactiveState,
   code: CreateIndexingTaskErrorCode,
+  indexCheckReservationSource: IndexCheckReservationSource,
 ): InactiveConfiguration {
   return Object.freeze({
     state,
     error: Object.freeze(createIndexingTaskError(code)),
+    indexCheckReservationSource,
   });
 }
 
@@ -263,33 +309,47 @@ function inactive(
 export function loadSubmissionConfiguration(
   options: SubmissionConfigurationOptions = {},
 ): SubmissionConfiguration {
+  let snapshot: LoadedSubmissionPolicy | undefined;
+  let source: IndexCheckReservationSource = Object.freeze({
+    state: 'unconfigured',
+  });
+  if (options.policyPath !== undefined) {
+    try {
+      snapshot = loadSubmissionPolicy(options.policyPath);
+      source = Object.freeze({
+        state: 'loaded',
+        ...(snapshot.policy.indexCheckReservations === undefined
+          ? {}
+          : { profiles: snapshot.policy.indexCheckReservations }),
+      });
+    } catch {
+      source = Object.freeze({ state: 'invalid' });
+    }
+  }
   if (options.policyPath === undefined && options.stateDirectory === undefined)
-    return inactive('unconfigured', 'WritesDisabled');
+    return inactive('unconfigured', 'WritesDisabled', source);
   if (
     !canonicalPath(options.policyPath) ||
     !canonicalPath(options.stateDirectory)
   )
-    return inactive('invalid', 'InvalidPolicy');
-  let snapshot: LoadedSubmissionPolicy;
-  try {
-    snapshot = loadSubmissionPolicy(options.policyPath);
-  } catch {
-    return inactive('invalid', 'InvalidPolicy');
-  }
-  if (!snapshot.policy.enabled) return inactive('disabled', 'WritesDisabled');
+    return inactive('invalid', 'InvalidPolicy', source);
+  if (!snapshot) return inactive('invalid', 'InvalidPolicy', source);
+  if (!snapshot.policy.enabled)
+    return inactive('disabled', 'WritesDisabled', source);
   let credential: ConfiguredSubmission['credential'];
   try {
     credential = normalizeCredential(options.apiKey);
   } catch {
-    return inactive('credential_missing', 'MissingCredentials');
+    return inactive('credential_missing', 'MissingCredentials', source);
   }
   if (credential.fingerprint !== snapshot.policy.credentialFingerprint)
-    return inactive('credential_mismatch', 'CredentialMismatch');
+    return inactive('credential_mismatch', 'CredentialMismatch', source);
   return Object.freeze({
     state: 'configured',
     snapshot,
     credential,
     stateDirectory: options.stateDirectory,
+    indexCheckReservationSource: source,
   });
 }
 
