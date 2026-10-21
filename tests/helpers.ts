@@ -581,8 +581,12 @@ function integrationRows(state: string, tables: readonly string[]) {
             : `"${column.name}"`,
         )
         .join(',');
+      const order =
+        table === 'intent_context'
+          ? 'credential_fp COLLATE BINARY, request_id COLLATE BINARY'
+          : 'rowid';
       return db
-        .query(`SELECT ${projection} FROM ${table} ORDER BY rowid`)
+        .query(`SELECT ${projection} FROM ${table} ORDER BY ${order}`)
         .all();
     });
   } finally {
