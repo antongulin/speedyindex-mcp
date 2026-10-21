@@ -17,6 +17,12 @@ import { join, resolve } from 'node:path';
 import { Database, constants, SQLiteError } from 'bun:sqlite';
 import { expect, test } from 'bun:test';
 import {
+  composeVerifiedRetryAdmission,
+  computeRetryPlanFingerprint,
+  type RetryProof,
+  type RetrySelection,
+  type RetryCollection,
+  type RetryPlanFingerprintInput,
   initializeLedger,
   initializeLedgerV2,
   migrateLedgerV2,
@@ -44,6 +50,15 @@ import {
   type AvailableRetrySnapshot,
   type SnapshotReadHooks,
 } from '../src/retry-ledger-snapshot';
+
+import {
+  fixtureRetryConfiguration,
+  fixtureRetryEvidence,
+  fixtureRetryVerifier,
+  retryFixtureUtc,
+  retryFixtureBinding,
+} from './fixtures/retry-verifier';
+import type { SubmissionPolicy } from '../src/submission-policy';
 
 const binding = 'a'.repeat(64);
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -4117,6 +4132,8 @@ test('V2-08 asynchronous trusted phase result is rejected and rolled back withou
 
 interface RetryProcessSetup {
   role:
+    | 'verified'
+    | 'verified_lock_wait'
     | 'retry'
     | 'ordinary'
     | 'claim'
@@ -4129,10 +4146,17 @@ interface RetryProcessSetup {
   ordinaryIntent?: PrepareIntentInput;
   capability?: DispatchCapability;
   pauseAt?: RetryLedgerPhase;
+  verifiedUrls?: string[];
+  clockAfterWait?: 'expiry' | 'utc';
 }
 interface RetryProcessMessage {
   event: 'ready' | 'phase' | 'result';
-  phase?: RetryLedgerPhase | 'claim_committed' | 'locked';
+  phase?:
+    | RetryLedgerPhase
+    | 'claim_committed'
+    | 'locked'
+    | 'lock_waited'
+    | 'prepare_attempt';
   kind?:
     | 'created'
     | 'replay'
@@ -4195,7 +4219,7 @@ async function retryProcessDeadline<T>(promise: Promise<T>): Promise<T> {
 }
 async function retryControl(
   child: OwnedRetryProcess,
-  command: 'GO' | 'RECORD',
+  command: 'GO' | 'RECORD' | 'RETRY',
   end = true,
 ) {
   await retryProcessDeadline(
@@ -4280,6 +4304,8 @@ async function startRetryProcess(
                 'after_accepted_commit',
                 'claim_committed',
                 'locked',
+                'lock_waited',
+                'prepare_attempt',
               ].includes(message.phase)) ||
             (message.kind !== undefined &&
               ![
@@ -4293,6 +4319,11 @@ async function startRetryProcess(
               ].includes(message.kind)) ||
             (message.code !== undefined &&
               ![
+                'RetryProofInvalid',
+                'RetryProofExpired',
+                'RetryPermissionDenied',
+                'RetryObservationInvalid',
+                'RetryCancelled',
                 'SnapshotConflict',
                 'SnapshotUnavailable',
                 'SnapshotLimitExceeded',
@@ -5577,4 +5608,1374 @@ test('P0-03 trusted inspection rejects mismatched binding, invalid attempt allow
         readRetryReplay({ stateDirectory: state }, otherBinding, identity),
       ).toEqual({ availability: 'unavailable', reason: 'InvalidState' });
     });
+  }));
+
+// P0-B2 fixtures exercise the same enclosed boundary required of the future P1 verifier.
+const externalParent = {
+  family: 'google/indexer' as const,
+  taskId: ' External-é ',
+};
+function verifiedFixture(
+  f: ReturnType<typeof fixture>,
+  policy: Partial<SubmissionPolicy> = {},
+  evidence = fixtureRetryEvidence(),
+  hooks: RetryPrepareHooks = {},
+) {
+  const state = join(f.root, 'verified-state');
+  const ordinary = f.init(state);
+  const configuration = fixtureRetryConfiguration(
+    join(f.root, 'verified-policy.json'),
+    state,
+    policy,
+  );
+  const clock = {
+    utc: retryFixtureUtc,
+    mono: 100,
+    utcMs() {
+      return this.utc;
+    },
+    monotonicMs() {
+      return this.mono;
+    },
+  };
+  const verifier = fixtureRetryVerifier(evidence);
+  const composition = composeVerifiedRetryAdmission({
+    configuration,
+    verifier,
+    clock,
+    hooks,
+  });
+  const selection: RetrySelection = {
+    requestId: 'verified-child',
+    parent: externalParent,
+  };
+  return {
+    state,
+    ordinary,
+    configuration,
+    clock,
+    verifier,
+    composition,
+    selection,
+    evidence,
+    db: f.raw(state),
+  };
+}
+function candidate(result: RetryCollection) {
+  expect(result.kind).toBe('candidate');
+  if (result.kind !== 'candidate')
+    throw new Error('Expected synthetic retry candidate: ' + result.code);
+  return result;
+}
+function seedVerifiedParent(
+  ledger: SubmissionLedger,
+  state = 'accepted' as const,
+  providerId = externalParent.taskId,
+  urls: readonly string[] = fixtureRetryEvidence().reports[0].indexedUrls.concat(
+    fixtureRetryEvidence().reports[0].unindexedUrls,
+  ),
+  id = 'local-parent',
+) {
+  seedSnapshotState(
+    ledger,
+    {
+      ...input(id),
+      budget: {
+        ...input(id).budget,
+        credentialFingerprint: retryFixtureBinding,
+        budgetScope: 'parent-scope',
+      },
+      submittedUrls: urls,
+    },
+    state,
+    providerId,
+  );
+}
+function verifiedWriter(
+  f: ReturnType<typeof fixture>,
+  h: ReturnType<typeof verifiedFixture>,
+) {
+  return f.track(h.composition.open());
+}
+function verifiedLogical(db: Database) {
+  return snapshot(db);
+}
+
+test('P0-02 genuine external admission inserts only actual child/core/URLs/event/reservation and provider-domain manifest', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const before = verifiedLogical(h.db);
+    const c = candidate(await h.composition.collect(h.selection));
+    const urls = [
+      ...h.evidence.reports[1].indexedUrls,
+      ...h.evidence.reports[1].unindexedUrls,
+    ];
+    expect(c.input.sourceManifestDigest).toBe(
+      hash(
+        'speedyindex-provider-report-url-manifest-v1\0' +
+          JSON.stringify([externalParent.family, externalParent.taskId, urls]),
+      ),
+    );
+    expect(c.request.body).toBe(
+      JSON.stringify({
+        urls: h.evidence.eligibleUrls,
+        pay_per_indexed: true,
+        drip_feed: false,
+      }),
+    );
+    expect(c.request.request.payloadDigest).toBe(hash(c.request.body));
+    expect(c.input.intent.reservation).toEqual({
+      tokens: 200,
+      indexer: 0,
+      checker: 0,
+    });
+    expect(verifiedLogical(h.db)).toEqual(before);
+    const writer = verifiedWriter(f, h);
+    const created = writer.prepareVerifiedRetryIntent(c.input, c.proof);
+    expect(created.kind).toBe('created');
+    if (created.kind !== 'created') throw new Error('Missing creator.');
+    const after = verifiedLogical(h.db);
+    expect(after.schema).toEqual(before.schema);
+    expect(after.meta).toEqual(before.meta);
+    expect(after.intents).toHaveLength(1);
+    expect(after.contexts).toEqual([
+      {
+        credential_fp: retryFixtureBinding,
+        request_id: 'verified-child',
+        origin_kind: 'retry',
+        parent_family: externalParent.family,
+        parent_task_id: externalParent.taskId,
+        source_manifest_digest: c.input.sourceManifestDigest,
+        plan_fingerprint: c.input.planFingerprint,
+      },
+    ]);
+    const row = after.intents[0] as Record<string, unknown>;
+    expect(row).toMatchObject({
+      credential_fp: retryFixtureBinding,
+      request_id: 'verified-child',
+      budget_scope: 'fixture-retry',
+      period_id: 'utc-day:2026-10-21',
+      policy_revision: 'fixture-retry',
+      policy_digest: h.configuration.snapshot.digest,
+      task_family: 'google/indexer',
+      provider_route: '/v2/task/google/indexer/create',
+      payload_digest: hash(c.request.body),
+      quote_version: c.request.quote.version,
+      quote_fingerprint: c.request.quote.fingerprint,
+      reserved_tokens: 200,
+      reserved_indexer: 0,
+      reserved_checker: 0,
+      state: 'prepared',
+      state_version: 0,
+      dispatch_outcome_token_digest: null,
+      created_at_ms: retryFixtureUtc,
+      provider_task_id: null,
+      provider_type: null,
+    });
+    expect(row.claim_token_digest).toBe(hash(created.dispatchCapability));
+    expect(after.urls).toEqual(
+      h.evidence.eligibleUrls.map((url, ordinal) => ({
+        credential_fp: retryFixtureBinding,
+        request_id: 'verified-child',
+        ordinal,
+        url_text: url,
+      })),
+    );
+    expect(after.events).toEqual([
+      {
+        event_id: 1,
+        credential_fp: retryFixtureBinding,
+        request_id: 'verified-child',
+        state_version: 0,
+        event_kind: 'prepared',
+        occurred_at_ms: retryFixtureUtc,
+        provider_task_id: null,
+        provider_type: null,
+      },
+    ]);
+    expect(after.periods).toEqual([
+      {
+        credential_fp: retryFixtureBinding,
+        budget_scope: 'fixture-retry',
+        period_id: 'utc-day:2026-10-21',
+        period_start_ms: Date.parse('2026-10-21T00:00:00Z'),
+        first_seen_at_ms: retryFixtureUtc,
+      },
+    ]);
+    expect(after.sequence).toEqual([{ name: 'intent_events', seq: 1 }]);
+    const replay = writer.prepareVerifiedRetryIntent(c.input);
+    expect(replay.kind).toBe('replay');
+    expect('dispatchCapability' in replay).toBe(false);
+    expect(verifiedLogical(h.db)).toEqual(after);
+  }));
+
+for (const variant of ['absent', 'disabled', 'adoption-false'] as const)
+  test(
+    'P0-02 permission ' + variant + ' blocks new external work without writes',
+    () =>
+      retryProcessCase(async (f) => {
+        const h = verifiedFixture(f, {
+          retry:
+            variant === 'absent'
+              ? undefined
+              : {
+                  enabled: variant !== 'disabled',
+                  allowUnattributedParents: variant !== 'adoption-false',
+                  maxAttemptsPerSource: 3,
+                },
+        });
+        const before = verifiedLogical(h.db);
+        expect(await h.composition.collect(h.selection)).toEqual({
+          kind: 'blocked',
+          code: 'RetryPermissionDenied',
+        });
+        const writer = verifiedWriter(f, h);
+        const value: PrepareRetryIntentInput = {
+          intent: {
+            ...input(),
+            budget: {
+              ...input().budget,
+              credentialFingerprint: retryFixtureBinding,
+            },
+          },
+          parent: externalParent,
+          sourceManifestDigest: hash('source'),
+          planFingerprint: hash('plan'),
+          expectedRevision: hash('revision'),
+        };
+        expectRetryError(
+          () => writer.prepareVerifiedRetryIntent(value),
+          'RetryProofInvalid',
+        );
+        expect(verifiedLogical(h.db)).toEqual(before);
+      }),
+  );
+
+for (const legacy of [false, true])
+  test(
+    'P0-02 ' +
+      (legacy ? 'legacy' : 'standalone') +
+      ' exact local manifest succeeds; source omissions and own children cannot become external',
+    () =>
+      retryProcessCase(async (f) => {
+        const h = verifiedFixture(f);
+        seedVerifiedParent(h.ordinary);
+        if (legacy)
+          h.db.run(
+            "UPDATE intent_context SET origin_kind='legacy_unattributed'",
+          );
+        const c = candidate(await h.composition.collect(h.selection));
+        expect(c.input.sourceManifestDigest).toBe(
+          hash(
+            'speedyindex-intent-url-manifest-v1\0' +
+              JSON.stringify([
+                externalParent.family,
+                [
+                  ...h.evidence.reports[0].indexedUrls,
+                  ...h.evidence.reports[0].unindexedUrls,
+                ],
+              ]),
+          ),
+        );
+        const writer = verifiedWriter(f, h);
+        const created = writer.prepareVerifiedRetryIntent(c.input, c.proof);
+        expect(created.kind).toBe('created');
+        if (created.kind !== 'created') throw new Error('Missing creator.');
+        const claim = writer.claimDispatch(created.dispatchCapability, 0);
+        if (claim.kind !== 'claimed') throw new Error('Missing claim.');
+        writer.recordDispatchOutcome({
+          credentialFingerprint: retryFixtureBinding,
+          requestId: c.input.intent.requestId,
+          expectedStateVersion: 1,
+          outcomeToken: claim.outcomeToken,
+          outcome: {
+            kind: 'accepted',
+            providerType: externalParent.family,
+            providerTaskId: 'own-child',
+          },
+        });
+        writer.close();
+        expect(
+          await h.composition.collect({
+            ...h.selection,
+            requestId: 'own-as-parent',
+            parent: { ...externalParent, taskId: 'own-child' },
+          }),
+        ).toEqual({ kind: 'blocked', code: 'RetryLineageConflict' });
+      }),
+  );
+
+test('P0-02 ambiguity, legacy permission and omitted local source fail closed without external fallback', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    seedVerifiedParent(h.ordinary);
+    seedVerifiedParent(
+      h.ordinary,
+      'accepted',
+      'other-ref',
+      undefined,
+      'second-parent',
+    );
+    h.db
+      .query('UPDATE intents SET provider_task_id=? WHERE request_id=?')
+      .run(externalParent.taskId, 'second-parent');
+    h.db
+      .query(
+        "UPDATE intent_events SET provider_task_id=? WHERE request_id=? AND event_kind='accepted'",
+      )
+      .run(externalParent.taskId, 'second-parent');
+    expect(await h.composition.collect(h.selection)).toEqual({
+      kind: 'blocked',
+      code: 'RetryLineageConflict',
+    });
+    h.db
+      .query('UPDATE intents SET provider_task_id=? WHERE request_id=?')
+      .run('other-ref', 'second-parent');
+    h.db
+      .query(
+        "UPDATE intent_events SET provider_task_id=? WHERE request_id=? AND event_kind='accepted'",
+      )
+      .run('other-ref', 'second-parent');
+    h.evidence.reports[0].unindexedUrls.pop();
+    h.evidence.reports[1].unindexedUrls.pop();
+    h.evidence.reports[0].size--;
+    h.evidence.reports[1].size--;
+    h.evidence.reports[0].processedCount--;
+    h.evidence.reports[1].processedCount--;
+    h.evidence.eligibleUrls.pop();
+    expect(await h.composition.collect(h.selection)).toEqual({
+      kind: 'blocked',
+      code: 'RetryLineageConflict',
+    });
+    h.db.run("UPDATE intent_context SET origin_kind='legacy_unattributed'");
+    const deny = composeVerifiedRetryAdmission({
+      configuration: fixtureRetryConfiguration(
+        join(f.root, 'deny.json'),
+        h.state,
+        {
+          retry: {
+            enabled: true,
+            allowUnattributedParents: false,
+            maxAttemptsPerSource: 3,
+          },
+        },
+      ),
+      verifier: fixtureRetryVerifier(fixtureRetryEvidence()),
+      clock: h.clock,
+    });
+    expect(await deny.collect(h.selection)).toEqual({
+      kind: 'blocked',
+      code: 'RetryPermissionDenied',
+    });
+  }));
+
+for (const variant of [
+  'forged',
+  'clone',
+  'serialized',
+  'foreign-composition',
+  'input-request',
+  'input-parent',
+  'input-family',
+  'input-manifest',
+  'input-plan',
+  'input-revision',
+  'input-binding',
+  'input-policy',
+  'input-scope',
+  'input-caps',
+  'input-payload',
+  'input-quote',
+  'input-reservation',
+  'input-subset',
+  'input-order',
+  'input-period',
+  'expired',
+  'regressed',
+] as const)
+  test('P0-02 proof ' + variant + ' is rejected and never restored', () =>
+    retryProcessCase(async (f) => {
+      const h = verifiedFixture(f);
+      const c = candidate(await h.composition.collect(h.selection));
+      let proof = c.proof;
+      const value = structuredClone(c.input);
+      if (variant === 'forged') proof = Object.freeze({}) as RetryProof;
+      if (variant === 'clone') proof = structuredClone(c.proof);
+      if (variant === 'serialized')
+        proof = JSON.parse(JSON.stringify(c.proof)) as RetryProof;
+      if (variant === 'foreign-composition') {
+        const other = composeVerifiedRetryAdmission({
+          configuration: h.configuration,
+          verifier: h.verifier,
+          clock: h.clock,
+        });
+        proof = candidate(await other.collect(h.selection)).proof;
+      }
+      if (variant === 'input-request') value.intent.requestId = 'changed';
+      if (variant === 'input-parent') value.parent.taskId = 'changed';
+      if (variant === 'input-family') {
+        value.parent.family = 'yandex/indexer';
+        value.intent.taskFamily = 'yandex/indexer';
+        value.intent.providerRoute = '/v2/task/yandex/indexer/create';
+      }
+      if (variant === 'input-manifest')
+        value.sourceManifestDigest = hash('changed');
+      if (variant === 'input-plan') value.planFingerprint = hash('changed');
+      if (variant === 'input-revision')
+        value.expectedRevision = hash('changed');
+      if (variant === 'input-binding')
+        value.intent.budget.credentialFingerprint = 'b'.repeat(64);
+      if (variant === 'input-policy')
+        value.intent.budget.policyDigest = hash('changed');
+      if (variant === 'input-scope')
+        value.intent.budget.budgetScope = 'changed';
+      if (variant === 'input-caps')
+        value.intent.budget.caps = { tokens: 1, indexer: 0, checker: 0 };
+      if (variant === 'input-payload')
+        value.intent.payloadDigest = hash('changed');
+      if (variant === 'input-quote')
+        value.intent.quoteFingerprint = hash('changed');
+      if (variant === 'input-reservation')
+        value.intent.reservation = { tokens: 1, indexer: 0, checker: 0 };
+      if (variant === 'input-subset')
+        value.intent.submittedUrls = ['https://example.test/outside'];
+      if (variant === 'input-order')
+        value.intent.submittedUrls = [...value.intent.submittedUrls].reverse();
+      if (variant === 'input-period') value.intent.budget.periodId = 'changed';
+      if (variant === 'expired') h.clock.mono += 60000;
+      if (variant === 'regressed') h.clock.mono--;
+      const writer = verifiedWriter(f, h);
+      const before = verifiedLogical(h.db);
+      if (variant === 'input-binding')
+        expectLedgerError(
+          () => writer.prepareVerifiedRetryIntent(value, proof),
+          'InvalidLedgerInput',
+        );
+      else
+        expectRetryError(
+          () => writer.prepareVerifiedRetryIntent(value, proof),
+          variant === 'expired' || variant === 'regressed'
+            ? 'RetryProofExpired'
+            : 'RetryProofInvalid',
+        );
+      expect(verifiedLogical(h.db)).toEqual(before);
+      if (variant.startsWith('input-') && variant !== 'input-binding')
+        expectRetryError(
+          () => writer.prepareVerifiedRetryIntent(c.input, c.proof),
+          'RetryProofInvalid',
+        );
+    }),
+  );
+
+test('P0-02 captured configuration/verifier/clocks and copied frozen observations resist later mutation; consumed proof grants no second ownership', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const c = candidate(await h.composition.collect(h.selection));
+    const inputBefore = structuredClone(c.input);
+    const body = c.request.body;
+    h.evidence.eligibleUrls[0] = 'https://example.test/changed';
+    h.evidence.reports[1].unindexedUrls.splice(0);
+    h.evidence.safetyEvidenceDigests[0] = hash('changed');
+    h.verifier.collectAndVerify = async () => {
+      throw new Error('SENTINEL-key-path');
+    };
+    h.clock.utcMs = () => {
+      throw new Error('SENTINEL-clock');
+    };
+    h.clock.monotonicMs = () => 0;
+    expect(Object.isFrozen(c.input.intent.budget.caps)).toBe(true);
+    expect(Object.isFrozen(c.input.intent.submittedUrls)).toBe(true);
+    expect(c.input).toEqual(inputBefore);
+    expect(c.request.body).toBe(body);
+    const writer = verifiedWriter(f, h);
+    expect(writer.prepareVerifiedRetryIntent(c.input, c.proof).kind).toBe(
+      'created',
+    );
+    const after = verifiedLogical(h.db);
+    const replay = writer.prepareVerifiedRetryIntent(c.input, c.proof);
+    expect(replay.kind).toBe('replay');
+    expect('dispatchCapability' in replay).toBe(false);
+    expect(verifiedLogical(h.db)).toEqual(after);
+  }));
+
+for (const variant of [
+  'absent',
+  'disabled',
+  'adoption-false',
+  'reduced',
+] as const)
+  test(
+    'P0-02 R1 replay precedes current ' +
+      variant +
+      ' policy, missing/expired proof and clocks',
+    () =>
+      retryProcessCase(async (f) => {
+        const h = verifiedFixture(f);
+        const c = candidate(await h.composition.collect(h.selection));
+        const writer = verifiedWriter(f, h);
+        expect(writer.prepareVerifiedRetryIntent(c.input, c.proof).kind).toBe(
+          'created',
+        );
+        writer.close();
+        h.clock.mono += 60000;
+        const configuration = fixtureRetryConfiguration(
+          join(f.root, 'changed.json'),
+          h.state,
+          {
+            policyRevision: 'current-different',
+            retry:
+              variant === 'absent'
+                ? undefined
+                : {
+                    enabled: variant !== 'disabled',
+                    allowUnattributedParents: variant !== 'adoption-false',
+                    maxAttemptsPerSource: 1,
+                  },
+          },
+        );
+        const clock = {
+          utcMs() {
+            throw new Error('Replay must not use clock.');
+          },
+          monotonicMs() {
+            throw new Error('Replay must not use clock.');
+          },
+        };
+        const composition = composeVerifiedRetryAdmission({
+          configuration,
+          verifier: h.verifier,
+          clock,
+        });
+        const current = f.track(composition.open());
+        const before = verifiedLogical(h.db);
+        for (const proof of [undefined, c.proof]) {
+          const replay = current.prepareVerifiedRetryIntent(c.input, proof);
+          expect(replay.kind).toBe('replay');
+          expect('dispatchCapability' in replay).toBe(false);
+          expect(verifiedLogical(h.db)).toEqual(before);
+        }
+      }),
+  );
+
+test('P0-02 R2 collect/writer mutually exclude in both directions at arrival/release barrier; recover throw/cancel/open error', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    let release!: () => void;
+    let arrive!: () => void;
+    const arrived = new Promise<void>((r) => (arrive = r));
+    const released = new Promise<void>((r) => (release = r));
+    let mode: 'hold' | 'throw' | 'ok' = 'hold';
+    const verifier = {
+      async collectAndVerify() {
+        if (mode === 'throw') throw new Error('SENTINEL-key-path-reflected');
+        if (mode === 'hold') {
+          arrive();
+          await released;
+        }
+        return h.evidence;
+      },
+    };
+    const composition = composeVerifiedRetryAdmission({
+      configuration: h.configuration,
+      verifier,
+      clock: h.clock,
+    });
+    const abort = new AbortController();
+    const pending = composition.collect(h.selection, abort.signal);
+    void pending.catch(() => {});
+    try {
+      await retryProcessDeadline(arrived);
+      expectLedgerError(() => composition.open(), 'LedgerBusy');
+      expect(await composition.collect(h.selection)).toEqual({
+        kind: 'blocked',
+        code: 'LedgerBusy',
+      });
+      abort.abort();
+    } finally {
+      release();
+    }
+    expect(await pending).toEqual({ kind: 'blocked', code: 'RetryCancelled' });
+    mode = 'throw';
+    expect(await composition.collect(h.selection)).toEqual({
+      kind: 'blocked',
+      code: 'RetryObservationInvalid',
+    });
+    mode = 'ok';
+    const c = candidate(await composition.collect(h.selection));
+    const writer = f.track(composition.open());
+    expectLedgerError(() => composition.open(), 'LedgerBusy');
+    expect(await composition.collect(h.selection)).toEqual({
+      kind: 'blocked',
+      code: 'LedgerBusy',
+    });
+    writer.close();
+    candidate(await composition.collect(h.selection));
+    const pre = new AbortController();
+    pre.abort();
+    expect(await composition.collect(h.selection, pre.signal)).toEqual({
+      kind: 'blocked',
+      code: 'RetryCancelled',
+    });
+    candidate(await composition.collect(h.selection));
+    expect(c.request.input.dripFeedDays).toBeUndefined();
+    const missing = join(f.root, 'missing');
+    const config = fixtureRetryConfiguration(
+      join(f.root, 'missing.json'),
+      missing,
+    );
+    const recover = composeVerifiedRetryAdmission({
+      configuration: config,
+      verifier,
+      clock: h.clock,
+    });
+    expectUnavailable(() => recover.open());
+    f.init(missing);
+    const recovered = f.track(recover.open());
+    recovered.close();
+  }));
+
+const reportInvalidVariants = [
+  'category-order',
+  'membership',
+  'conflict',
+  'size',
+  'processed',
+  'omission',
+  'unsafe-url',
+  'eligible-indexed',
+  'eligible-order',
+  'duplicate-proposal',
+  'raw-limit',
+  'proposal-limit',
+  'empty-digests',
+  'digest-limit',
+  'digest-prefix',
+  'partition-prefix',
+  'body-limit',
+  'semantic-limit',
+] as const;
+for (const variant of reportInvalidVariants)
+  test(
+    'P0-02 report ' +
+      variant +
+      ' is bounded and rejected without authority or writes',
+    () =>
+      retryProcessCase(async (f) => {
+        const h = verifiedFixture(f);
+        const e = h.evidence;
+        if (variant === 'category-order') e.reports[1].unindexedUrls.reverse();
+        if (variant === 'membership')
+          e.reports[1].unindexedUrls[0] = 'https://example.test/other';
+        if (variant === 'conflict')
+          for (const r of e.reports) r.unindexedUrls[0] = r.indexedUrls[0]!;
+        if (variant === 'size') for (const r of e.reports) r.size++;
+        if (variant === 'processed')
+          for (const r of e.reports) r.processedCount--;
+        if (variant === 'omission')
+          for (const r of e.reports) r.unindexedUrls.pop();
+        if (variant === 'unsafe-url')
+          for (const r of e.reports)
+            r.unindexedUrls[0] = 'https://user:pass@example.test/';
+        if (variant === 'eligible-indexed')
+          e.eligibleUrls = [e.reports[0].indexedUrls[0]!];
+        if (variant === 'eligible-order') e.eligibleUrls.reverse();
+        if (variant === 'duplicate-proposal')
+          e.eligibleUrls.push(e.eligibleUrls[0]!);
+        if (variant === 'raw-limit')
+          for (const r of e.reports)
+            r.indexedUrls = Array(10001).fill(r.indexedUrls[0]);
+        if (variant === 'proposal-limit')
+          e.eligibleUrls = Array(10001).fill('https://example.test/proposal');
+        if (variant === 'empty-digests') e.safetyEvidenceDigests = [];
+        if (variant === 'digest-limit')
+          e.safetyEvidenceDigests = Array(65).fill(hash('one'));
+        if (variant === 'digest-prefix')
+          e.safetyEvidenceDigests = [hash('one') + 'extra'];
+        if (variant === 'partition-prefix')
+          e.partitionDigest = hash('one') + 'extra';
+        if (variant === 'body-limit' || variant === 'semantic-limit') {
+          const length = variant === 'body-limit' ? 2150 : 3000;
+          const width = variant === 'body-limit' ? 1000 : 1500;
+          const urls = Array.from(
+            { length },
+            (_, i) => 'https://example.test/' + i + 'x'.repeat(width),
+          );
+          for (const r of e.reports) {
+            r.indexedUrls = variant === 'semantic-limit' ? urls : [];
+            r.unindexedUrls =
+              variant === 'semantic-limit'
+                ? ['https://example.test/proposal']
+                : urls;
+            r.size = r.indexedUrls.length + r.unindexedUrls.length;
+            r.processedCount = r.size;
+          }
+          e.eligibleUrls =
+            variant === 'semantic-limit'
+              ? ['https://example.test/proposal']
+              : urls;
+        }
+        const before = verifiedLogical(h.db);
+        const result = await h.composition.collect(h.selection);
+        expect(result.kind).toBe('blocked');
+        expect(JSON.stringify(result)).not.toContain('SENTINEL');
+        expect(verifiedLogical(h.db)).toEqual(before);
+      }),
+  );
+
+test('P0-02 matching first-unique reports retain exact category order and proposal; constructor captures mutable trusted config', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    h.evidence.reports[0].indexedUrls.push(
+      h.evidence.reports[0].indexedUrls[0]!,
+    );
+    h.evidence.reports[1].unindexedUrls.push(
+      h.evidence.reports[1].unindexedUrls[0]!,
+    );
+    const configuration = structuredClone(h.configuration);
+    const composition = composeVerifiedRetryAdmission({
+      configuration,
+      verifier: h.verifier,
+      clock: h.clock,
+    });
+    (configuration.snapshot.policy.caps as { tokens: number }).tokens = 0;
+    (configuration.snapshot.policy.retry as { enabled: boolean }).enabled =
+      false;
+    const c = candidate(await composition.collect(h.selection));
+    expect(c.request.input.urls).toEqual(fixtureRetryEvidence().eligibleUrls);
+    const writer = f.track(composition.open());
+    expect(writer.prepareVerifiedRetryIntent(c.input, c.proof).kind).toBe(
+      'created',
+    );
+  }));
+
+test('P0-02 R3 pure fixed public tuple has an independent canonical oracle and excludes incidental metadata', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const a = candidate(await h.composition.collect(h.selection));
+    h.clock.mono += 100;
+    h.clock.utc += 100;
+    const b = candidate(
+      await h.composition.collect({
+        ...h.selection,
+        requestId: 'different-request',
+      }),
+    );
+    expect(a.input.planFingerprint).toBe(b.input.planFingerprint);
+    const value: RetryPlanFingerprintInput = {
+      parent: externalParent,
+      provenance: 'external_unattributed',
+      originalManifestKnown: false,
+      manifestProvenance: 'provider_report_observed_corpus',
+      sourceManifestDigest: a.input.sourceManifestDigest,
+      safetyEvidenceDigests: h.evidence.safetyEvidenceDigests,
+      partitionDigest: h.evidence.partitionDigest,
+      revision: a.input.expectedRevision,
+      policyDigest: a.input.intent.budget.policyDigest,
+      authorizationFingerprint: hash('public-authorization'),
+      payloadDigest: a.input.intent.payloadDigest,
+      quoteVersion: a.input.intent.quoteVersion,
+      quoteFingerprint: a.input.intent.quoteFingerprint,
+      period: {
+        id: a.input.intent.budget.periodId,
+        startMs: a.input.intent.budget.periodStartMs,
+        endMs: a.input.intent.budget.periodStartMs + 86400000,
+      },
+      providerRoute: a.input.intent.providerRoute,
+      urlCount: 2,
+      providerBodyBytes: a.request.request.providerBodyBytes,
+      reservation: a.input.intent.reservation,
+    };
+    const expected = hash(
+      'speedyindex-retry-plan-v1\0' +
+        JSON.stringify([
+          externalParent.family,
+          externalParent.taskId,
+          'external_unattributed',
+          false,
+          'provider_report_observed_corpus',
+          value.sourceManifestDigest,
+          value.safetyEvidenceDigests,
+          value.partitionDigest,
+          value.revision,
+          value.policyDigest,
+          value.authorizationFingerprint,
+          value.payloadDigest,
+          value.quoteVersion,
+          value.quoteFingerprint,
+          [value.period.id, value.period.startMs, value.period.endMs],
+          value.providerRoute,
+          value.urlCount,
+          value.providerBodyBytes,
+          [200, 0, 0],
+        ]),
+    );
+    expect(computeRetryPlanFingerprint(value)).toBe(expected);
+    const incidental = {
+      ...value,
+      requestId: 'unrelated',
+      observationTime: 999,
+      credentialFingerprint: 'private',
+      ledgerId: 'private',
+      stateDirectory: 'private',
+      owner: 'private',
+    };
+    expect(computeRetryPlanFingerprint(incidental)).toBe(expected);
+    for (const key of [
+      'sourceManifestDigest',
+      'partitionDigest',
+      'revision',
+      'policyDigest',
+      'authorizationFingerprint',
+      'payloadDigest',
+      'quoteFingerprint',
+    ] as const)
+      expect(
+        computeRetryPlanFingerprint({ ...value, [key]: hash(key) }),
+      ).not.toBe(expected);
+    expect(
+      computeRetryPlanFingerprint({
+        ...value,
+        safetyEvidenceDigests: [hash('changed')],
+      }),
+    ).not.toBe(expected);
+    expect(
+      computeRetryPlanFingerprint({
+        ...value,
+        provenance: 'legacy_unattributed',
+      }),
+    ).not.toBe(expected);
+    const writer = verifiedWriter(f, h);
+    expectRetryError(
+      () => writer.prepareVerifiedRetryIntent(b.input, a.proof),
+      'RetryProofInvalid',
+    );
+  }));
+
+for (const kind of ['expiry', 'utc'] as const)
+  test(
+    'P0-02 ' +
+      kind +
+      ' is rechecked immediately before insertion and consumes failed proof',
+    () =>
+      retryProcessCase(async (f) => {
+        const h = verifiedFixture(f);
+        let armed = false;
+        let calls = 0;
+        const clock = {
+          utcMs() {
+            return (
+              retryFixtureUtc +
+              (armed && kind === 'utc' && ++calls >= 4 ? 86400000 : 0)
+            );
+          },
+          monotonicMs() {
+            return armed && kind === 'expiry' && ++calls >= 3 ? 60100 : 100;
+          },
+        };
+        const composition = composeVerifiedRetryAdmission({
+          configuration: h.configuration,
+          verifier: h.verifier,
+          clock,
+        });
+        const c = candidate(await composition.collect(h.selection));
+        const writer = f.track(composition.open());
+        const before = verifiedLogical(h.db);
+        armed = true;
+        if (kind === 'expiry')
+          expectRetryError(
+            () => writer.prepareVerifiedRetryIntent(c.input, c.proof),
+            'RetryProofExpired',
+          );
+        else
+          expectLedgerError(
+            () => writer.prepareVerifiedRetryIntent(c.input, c.proof),
+            'StalePeriodContext',
+          );
+        expect(verifiedLogical(h.db)).toEqual(before);
+        armed = false;
+        expectRetryError(
+          () => writer.prepareVerifiedRetryIntent(c.input, c.proof),
+          'RetryProofInvalid',
+        );
+      }),
+  );
+
+for (const race of ['same-id', 'disjoint'] as const)
+  test(
+    'P0-04 independently composed owned process ' +
+      race +
+      ' admission race has one creator',
+    () =>
+      retryProcessCase(async (f, children) => {
+        const h = verifiedFixture(f);
+        const first = candidate(await h.composition.collect(h.selection));
+        const secondUrls = [
+          'https://example.test/disjoint-indexed',
+          'https://example.test/disjoint-a',
+          'https://example.test/disjoint-b',
+        ];
+        const a = await startRetryProcess(f, children, {
+          role: 'verified',
+          stateDirectory: h.state,
+          input: first.input,
+        });
+        const b = await startRetryProcess(f, children, {
+          role: 'verified',
+          stateDirectory: h.state,
+          input:
+            race === 'same-id'
+              ? first.input
+              : {
+                  ...first.input,
+                  intent: {
+                    ...first.input.intent,
+                    requestId: 'disjoint-child',
+                  },
+                },
+          ...(race === 'same-id' ? {} : { verifiedUrls: secondUrls }),
+        });
+        await Promise.all([retryControl(a, 'GO'), retryControl(b, 'GO')]);
+        const results = await Promise.all([
+          retryProcessResult(a),
+          retryProcessResult(b),
+        ]);
+        expect(results.filter((r) => r.kind === 'created')).toHaveLength(1);
+        if (race === 'same-id') {
+          expect(results.map((r) => r.kind).sort()).toEqual([
+            'created',
+            'replay',
+          ]);
+          expect(results.map((r) => r.capability).sort()).toEqual([
+            false,
+            true,
+          ]);
+        } else
+          expect(results.find((r) => r.kind === 'error')?.code).toBe(
+            'SnapshotConflict',
+          );
+        const after = verifiedLogical(h.db);
+        expect(after.intents).toHaveLength(1);
+        expect(after.contexts).toHaveLength(1);
+        expect(after.events).toHaveLength(1);
+        expect(after.urls).toHaveLength(2);
+        expect(
+          readRetrySnapshot({ stateDirectory: h.state }, retryFixtureBinding)
+            .availability,
+        ).toBe('available');
+      }),
+  );
+
+for (const kind of ['expiry', 'utc'] as const)
+  test(
+    'P0-04 real native SQL lock contention then ' +
+      kind +
+      ' refuses unchanged unconsumed proof after acquisition',
+    () =>
+      retryProcessCase(async (f, children) => {
+        const h = verifiedFixture(f);
+        const c = candidate(await h.composition.collect(h.selection));
+        const child = await startRetryProcess(f, children, {
+          role: 'verified_lock_wait',
+          stateDirectory: h.state,
+          input: c.input,
+          clockAfterWait: kind,
+        });
+        const before = verifiedLogical(h.db);
+        h.db.run('BEGIN IMMEDIATE');
+        try {
+          await retryControl(child, 'GO', false);
+          await waitRetryMessage(child, (m) => m.phase === 'lock_waited');
+          await retryControl(child, 'RETRY');
+          await waitRetryMessage(child, (m) => m.phase === 'prepare_attempt');
+        } finally {
+          h.db.run('ROLLBACK');
+        }
+        const result = await retryProcessResult(child);
+        expect(result).toMatchObject({
+          kind: 'error',
+          code: kind === 'expiry' ? 'RetryProofExpired' : 'StalePeriodContext',
+        });
+        expect(verifiedLogical(h.db)).toEqual(before);
+      }),
+    10000,
+  );
+
+for (const phase of ['before_context', 'after_prepare_commit'] as const)
+  test(
+    'P0-04 verified external native ' +
+      phase +
+      ' crash preserves atomic child and holds',
+    () =>
+      retryProcessCase(async (f, children) => {
+        const h = verifiedFixture(f);
+        const c = candidate(await h.composition.collect(h.selection));
+        const before = verifiedLogical(h.db);
+        const child = await startRetryProcess(f, children, {
+          role: 'verified',
+          stateDirectory: h.state,
+          input: c.input,
+          pauseAt: phase,
+        });
+        await retryControl(child, 'GO');
+        await waitRetryMessage(child, (m) => m.phase === phase);
+        await finishRetryProcess(child, true);
+        if (phase === 'before_context')
+          expect(verifiedLogical(h.db)).toEqual(before);
+        else {
+          const snap = readRetrySnapshot(
+            { stateDirectory: h.state },
+            retryFixtureBinding,
+          );
+          expect(snap.availability).toBe('available');
+          if (snap.availability !== 'available')
+            throw new Error('Missing snapshot.');
+          expect(snap.retryChildren).toHaveLength(1);
+          expect(snap.holds).toHaveLength(1);
+          expect(snap.holds[0]!.urls.map((u) => u.url)).toEqual(
+            h.evidence.eligibleUrls,
+          );
+          h.clock.mono += 60000;
+          const writer = verifiedWriter(f, h);
+          const replay = writer.prepareVerifiedRetryIntent(c.input);
+          expect(replay.kind).toBe('replay');
+          expect('dispatchCapability' in replay).toBe(false);
+          expect(
+            writer.cancelPrepared(
+              retryFixtureBinding,
+              c.input.intent.requestId,
+              1,
+            ).kind,
+          ).toBe('lost');
+        }
+      }),
+  );
+
+test('P0-04 ordinary/retry process exact overlap has one winner and closed stale-or-overlap loser', () =>
+  retryProcessCase(async (f, children) => {
+    const h = verifiedFixture(f);
+    const c = candidate(await h.composition.collect(h.selection));
+    const ordinary = { ...c.input.intent, requestId: 'ordinary-racer' };
+    const a = await startRetryProcess(f, children, {
+      role: 'verified',
+      stateDirectory: h.state,
+      input: c.input,
+    });
+    const b = await startRetryProcess(f, children, {
+      role: 'ordinary',
+      stateDirectory: h.state,
+      input: c.input,
+      ordinaryIntent: ordinary,
+    });
+    await Promise.all([retryControl(a, 'GO'), retryControl(b, 'GO')]);
+    const results = await Promise.all([
+      retryProcessResult(a),
+      retryProcessResult(b),
+    ]);
+    expect(results.filter((r) => r.kind === 'created')).toHaveLength(1);
+    expect(['SnapshotConflict', 'UrlOverlap']).toContain(
+      results.find((r) => r.kind === 'error')!.code!,
+    );
+    expect(verifiedLogical(h.db).intents).toHaveLength(1);
+  }));
+
+for (const family of [
+  'google/checker',
+  'backlink/checker',
+  'yandex/indexer',
+] as const)
+  test(
+    'P0-04 fresh collection sees old-period ' +
+      family +
+      ' exact held URL across scopes',
+    () =>
+      retryProcessCase(async (f) => {
+        const h = verifiedFixture(f);
+        const hold = {
+          ...input('held'),
+          taskFamily: family,
+          providerRoute: `/v2/task/${family}/create` as const,
+          budget: {
+            ...input().budget,
+            credentialFingerprint: retryFixtureBinding,
+            budgetScope: 'other-scope',
+          },
+          submittedUrls: [h.evidence.eligibleUrls[0]!],
+        };
+        newIntent(h.ordinary, hold);
+        const before = verifiedLogical(h.db);
+        expect(await h.composition.collect(h.selection)).toEqual({
+          kind: 'blocked',
+          code: 'UrlOverlap',
+        });
+        expect(verifiedLogical(h.db)).toEqual(before);
+      }),
+  );
+
+test('P0-04 fresh revision all-state attempt count and each unit cap pressure refuse new admission; no-ID unknown retry blocks other parents', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const c = candidate(await h.composition.collect(h.selection));
+    const writer = verifiedWriter(f, h);
+    const created = writer.prepareVerifiedRetryIntent(c.input, c.proof);
+    if (created.kind !== 'created') throw new Error('Missing creator.');
+    expect(
+      writer.cancelPrepared(retryFixtureBinding, c.input.intent.requestId, 0)
+        .kind,
+    ).toBe('cancelled');
+    writer.close();
+    const limited = composeVerifiedRetryAdmission({
+      configuration: fixtureRetryConfiguration(
+        join(f.root, 'limited.json'),
+        h.state,
+        {
+          retry: {
+            enabled: true,
+            allowUnattributedParents: true,
+            maxAttemptsPerSource: 1,
+          },
+        },
+      ),
+      verifier: h.verifier,
+      clock: h.clock,
+    });
+    expect(
+      await limited.collect({ ...h.selection, requestId: 'count-loser' }),
+    ).toEqual({ kind: 'blocked', code: 'RetryPermissionDenied' });
+    for (const unit of ['tokens', 'indexer', 'checker'] as const) {
+      const caps = { tokens: 10000, indexer: 100, checker: 100 };
+      caps[unit] = 0;
+      const reservations = { tokens: 0, indexer: 0, checker: 0 };
+      reservations[unit] = 1;
+      const hold = {
+        ...input('pressure-' + unit),
+        budget: {
+          ...c.input.intent.budget,
+          policyDigest: hash('pressure'),
+          caps: { tokens: 10000, indexer: 100, checker: 100 },
+        },
+        submittedUrls: ['https://example.test/pressure-' + unit],
+        reservation: reservations,
+      };
+      newIntent(h.ordinary, hold);
+      const comp = composeVerifiedRetryAdmission({
+        configuration: fixtureRetryConfiguration(
+          join(f.root, 'cap-' + unit + '.json'),
+          h.state,
+          { caps },
+        ),
+        verifier: h.verifier,
+        clock: h.clock,
+      });
+      expect(
+        await comp.collect({ ...h.selection, requestId: 'cap-loser-' + unit }),
+      ).toEqual({ kind: 'blocked', code: 'BudgetExceeded' });
+    }
+    const newc = candidate(
+      await h.composition.collect({
+        ...h.selection,
+        requestId: 'unknown-child',
+      }),
+    );
+    const next = verifiedWriter(f, h);
+    const prepared = next.prepareVerifiedRetryIntent(newc.input, newc.proof);
+    if (prepared.kind !== 'created') throw new Error('Missing creator.');
+    const claim = next.claimDispatch(prepared.dispatchCapability, 0);
+    if (claim.kind !== 'claimed') throw new Error('Missing claim.');
+    next.recordDispatchOutcome({
+      credentialFingerprint: retryFixtureBinding,
+      requestId: newc.input.intent.requestId,
+      expectedStateVersion: 1,
+      outcomeToken: claim.outcomeToken,
+      outcome: { kind: 'unknown' },
+    });
+    next.close();
+    const other = composeVerifiedRetryAdmission({
+      configuration: h.configuration,
+      verifier: fixtureRetryVerifier(
+        fixtureRetryEvidence([
+          'https://example.test/other0',
+          'https://example.test/other1',
+        ]),
+      ),
+      clock: h.clock,
+    });
+    expect(
+      await other.collect({
+        requestId: 'other-new',
+        parent: { ...externalParent, taskId: 'other-parent' },
+      }),
+    ).toEqual({ kind: 'blocked', code: 'UnknownRetryDispatch' });
+  }));
+
+test('P0-04 external child keeps native owner-first duplicate/self-parent ACK guards and dispatching holds', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    seedVerifiedParent(h.ordinary, 'accepted', 'existing-ack', [
+      'https://example.test/independent-parent',
+    ]);
+    const c = candidate(await h.composition.collect(h.selection));
+    const writer = verifiedWriter(f, h);
+    const prepared = writer.prepareVerifiedRetryIntent(c.input, c.proof);
+    if (prepared.kind !== 'created') throw new Error('Missing creator.');
+    const claim = writer.claimDispatch(prepared.dispatchCapability, 0);
+    if (claim.kind !== 'claimed') throw new Error('Missing claim.');
+    expect(writer.claimDispatch(prepared.dispatchCapability, 0).kind).toBe(
+      'lost',
+    );
+    expect(
+      writer.cancelPrepared(retryFixtureBinding, c.input.intent.requestId, 0)
+        .kind,
+    ).toBe('lost');
+    const otherPrepared = newIntent(h.ordinary, {
+      ...input('other-owner'),
+      budget: {
+        ...input().budget,
+        credentialFingerprint: retryFixtureBinding,
+        budgetScope: 'other-owner',
+      },
+      submittedUrls: ['https://example.test/other-owner'],
+    });
+    const otherClaim = h.ordinary.claimDispatch(
+      otherPrepared.dispatchCapability,
+      0,
+    );
+    if (otherClaim.kind !== 'claimed') throw new Error('Missing other owner.');
+    const base = {
+      credentialFingerprint: retryFixtureBinding,
+      requestId: c.input.intent.requestId,
+      expectedStateVersion: 1,
+      outcomeToken: claim.outcomeToken,
+    };
+    for (const taskId of [externalParent.taskId, 'existing-ack']) {
+      const before = verifiedLogical(h.db);
+      expectLedgerError(
+        () =>
+          writer.recordDispatchOutcome({
+            ...base,
+            outcomeToken: otherClaim.outcomeToken,
+            outcome: {
+              kind: 'accepted',
+              providerType: externalParent.family,
+              providerTaskId: taskId,
+            },
+          }),
+        'DispatchOutcomeClaimLost',
+      );
+      expect(verifiedLogical(h.db)).toEqual(before);
+      expectRetryError(
+        () =>
+          writer.recordDispatchOutcome({
+            ...base,
+            outcome: {
+              kind: 'accepted',
+              providerType: externalParent.family,
+              providerTaskId: taskId,
+            },
+          }),
+        'RetryLineageConflict',
+      );
+      expect(verifiedLogical(h.db)).toEqual(before);
+    }
+    writer.recordDispatchOutcome({
+      ...base,
+      outcome: {
+        kind: 'accepted',
+        providerType: externalParent.family,
+        providerTaskId: 'genuine-child-ack',
+      },
+    });
+    expect(
+      writer.readIntent(retryFixtureBinding, c.input.intent.requestId)?.state,
+    ).toBe('accepted');
+    expect(verifiedLogical(h.db).intents).toHaveLength(3);
+  }));
+
+test('P0-02 boundary raw entries and safety digests succeed without truncation', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    for (const r of h.evidence.reports)
+      r.indexedUrls = Array(9998).fill(r.indexedUrls[0]!);
+    h.evidence.safetyEvidenceDigests = Array.from({ length: 64 }, (_, i) =>
+      hash('fence-' + i),
+    );
+    const c = candidate(await h.composition.collect(h.selection));
+    const writer = verifiedWriter(f, h);
+    expect(writer.prepareVerifiedRetryIntent(c.input, c.proof).kind).toBe(
+      'created',
+    );
+    expect(c.request.input.urls).toEqual(h.evidence.eligibleUrls);
+  }));
+
+test('P0-02 same composition rejects replaced ledger identity; invalid/unbound configuration and V1 remain unavailable', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const c = candidate(await h.composition.collect(h.selection));
+    h.db
+      .query('UPDATE retry_ledger_meta SET ledger_id=?')
+      .run(hash('replacement-ledger'));
+    const writer = verifiedWriter(f, h);
+    const before = verifiedLogical(h.db);
+    expectRetryError(
+      () => writer.prepareVerifiedRetryIntent(c.input, c.proof),
+      'RetryProofInvalid',
+    );
+    expect(verifiedLogical(h.db)).toEqual(before);
+    writer.close();
+    for (const field of ['key', 'digest', 'state'] as const) {
+      const configuration = structuredClone(h.configuration);
+      if (field === 'key')
+        (configuration.credential as { fingerprint: string }).fingerprint =
+          hash('wrong-key');
+      if (field === 'digest')
+        (configuration.snapshot as { digest: string }).digest =
+          hash('wrong-policy');
+      if (field === 'state')
+        (configuration as { state: string }).state = 'invalid';
+      expectLedgerError(
+        () =>
+          composeVerifiedRetryAdmission({
+            configuration,
+            verifier: h.verifier,
+            clock: h.clock,
+          }),
+        'InvalidLedgerInput',
+      );
+    }
+    const state = join(f.root, 'v1');
+    f.init(state, 1);
+    const composition = composeVerifiedRetryAdmission({
+      configuration: fixtureRetryConfiguration(
+        join(f.root, 'v1-policy.json'),
+        state,
+      ),
+      verifier: h.verifier,
+      clock: h.clock,
+    });
+    expectRetryError(() => composition.open(), 'UpgradeRequired');
+    expect(await composition.collect(h.selection)).toEqual({
+      kind: 'blocked',
+      code: 'SnapshotUnavailable',
+    });
+  }));
+
+test('P0-02 caller cancellation after collection consumes no new hold or replacement capability', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const abort = new AbortController();
+    const c = candidate(await h.composition.collect(h.selection, abort.signal));
+    abort.abort();
+    const writer = verifiedWriter(f, h);
+    const before = verifiedLogical(h.db);
+    expectRetryError(
+      () => writer.prepareVerifiedRetryIntent(c.input, c.proof),
+      'RetryCancelled',
+    );
+    expect(verifiedLogical(h.db)).toEqual(before);
+    expectRetryError(
+      () => writer.prepareVerifiedRetryIntent(c.input, c.proof),
+      'RetryProofInvalid',
+    );
+    writer.close();
+    const fresh = candidate(await h.composition.collect(h.selection));
+    expect(fresh.proof).not.toBe(c.proof);
   }));

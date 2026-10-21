@@ -14,6 +14,8 @@ globalThis.fetch = Object.assign(denyNetwork, { preconnect: denyNetwork });
 
 interface Setup {
   role:
+    | 'verified'
+    | 'verified_lock_wait'
     | 'retry'
     | 'ordinary'
     | 'claim'
@@ -26,6 +28,8 @@ interface Setup {
   ordinaryIntent?: PrepareIntentInput;
   capability?: DispatchCapability;
   pauseAt?: RetryLedgerPhase;
+  verifiedUrls?: string[];
+  clockAfterWait?: 'expiry' | 'utc';
 }
 function send(message: object, fd = 1) {
   const bytes = Buffer.from(JSON.stringify(message) + '\n');
@@ -67,6 +71,8 @@ async function main() {
   const config = JSON.parse(first.value) as Setup;
   if (
     ![
+      'verified',
+      'verified_lock_wait',
       'retry',
       'ordinary',
       'claim',
@@ -90,7 +96,7 @@ async function main() {
   let result: object | undefined;
   const failures: unknown[] = [];
   try {
-    const ledger = openRetryLedgerV2(
+    const localLedger = openRetryLedgerV2(
       { stateDirectory: config.stateDirectory },
       {
         onPhase(phase) {
@@ -99,7 +105,57 @@ async function main() {
         },
       },
     );
-    handles.push(ledger);
+    handles.push(localLedger);
+    let ledger: Omit<
+      import('../../src/submission-ledger').SubmissionLedger,
+      'prepareIntent'
+    > = localLedger;
+    let retryPrepare = () => localLedger.prepareRetryIntent(config.input);
+    let afterWait = false;
+    if (config.role.startsWith('verified')) {
+      const { composeVerifiedRetryAdmission } =
+        await import('../../src/submission-ledger');
+      const {
+        fixtureRetryConfiguration,
+        fixtureRetryEvidence,
+        fixtureRetryVerifier,
+        retryFixtureUtc,
+      } = await import('./retry-verifier');
+      const configuration = fixtureRetryConfiguration(
+        join(process.env.HOME!, 'synthetic-policy.json'),
+        config.stateDirectory,
+      );
+      const composition = composeVerifiedRetryAdmission({
+        configuration,
+        verifier: fixtureRetryVerifier(
+          fixtureRetryEvidence(config.verifiedUrls),
+        ),
+        clock: {
+          utcMs: () =>
+            retryFixtureUtc +
+            (afterWait && config.clockAfterWait === 'utc' ? 86400000 : 0),
+          monotonicMs: () =>
+            afterWait && config.clockAfterWait === 'expiry' ? 60100 : 100,
+        },
+        hooks: {
+          onPhase(phase) {
+            if (phase === config.pauseAt) stop(phase);
+            else send({ event: 'phase', phase });
+          },
+        },
+      });
+      const result = await composition.collect({
+        requestId: config.input.intent.requestId,
+        parent: config.input.parent,
+      });
+      if (result.kind !== 'candidate')
+        throw new Error('Synthetic verified child collection failed.');
+      const verified = composition.open();
+      handles.push(verified);
+      ledger = verified;
+      retryPrepare = () =>
+        verified.prepareVerifiedRetryIntent(result.input, result.proof);
+    }
     send({ event: 'ready' });
     await control('GO'); // No application transaction is open while waiting.
     try {
@@ -117,7 +173,7 @@ async function main() {
       if (config.role === 'ordinary') {
         if (!config.ordinaryIntent)
           throw new Error('Missing ordinary fixture input.');
-        const prepared = ledger.prepareIntent(config.ordinaryIntent);
+        const prepared = localLedger.prepareIntent(config.ordinaryIntent);
         result = {
           event: 'result',
           kind: prepared.kind,
@@ -138,8 +194,28 @@ async function main() {
         const claimed = ledger.claimDispatch(config.capability, 0);
         result = { event: 'result', kind: claimed.kind }; // Never emit the outcome token.
       } else {
-        const prepared = ledger.prepareRetryIntent(config.input);
-        if (config.role === 'retry') {
+        if (config.role === 'verified_lock_wait') {
+          try {
+            retryPrepare();
+            throw new Error('Expected held native SQL lock.');
+          } catch (error) {
+            if (
+              !(error instanceof SubmissionLedgerError) ||
+              error.code !== 'LedgerBusy'
+            )
+              throw error;
+          }
+          send({ event: 'phase', phase: 'lock_waited' });
+          await control('RETRY'); // Failed BEGIN held no transaction and consumed no proof.
+          afterWait = true;
+          send({ event: 'phase', phase: 'prepare_attempt' });
+        }
+        const prepared = retryPrepare();
+        if (
+          config.role === 'retry' ||
+          config.role === 'verified' ||
+          config.role === 'verified_lock_wait'
+        ) {
           result = {
             event: 'result',
             kind: prepared.kind,
