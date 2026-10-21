@@ -31,6 +31,9 @@ import {
   type PrepareRetryIntentInput,
   type RetryPrepareHooks,
   type RetrySubmissionLedger,
+  type DispatchCapability,
+  type DispatchOutcomeToken,
+  type RetryLedgerPhase,
 } from '../src/submission-ledger';
 import {
   type AvailableRetrySnapshot,
@@ -4029,5 +4032,1038 @@ test('V2-08 asynchronous trusted phase result is rejected and rolled back withou
         () => writer.prepareRetryIntent(value),
         'LedgerUnavailable',
       ),
+    );
+  }));
+
+interface RetryProcessSetup {
+  role:
+    | 'retry'
+    | 'ordinary'
+    | 'claim'
+    | 'cancel'
+    | 'claim_pause'
+    | 'outcome'
+    | 'lock';
+  stateDirectory: string;
+  input: PrepareRetryIntentInput;
+  ordinaryIntent?: PrepareIntentInput;
+  capability?: DispatchCapability;
+  pauseAt?: RetryLedgerPhase;
+}
+interface RetryProcessMessage {
+  event: 'ready' | 'phase' | 'result';
+  phase?: RetryLedgerPhase | 'claim_committed' | 'locked';
+  kind?:
+    | 'created'
+    | 'replay'
+    | 'claimed'
+    | 'cancelled'
+    | 'lost'
+    | 'accepted'
+    | 'error';
+  code?: string;
+  unit?: 'tokens' | 'indexer' | 'checker';
+  capability?: boolean;
+}
+function spawnRetryProcess(home: string) {
+  return Bun.spawn(
+    [
+      process.execPath,
+      '--no-env-file',
+      resolve('tests/fixtures/retry-admission-child.ts'),
+    ],
+    {
+      cwd: process.cwd(),
+      env: { HOME: home },
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
+}
+interface OwnedRetryProcess {
+  process: ReturnType<typeof spawnRetryProcess>;
+  role: RetryProcessSetup['role'];
+  pauseAt: RetryLedgerPhase | null;
+  messages: RetryProcessMessage[];
+  waiters: {
+    match: (m: RetryProcessMessage) => boolean;
+    resolve: (m: RetryProcessMessage) => void;
+    reject: (e: Error) => void;
+  }[];
+  stdoutDone?: Promise<void>;
+  stderrDone?: Promise<string>;
+  inputClosed: boolean;
+  exitResult?: number;
+  outputEnded: boolean;
+}
+async function retryProcessDeadline<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('Owned retry process deadline exceeded.')),
+          5000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function retryControl(
+  child: OwnedRetryProcess,
+  command: 'GO' | 'RECORD',
+  end = true,
+) {
+  await retryProcessDeadline(
+    Promise.resolve(child.process.stdin.write(command + '\n')),
+  );
+  await retryProcessDeadline(Promise.resolve(child.process.stdin.flush()));
+  if (end) {
+    await retryProcessDeadline(Promise.resolve(child.process.stdin.end()));
+    child.inputClosed = true;
+  }
+}
+function waitRetryMessage(
+  child: OwnedRetryProcess,
+  match: (m: RetryProcessMessage) => boolean,
+) {
+  const found = child.messages.find(match);
+  if (found) return Promise.resolve(found);
+  if (child.outputEnded)
+    return Promise.reject(
+      new Error('Retry child ended before expected marker.'),
+    );
+  const pending = new Promise<RetryProcessMessage>((resolve, reject) => {
+    child.waiters.push({ match, resolve, reject });
+  });
+  void pending.catch(() => {});
+  return retryProcessDeadline(pending);
+}
+async function startRetryProcess(
+  f: ReturnType<typeof fixture>,
+  children: OwnedRetryProcess[],
+  setup: RetryProcessSetup,
+) {
+  const home = join(f.root, `retry-child-home-${children.length}`);
+  mkdirSync(home, { mode: 0o700 });
+  const process = spawnRetryProcess(home);
+  const child: OwnedRetryProcess = {
+    process,
+    role: setup.role,
+    pauseAt: setup.pauseAt ?? null,
+    messages: [],
+    waiters: [],
+    inputClosed: false,
+    outputEnded: false,
+  };
+  children.push(child); // Registry owns PID before starting stream tasks or setup writes.
+  child.stderrDone = new Response(process.stderr).text();
+  void child.stderrDone.catch(() => {});
+  child.stdoutDone = (async () => {
+    const reader = process.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        buffer += decoder.decode(next.value, { stream: true });
+        if (buffer.length > 4096)
+          throw new Error('Unexpected retry child output.');
+        while (buffer.includes('\n')) {
+          const end = buffer.indexOf('\n');
+          const line = buffer.slice(0, end);
+          buffer = buffer.slice(end + 1);
+          const message = JSON.parse(line) as RetryProcessMessage;
+          if (
+            Object.keys(message).some(
+              (key) =>
+                ![
+                  'event',
+                  'phase',
+                  'kind',
+                  'code',
+                  'unit',
+                  'capability',
+                ].includes(key),
+            ) ||
+            !['ready', 'phase', 'result'].includes(message.event) ||
+            (message.phase !== undefined &&
+              ![
+                'before_context',
+                'after_prepare_commit',
+                'before_accepted_commit',
+                'after_accepted_commit',
+                'claim_committed',
+                'locked',
+              ].includes(message.phase)) ||
+            (message.kind !== undefined &&
+              ![
+                'created',
+                'replay',
+                'claimed',
+                'cancelled',
+                'lost',
+                'accepted',
+                'error',
+              ].includes(message.kind)) ||
+            (message.code !== undefined &&
+              ![
+                'SnapshotConflict',
+                'SnapshotUnavailable',
+                'SnapshotLimitExceeded',
+                'RetryLineageConflict',
+                'UnknownRetryDispatch',
+                'LedgerBusy',
+                'BudgetExceeded',
+                'UrlOverlap',
+                'StalePeriodContext',
+                'LedgerUnavailable',
+                'DispatchOutcomeClaimLost',
+                'ProviderTypeMismatch',
+                'InvalidLedgerInput',
+                'OutcomePersistenceFailed',
+                'UpgradeRequired',
+                'RequestIdConflict',
+              ].includes(message.code)) ||
+            (message.unit !== undefined &&
+              !['tokens', 'indexer', 'checker'].includes(message.unit)) ||
+            (message.capability !== undefined &&
+              typeof message.capability !== 'boolean')
+          )
+            throw new Error('Unexpected retry child protocol.');
+          child.messages.push(message);
+          if (child.messages.length > 16)
+            throw new Error('Excess retry child output.');
+          for (const waiter of [...child.waiters])
+            if (waiter.match(message)) {
+              child.waiters.splice(child.waiters.indexOf(waiter), 1);
+              waiter.resolve(message);
+            }
+        }
+      }
+      buffer += decoder.decode();
+      if (buffer !== '') throw new Error('Unterminated retry child output.');
+    } finally {
+      child.outputEnded = true;
+      for (const waiter of child.waiters.splice(0))
+        waiter.reject(new Error('Retry child ended before expected marker.'));
+      reader.releaseLock();
+    }
+  })();
+  void child.stdoutDone.catch(() => {});
+  await retryProcessDeadline(
+    Promise.resolve(process.stdin.write(JSON.stringify(setup) + '\n')),
+  );
+  await retryProcessDeadline(Promise.resolve(process.stdin.flush()));
+  await waitRetryMessage(child, (m) => m.event === 'ready');
+  return child;
+}
+async function reapRetryProcess(child: OwnedRetryProcess) {
+  if (child.process.exitCode === null && child.process.signalCode === null)
+    child.process.kill('SIGKILL');
+  child.exitResult = await retryProcessDeadline(child.process.exited);
+}
+async function finishRetryProcess(child: OwnedRetryProcess, killed = false) {
+  if (killed) await reapRetryProcess(child);
+  else child.exitResult = await retryProcessDeadline(child.process.exited);
+  await retryProcessDeadline(child.stdoutDone!);
+  expect(await retryProcessDeadline(child.stderrDone!)).toBe('');
+  expect(child.exitResult).toBe(killed ? 137 : 0);
+  expect(child.process.signalCode).toBe(killed ? 'SIGKILL' : null);
+}
+async function retryProcessResult(child: OwnedRetryProcess) {
+  const result = await waitRetryMessage(child, (m) => m.event === 'result');
+  await finishRetryProcess(child);
+  return result;
+}
+async function retryProcessCase(
+  body: (
+    f: ReturnType<typeof fixture>,
+    children: OwnedRetryProcess[],
+  ) => Promise<void>,
+) {
+  const f = fixture();
+  const children: OwnedRetryProcess[] = [];
+  let verified = false;
+  const failures: unknown[] = [];
+  try {
+    await body(f, children);
+    verified = true;
+  } catch (error) {
+    failures.push(error);
+  } finally {
+    try {
+      await closeRetryProcessFixture(f, children, verified);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1)
+    throw new AggregateError(
+      failures,
+      'Retry case and cleanup failed; owned root preserved.',
+    );
+}
+async function closeRetryProcessFixture(
+  f: ReturnType<typeof fixture>,
+  children: OwnedRetryProcess[],
+  verified: boolean,
+) {
+  const failures: unknown[] = [];
+  const reaped = await Promise.allSettled(children.map(reapRetryProcess));
+  for (const result of reaped)
+    if (result.status === 'rejected') failures.push(result.reason);
+  const settled = await Promise.allSettled(
+    children.map(async (child, index) => {
+      const streams = await Promise.allSettled([
+        retryProcessDeadline(
+          (async () => {
+            if (!child.inputClosed) {
+              await child.process.stdin.end();
+              child.inputClosed = true;
+            }
+          })(),
+        ),
+        retryProcessDeadline<void | string>(
+          child.stdoutDone ?? new Response(child.process.stdout).text(),
+        ),
+        retryProcessDeadline(
+          child.stderrDone ?? new Response(child.process.stderr).text(),
+        ),
+      ]);
+      for (const result of streams)
+        if (result.status === 'rejected') failures.push(result.reason);
+      if (streams[2]?.status === 'fulfilled' && streams[2].value !== '')
+        failures.push(new Error('Retry child stderr was not empty.'));
+      console.info(
+        'V2-RETRY_PROCESS ' +
+          JSON.stringify({
+            pid: child.process.pid,
+            role: child.role,
+            pauseAt: child.pauseAt,
+            signal: child.process.signalCode,
+            exitResult: child.exitResult,
+            reaped: reaped[index]?.status === 'fulfilled',
+            inputClosed: child.inputClosed,
+            stdoutSettled: streams[1]?.status === 'fulfilled',
+            stderrSettled: streams[2]?.status === 'fulfilled',
+            messages: child.messages,
+          }),
+      );
+    }),
+  );
+  for (const result of settled)
+    if (result.status === 'rejected') failures.push(result.reason);
+  try {
+    f.cleanup(verified && failures.length === 0);
+  } catch (error) {
+    failures.push(error);
+  }
+  const removed = !existsSync(f.root);
+  if (verified && failures.length === 0 && !removed)
+    failures.push(new Error('Owned retry root was not removed.'));
+  console.info(
+    'V2-RETRY_CLEANUP ' +
+      JSON.stringify({
+        ownedRoot: f.root,
+        removed,
+        children: children.length,
+        failures: failures.length,
+      }),
+  );
+  if (failures.length)
+    throw new AggregateError(
+      failures,
+      'Retry process cleanup failed; owned root preserved.',
+    );
+}
+function retryProcessProjection(db: Database) {
+  return {
+    core: exactCoreRows(db),
+    contexts: db
+      .query('SELECT * FROM intent_context ORDER BY credential_fp,request_id')
+      .all(),
+    meta: db.query('SELECT * FROM retry_ledger_meta').all(),
+    schema: db
+      .query(
+        'SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name',
+      )
+      .all(),
+    version: db.query('PRAGMA user_version').get(),
+  };
+}
+function expectProcessOriginalsPreserved(
+  before: ReturnType<typeof retryProcessProjection>,
+  after: ReturnType<typeof retryProcessProjection>,
+  value: PrepareRetryIntentInput,
+) {
+  expect(after.meta).toEqual(before.meta);
+  expect(after.schema).toEqual(before.schema);
+  expect(after.version).toEqual(before.version);
+  expect(
+    after.contexts.filter(
+      (row) =>
+        (row as { request_id: string }).request_id !== value.intent.requestId,
+    ),
+  ).toEqual(before.contexts);
+  expect(
+    after.contexts.find(
+      (row) =>
+        (row as { request_id: string }).request_id === value.intent.requestId,
+    ),
+  ).toEqual({
+    credential_fp: binding,
+    request_id: value.intent.requestId,
+    origin_kind: 'retry',
+    parent_family: value.parent.family,
+    parent_task_id: value.parent.taskId,
+    source_manifest_digest: value.sourceManifestDigest,
+    plan_fingerprint: value.planFingerprint,
+  });
+  for (const table of ['intents', 'intent_urls', 'intent_events'])
+    expect(
+      (after.core[table] as Record<string, unknown>[]).filter(
+        (row) => row.request_id !== value.intent.requestId,
+      ),
+    ).toEqual(before.core[table] as Record<string, unknown>[]);
+  expect(
+    (after.core.budget_periods as Record<string, unknown>[]).filter(
+      (row) => row.budget_scope !== value.intent.budget.budgetScope,
+    ),
+  ).toEqual(before.core.budget_periods as Record<string, unknown>[]);
+}
+function strictRetryReopen(f: ReturnType<typeof fixture>, state: string) {
+  const reopened = f.track(openRetryLedgerV2({ stateDirectory: state }));
+  expect(availableSnapshot(state).schemaVersion).toBe(2);
+  return reopened;
+}
+function prepareProcessCrashFixture(f: ReturnType<typeof fixture>) {
+  const setup = retryFixture(f);
+  seedRetryParent(setup.ordinary, 'other-parent', ' Other-parent ', [
+    'https://example.test/other-process/1',
+    'https://example.test/other-process/2',
+  ]);
+  setup.ordinary.close();
+  setup.writer.close();
+  setup.db.run('UPDATE intent_events SET event_id=event_id+9007199254740992');
+  setup.db.run('UPDATE sqlite_sequence SET seq=9007199254745999');
+  const value = retryInput(setup.state);
+  value.intent.budget = {
+    ...value.intent.budget,
+    budgetScope: 'process-retry-scope',
+    periodId: 'process-period',
+    periodStartMs: 3000,
+  };
+  return { ...setup, value };
+}
+
+test('V2-08 process same-ID READY/GO race creates one retry and returns one exact replay without a second capability', () =>
+  retryProcessCase(async (f, children) => {
+    const { state, db } = retryFixture(f);
+    const value = retryInput(state);
+    const a = await startRetryProcess(f, children, {
+      role: 'retry',
+      stateDirectory: state,
+      input: value,
+    });
+    const b = await startRetryProcess(f, children, {
+      role: 'retry',
+      stateDirectory: state,
+      input: value,
+    });
+    await Promise.all([retryControl(a, 'GO'), retryControl(b, 'GO')]);
+    const results = await Promise.all([
+      retryProcessResult(a),
+      retryProcessResult(b),
+    ]);
+    expect(results.map((row) => row.kind).sort()).toEqual([
+      'created',
+      'replay',
+    ]);
+    expect(results.map((row) => row.capability).sort()).toEqual([false, true]);
+    const writer = strictRetryReopen(f, state);
+    const snap = availableSnapshot(state);
+    expect(snap.retryChildren.length).toBe(1);
+    expect(snap.holds.length).toBe(1);
+    expect(snap.holds[0]!.urls.map((row) => row.url)).toEqual([
+      ...value.intent.submittedUrls,
+    ]);
+    expect(snap.unresolvedHistory[0]!.reservation).toEqual({
+      tokens: '3',
+      indexer: '2',
+      checker: '1',
+    });
+    expect(
+      (
+        db
+          .query('SELECT COUNT(*) AS n FROM intents WHERE request_id=?')
+          .get(value.intent.requestId) as { n: number }
+      ).n,
+    ).toBe(1);
+    expect(
+      (
+        db
+          .query('SELECT COUNT(*) AS n FROM intent_events WHERE request_id=?')
+          .get(value.intent.requestId) as { n: number }
+      ).n,
+    ).toBe(1);
+    assertNoRetryWrite(db, () => {
+      const replay = writer.prepareRetryIntent(value);
+      expect(replay.kind).toBe('replay');
+      expect('dispatchCapability' in replay).toBe(false);
+    });
+  }));
+
+test('V2-08 process different-ID shared revision reaches exact SnapshotConflict after first commit and lock settlement', () =>
+  retryProcessCase(async (f, children) => {
+    const { state, db } = retryFixture(f);
+    const first = retryInput(state);
+    const second = {
+      ...first,
+      intent: { ...first.intent, requestId: 'second-id' },
+    };
+    const a = await startRetryProcess(f, children, {
+      role: 'retry',
+      stateDirectory: state,
+      input: first,
+    });
+    const b = await startRetryProcess(f, children, {
+      role: 'retry',
+      stateDirectory: state,
+      input: second,
+    });
+    await retryControl(a, 'GO');
+    expect((await retryProcessResult(a)).kind).toBe('created');
+    const before = retryProcessProjection(db);
+    await retryControl(b, 'GO');
+    expect(await retryProcessResult(b)).toEqual({
+      event: 'result',
+      kind: 'error',
+      code: 'SnapshotConflict',
+    });
+    strictRetryReopen(f, state);
+    expect(retryProcessProjection(db)).toEqual(before);
+  }));
+
+test(
+  'V2-08 process retained writer lock reaches exact LedgerBusy separately from stale revision and overlap',
+  () =>
+    retryProcessCase(async (f, children) => {
+      const { state, db } = retryFixture(f);
+      const value = retryInput(state);
+      const before = retryProcessProjection(db);
+      const writer = await startRetryProcess(f, children, {
+        role: 'retry',
+        stateDirectory: state,
+        input: value,
+      });
+      const lock = await startRetryProcess(f, children, {
+        role: 'lock',
+        stateDirectory: state,
+        input: value,
+      });
+      await retryControl(lock, 'GO');
+      await waitRetryMessage(lock, (m) => m.phase === 'locked');
+      await retryControl(writer, 'GO');
+      expect(await retryProcessResult(writer)).toEqual({
+        event: 'result',
+        kind: 'error',
+        code: 'LedgerBusy',
+      });
+      await finishRetryProcess(lock, true);
+      strictRetryReopen(f, state);
+      expect(retryProcessProjection(db)).toEqual(before);
+    }),
+  15000,
+);
+
+for (const unit of ['tokens', 'indexer', 'checker'] as const) {
+  test(`V2-08 process fresh revision and disjoint URLs reach exact ${unit} BudgetExceeded`, () =>
+    retryProcessCase(async (f, children) => {
+      const { state, db } = retryFixture(f);
+      const first = retryInput(state);
+      first.intent.submittedUrls = parentUrls.slice(0, 1);
+      first.intent.budget.caps = {
+        ...first.intent.budget.caps,
+        [unit]: first.intent.reservation[unit] * 2 - 1,
+      };
+      const a = await startRetryProcess(f, children, {
+        role: 'retry',
+        stateDirectory: state,
+        input: first,
+      });
+      await retryControl(a, 'GO');
+      expect((await retryProcessResult(a)).kind).toBe('created');
+      const second = retryInput(state, 'cap-second');
+      second.intent.submittedUrls = parentUrls.slice(1, 2);
+      second.intent.budget.caps = first.intent.budget.caps;
+      const before = retryProcessProjection(db);
+      const b = await startRetryProcess(f, children, {
+        role: 'retry',
+        stateDirectory: state,
+        input: second,
+      });
+      await retryControl(b, 'GO');
+      expect(await retryProcessResult(b)).toEqual({
+        event: 'result',
+        kind: 'error',
+        code: 'BudgetExceeded',
+        unit,
+      });
+      strictRetryReopen(f, state);
+      expect(retryProcessProjection(db)).toEqual(before);
+    }));
+}
+
+test('V2-08 process ordinary V2 commit between snapshot and retry invalidates revision and preserves atomic standalone history', () =>
+  retryProcessCase(async (f, children) => {
+    const { state, db } = retryFixture(f);
+    const stale = retryInput(state);
+    const retry = await startRetryProcess(f, children, {
+      role: 'retry',
+      stateDirectory: state,
+      input: stale,
+    });
+    const ordinary = await startRetryProcess(f, children, {
+      role: 'ordinary',
+      stateDirectory: state,
+      input: stale,
+      ordinaryIntent: {
+        ...input('ordinary-between'),
+        submittedUrls: ['https://example.test/ordinary-between'],
+      },
+    });
+    await retryControl(ordinary, 'GO');
+    expect(await retryProcessResult(ordinary)).toEqual({
+      event: 'result',
+      kind: 'created',
+      capability: true,
+    });
+    const before = retryProcessProjection(db);
+    await retryControl(retry, 'GO');
+    expect(await retryProcessResult(retry)).toEqual({
+      event: 'result',
+      kind: 'error',
+      code: 'SnapshotConflict',
+    });
+    expect(retryProcessProjection(db)).toEqual(before);
+    const snap = availableSnapshot(state);
+    expect(snap.revision).not.toBe(stale.expectedRevision);
+    expect(
+      snap.unresolvedHistory.find(
+        (row) => row.requestId === 'ordinary-between',
+      )!.context.originKind,
+    ).toBe('standalone');
+    expect(
+      snap.unresolvedHistory
+        .find((row) => row.requestId === 'ordinary-between')!
+        .events.map((row) => row.kind),
+    ).toEqual(['prepared']);
+    const fresh = await startRetryProcess(f, children, {
+      role: 'retry',
+      stateDirectory: state,
+      input: retryInput(state),
+    });
+    await retryControl(fresh, 'GO');
+    expect((await retryProcessResult(fresh)).kind).toBe('created');
+    strictRetryReopen(f, state);
+  }));
+
+for (const pauseAt of ['before_context', 'after_prepare_commit'] as const) {
+  test(`V2-08 process kill ${pauseAt} proves native prepare atomicity and lost-capability retention`, () =>
+    retryProcessCase(async (f, children) => {
+      const { state, db, value } = prepareProcessCrashFixture(f);
+      const before = retryProcessProjection(db);
+      const child = await startRetryProcess(f, children, {
+        role: 'retry',
+        stateDirectory: state,
+        input: value,
+        pauseAt,
+      });
+      await retryControl(child, 'GO');
+      await waitRetryMessage(child, (m) => m.phase === pauseAt);
+      await finishRetryProcess(child, true);
+      expect(child.messages.some((row) => row.event === 'result')).toBe(false);
+      const reopened = strictRetryReopen(f, state);
+      if (pauseAt === 'before_context') {
+        expect(retryProcessProjection(db)).toEqual(before);
+        expect(reopened.readIntent(binding, value.intent.requestId)).toBeNull();
+        expect(availableSnapshot(state).retryChildren).toEqual([]);
+      } else {
+        const snap = availableSnapshot(state);
+        expect(snap.retryChildren).toHaveLength(1);
+        expect(snap.retryChildren[0]!.state).toBe('prepared');
+        expect(snap.retryChildren[0]!.parentTaskId).toBe(value.parent.taskId);
+        expect(snap.holds[0]!.urls.map((row) => row.url)).toEqual([
+          ...value.intent.submittedUrls,
+        ]);
+        expect(
+          snap.unresolvedHistory[0]!.events.map((row) => row.kind),
+        ).toEqual(['prepared']);
+        expect(snap.unresolvedHistory[0]!.reservation).toEqual({
+          tokens: '3',
+          indexer: '2',
+          checker: '1',
+        });
+        const after = retryProcessProjection(db);
+        expectProcessOriginalsPreserved(before, after, value);
+        expect(after.contexts.length).toBe(before.contexts.length + 1);
+        expect(after.core.budget_periods!.length).toBe(
+          before.core.budget_periods!.length + 1,
+        );
+        const row = (after.core.intents as Record<string, unknown>[]).find(
+          (row) => row.request_id === value.intent.requestId,
+        )!;
+        expect(row.created_at_ms).toMatch(/^-?\d+$/);
+        expect(row.claim_token_digest).toMatch(/^[0-9a-f]{64}$/);
+        expect(row).toEqual({
+          _rowid: row._rowid,
+          credential_fp: binding,
+          request_id: value.intent.requestId,
+          budget_scope: value.intent.budget.budgetScope,
+          period_id: value.intent.budget.periodId,
+          period_start_ms: String(value.intent.budget.periodStartMs),
+          policy_revision: value.intent.budget.policyRevision,
+          policy_digest: value.intent.budget.policyDigest,
+          task_family: value.intent.taskFamily,
+          provider_route: value.intent.providerRoute,
+          payload_digest: value.intent.payloadDigest,
+          quote_version: value.intent.quoteVersion,
+          quote_fingerprint: value.intent.quoteFingerprint,
+          reserved_tokens: '3',
+          reserved_indexer: '2',
+          reserved_checker: '1',
+          state: 'prepared',
+          state_version: '0',
+          claim_token_digest: row.claim_token_digest,
+          dispatch_outcome_token_digest: null,
+          created_at_ms: row.created_at_ms,
+          provider_task_id: null,
+          provider_type: null,
+        });
+        const oldSeq = (before.core.sqlite_sequence as { seq: string }[])[0]!
+          .seq;
+        const nextId = (BigInt(oldSeq) + 1n).toString();
+        const newEvents = (
+          after.core.intent_events as Record<string, unknown>[]
+        ).filter((row) => row.request_id === value.intent.requestId);
+        expect(newEvents.length).toBe(1);
+        expect(newEvents[0]).toMatchObject({
+          _rowid: nextId,
+          event_id: nextId,
+          credential_fp: binding,
+          request_id: value.intent.requestId,
+          state_version: '0',
+          event_kind: 'prepared',
+          provider_task_id: null,
+          provider_type: null,
+        });
+        expect(newEvents[0]!.occurred_at_ms).toMatch(/^-?\d+$/);
+        expect((after.core.sqlite_sequence as { seq: string }[])[0]!.seq).toBe(
+          nextId,
+        );
+        assertNoRetryWrite(db, () => {
+          const replay = reopened.prepareRetryIntent(value);
+          expect(replay.kind).toBe('replay');
+          expect('dispatchCapability' in replay).toBe(false);
+        });
+      }
+    }));
+}
+
+test('V2-09 process death immediately after durable retry claim retains unknown dispatch barrier, units and ownership', () =>
+  retryProcessCase(async (f, children) => {
+    const { state, db, value } = prepareProcessCrashFixture(f);
+    const originals = retryProcessProjection(db);
+    const child = await startRetryProcess(f, children, {
+      role: 'claim_pause',
+      stateDirectory: state,
+      input: value,
+    });
+    await retryControl(child, 'GO');
+    await waitRetryMessage(child, (m) => m.phase === 'claim_committed');
+    await finishRetryProcess(child, true);
+    const reopened = strictRetryReopen(f, state);
+    expectProcessOriginalsPreserved(
+      originals,
+      retryProcessProjection(db),
+      value,
+    );
+    expect(
+      (retryProcessProjection(db).core.sqlite_sequence as { seq: string }[])[0]!
+        .seq,
+    ).toBe(
+      (
+        BigInt((originals.core.sqlite_sequence as { seq: string }[])[0]!.seq) +
+        2n
+      ).toString(),
+    );
+    const snap = availableSnapshot(state);
+    expect(snap.retryChildren[0]!.state).toBe('dispatching');
+    expect(snap.retryChildren[0]!.providerTaskId).toBeNull();
+    expect(snap.unresolvedHistory[0]!.events.map((row) => row.kind)).toEqual([
+      'prepared',
+      'dispatching',
+    ]);
+    expect(snap.unresolvedHistory[0]!.reservation).toEqual({
+      tokens: '3',
+      indexer: '2',
+      checker: '1',
+    });
+    expect(snap.holds[0]!.urls.map((row) => row.url)).toEqual([
+      ...value.intent.submittedUrls,
+    ]);
+    const fresh = retryInput(state, 'different-parent', ' Other-parent ');
+    assertNoRetryWrite(db, () =>
+      expectRetryError(
+        () => reopened.prepareRetryIntent(fresh),
+        'UnknownRetryDispatch',
+      ),
+    );
+    assertNoRetryWrite(db, () => {
+      const replay = reopened.prepareRetryIntent(value);
+      expect(replay.kind).toBe('replay');
+      expect('dispatchCapability' in replay).toBe(false);
+      expect(
+        reopened.cancelPrepared(binding, value.intent.requestId, 0),
+      ).toEqual({ kind: 'lost' });
+    });
+    const wrong = newIntent(reopened, {
+      ...input('wrong-owner'),
+      submittedUrls: ['https://example.test/wrong-process-owner'],
+    });
+    const wrongClaim = claimRetry(reopened, wrong);
+    assertNoRetryWrite(db, () =>
+      expectLedgerError(
+        () =>
+          reopened.recordDispatchOutcome({
+            credentialFingerprint: binding,
+            requestId: value.intent.requestId,
+            expectedStateVersion: 1,
+            outcomeToken: wrongClaim.outcomeToken,
+            outcome: { kind: 'unknown' },
+          }),
+        'DispatchOutcomeClaimLost',
+      ),
+    );
+  }));
+
+for (const pauseAt of [
+  'before_accepted_commit',
+  'after_accepted_commit',
+] as const) {
+  test(`V2-09 process kill ${pauseAt} preserves exact joined outcome at the native transaction boundary`, () =>
+    retryProcessCase(async (f, children) => {
+      const { state, db, value } = prepareProcessCrashFixture(f);
+      const originals = retryProcessProjection(db);
+      const child = await startRetryProcess(f, children, {
+        role: 'outcome',
+        stateDirectory: state,
+        input: value,
+        pauseAt,
+      });
+      await retryControl(child, 'GO', false);
+      await waitRetryMessage(child, (m) => m.phase === 'claim_committed');
+      const before = retryProcessProjection(db);
+      expect(
+        strictRetryReopen(f, state).readIntent(binding, value.intent.requestId)!
+          .state,
+      ).toBe('dispatching');
+      await retryControl(child, 'RECORD');
+      await waitRetryMessage(child, (m) => m.phase === pauseAt);
+      await finishRetryProcess(child, true);
+      expect(child.messages.some((row) => row.event === 'result')).toBe(false);
+      const reopened = strictRetryReopen(f, state);
+      expectProcessOriginalsPreserved(
+        originals,
+        retryProcessProjection(db),
+        value,
+      );
+      const snap = availableSnapshot(state);
+      if (pauseAt === 'before_accepted_commit') {
+        expect(retryProcessProjection(db)).toEqual(before);
+        expect(snap.retryChildren[0]!.state).toBe('dispatching');
+        expect(snap.retryChildren[0]!.providerTaskId).toBeNull();
+        expect(snap.holds[0]!.urls.map((row) => row.url)).toEqual([
+          ...value.intent.submittedUrls,
+        ]);
+        expect(snap.unresolvedHistory[0]!.reservation).toEqual({
+          tokens: '3',
+          indexer: '2',
+          checker: '1',
+        });
+      } else {
+        const after = retryProcessProjection(db);
+        expect(after.contexts).toEqual(before.contexts);
+        expect(after.meta).toEqual(before.meta);
+        expect(after.schema).toEqual(before.schema);
+        expect(after.core.budget_periods).toEqual(before.core.budget_periods);
+        expect(after.core.intent_urls).toEqual(before.core.intent_urls);
+        const oldRows = before.core.intents as Record<string, unknown>[];
+        const newRows = after.core.intents as Record<string, unknown>[];
+        expect(newRows).toEqual(
+          oldRows.map((row) =>
+            row.request_id === value.intent.requestId
+              ? {
+                  ...row,
+                  state: 'accepted',
+                  state_version: '2',
+                  dispatch_outcome_token_digest: null,
+                  provider_task_id: ' Process-child-é ',
+                  provider_type: 'google/indexer',
+                }
+              : row,
+          ),
+        );
+        const oldEvents = before.core.intent_events as Record<
+          string,
+          unknown
+        >[];
+        const newEvents = after.core.intent_events as Record<string, unknown>[];
+        expect(newEvents.slice(0, -1)).toEqual(oldEvents);
+        expect(newEvents.length).toBe(oldEvents.length + 1);
+        const oldSeq = (before.core.sqlite_sequence as { seq: string }[])[0]!
+          .seq;
+        const nextId = (BigInt(oldSeq) + 1n).toString();
+        expect(newEvents.at(-1)).toMatchObject({
+          _rowid: nextId,
+          event_id: nextId,
+          credential_fp: binding,
+          request_id: value.intent.requestId,
+          state_version: '2',
+          event_kind: 'accepted',
+          provider_task_id: ' Process-child-é ',
+          provider_type: 'google/indexer',
+        });
+        expect(newEvents.at(-1)!.occurred_at_ms).toMatch(/^-?\d+$/);
+        expect((after.core.sqlite_sequence as { seq: string }[])[0]!.seq).toBe(
+          nextId,
+        );
+        expect(snap.retryChildren[0]!.providerTaskId).toBe(' Process-child-é ');
+        expect(snap.retryChildren[0]!.state).toBe('accepted');
+        expect(snap.holds).toEqual([]);
+        expect(
+          snap.acceptedManifests.find(
+            (row) => row.requestId === value.intent.requestId,
+          )!.originKind,
+        ).toBe('retry');
+        const grandchild = retryInput(state, 'grandchild', ' Process-child-é ');
+        assertNoRetryWrite(db, () =>
+          expectRetryError(
+            () => reopened.prepareRetryIntent(grandchild),
+            'RetryLineageConflict',
+          ),
+        );
+      }
+      assertNoRetryWrite(db, () => {
+        const replay = reopened.prepareRetryIntent(value);
+        expect(replay.kind).toBe('replay');
+        expect('dispatchCapability' in replay).toBe(false);
+      });
+    }));
+}
+
+test('V2-09 process prepared cancel versus claim race has one durable winner and truthful held units/context', () =>
+  retryProcessCase(async (f, children) => {
+    const { state, writer, db } = retryFixture(f);
+    const value = retryInput(state);
+    const prepared = createRetry(writer, value);
+    const claim = await startRetryProcess(f, children, {
+      role: 'claim',
+      stateDirectory: state,
+      input: value,
+      capability: prepared.dispatchCapability,
+    });
+    const cancel = await startRetryProcess(f, children, {
+      role: 'cancel',
+      stateDirectory: state,
+      input: value,
+    });
+    await Promise.all([retryControl(claim, 'GO'), retryControl(cancel, 'GO')]);
+    const [claimed, cancelled] = await Promise.all([
+      retryProcessResult(claim),
+      retryProcessResult(cancel),
+    ]);
+    const reopened = strictRetryReopen(f, state);
+    const snap = availableSnapshot(state);
+    const relation = snap.retryChildren[0]!;
+    if (cancelled.kind === 'cancelled') {
+      expect(claimed.kind).toBe('lost');
+      expect(relation.state).toBe('cancelled');
+      expect(snap.holds).toEqual([]);
+      expect(reopened.claimDispatch(prepared.dispatchCapability, 0)).toEqual({
+        kind: 'lost',
+      });
+    } else {
+      expect(cancelled.kind).toBe('lost');
+      expect(claimed.kind).toBe('claimed');
+      expect(relation.state).toBe('dispatching');
+      expect(relation.providerTaskId).toBeNull();
+      expect(snap.holds[0]!.urls.map((row) => row.url)).toEqual([
+        ...value.intent.submittedUrls,
+      ]);
+      expect(snap.unresolvedHistory[0]!.reservation).toEqual({
+        tokens: '3',
+        indexer: '2',
+        checker: '1',
+      });
+      expect(
+        reopened.cancelPrepared(binding, value.intent.requestId, 0),
+      ).toEqual({ kind: 'lost' });
+      assertNoRetryWrite(db, () =>
+        expectLedgerError(
+          () =>
+            reopened.recordDispatchOutcome({
+              credentialFingerprint: binding,
+              requestId: value.intent.requestId,
+              expectedStateVersion: 1,
+              outcomeToken:
+                prepared.dispatchCapability as unknown as DispatchOutcomeToken,
+              outcome: { kind: 'unknown' },
+            }),
+          'DispatchOutcomeClaimLost',
+        ),
+      );
+    }
+    expect(relation.parentTaskId).toBe(value.parent.taskId);
+    expect(
+      (
+        db
+          .query('SELECT COUNT(*) AS n FROM intent_context WHERE request_id=?')
+          .get(value.intent.requestId) as { n: number }
+      ).n,
+    ).toBe(1);
+    const held = db
+      .query(
+        `SELECT CAST(COALESCE(SUM(reserved_tokens),0) AS TEXT) AS tokens,CAST(COALESCE(SUM(reserved_indexer),0) AS TEXT) AS indexer,CAST(COALESCE(SUM(reserved_checker),0) AS TEXT) AS checker FROM intents WHERE request_id=? AND state IN ('prepared','dispatching','unknown')`,
+      )
+      .get(value.intent.requestId);
+    expect(held).toEqual(
+      cancelled.kind === 'cancelled'
+        ? { tokens: '0', indexer: '0', checker: '0' }
+        : { tokens: '3', indexer: '2', checker: '1' },
+    );
+    const events = db
+      .query(
+        'SELECT event_kind FROM intent_events WHERE request_id=? ORDER BY event_id',
+      )
+      .all(value.intent.requestId) as { event_kind: string }[];
+    expect(events.map((row) => row.event_kind)).toEqual([
+      'prepared',
+      cancelled.kind === 'cancelled' ? 'cancelled' : 'dispatching',
+    ]);
+    console.info(
+      'V2-RETRY_RACE ' +
+        JSON.stringify({
+          claim: claimed.kind,
+          cancel: cancelled.kind,
+          durableState: relation.state,
+        }),
     );
   }));

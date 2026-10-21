@@ -143,8 +143,13 @@ export interface RetrySubmissionLedger extends SubmissionLedger {
 }
 export interface RetryPrepareHooks {
   // Trusted synchronous test wiring only; never receives state or ownership handles.
-  onPhase?: (phase: 'before_context') => void;
+  onPhase?: (phase: RetryLedgerPhase) => void;
 }
+export type RetryLedgerPhase =
+  | 'before_context'
+  | 'after_prepare_commit'
+  | 'before_accepted_commit'
+  | 'after_accepted_commit';
 export type RetryLedgerErrorCode =
   | 'UpgradeRequired'
   | 'SnapshotUnavailable'
@@ -1345,6 +1350,11 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
     if (this.closed || this.schemaInvalidated) fail('LedgerUnavailable');
   }
 
+  private signalRetryPhase(phase: RetryLedgerPhase) {
+    if (this.retryHooks.onPhase?.(phase) !== undefined)
+      fail('LedgerUnavailable');
+  }
+
   private verifyMutationVersion() {
     // Called after BEGIN IMMEDIATE, before replay or any write. Old binaries
     // still require the operator's offline stop/restart discipline.
@@ -1504,8 +1514,7 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
         );
         if (this.openedSchema.version === 2) {
           if (retry) {
-            if (this.retryHooks.onPhase?.('before_context') !== undefined)
-              fail('LedgerUnavailable');
+            this.signalRetryPhase('before_context');
             this.database
               .query(
                 `INSERT INTO intent_context
@@ -1540,6 +1549,8 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
           dispatchCapability: capability,
         };
       });
+      if (retry && result.kind === 'created')
+        this.signalRetryPhase('after_prepare_commit');
       return result;
     } catch (error) {
       throw toLedgerError(error);
@@ -1679,7 +1690,7 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
     validateOutcome(input.outcome);
 
     try {
-      return withImmediateTransaction(
+      const result = withImmediateTransaction(
         this.database,
         () => {
           this.verifyMutationVersion();
@@ -1792,10 +1803,18 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
             input.requestId,
           );
           if (!stored) fail('OutcomePersistenceFailed');
+          if (
+            this.openedSchema.version === 2 &&
+            input.outcome.kind === 'accepted'
+          )
+            this.signalRetryPhase('before_accepted_commit');
           return rowToIntentView(stored);
         },
         'OutcomePersistenceFailed',
       );
+      if (this.openedSchema.version === 2 && input.outcome.kind === 'accepted')
+        this.signalRetryPhase('after_accepted_commit');
+      return result;
     } catch (error) {
       throw toLedgerError(error, 'OutcomePersistenceFailed');
     }
