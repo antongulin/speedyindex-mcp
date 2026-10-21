@@ -1796,10 +1796,25 @@ export type MigrationReceipt =
   | { migrated: false; schemaVersion: 2; reason: 'AlreadyV2' };
 
 // Trusted in-process test wiring only; never supplied by CLI, MCP, policy or environment.
+export type MigrationPhase =
+  'backup_verified' | 'before_commit' | 'after_commit';
+
 export interface MigrationTestHooks {
   afterCheckpoint?: () => void;
+  onPhase?: (phase: MigrationPhase) => void;
   maxWriteBytes?: number;
   fault?: 'copy' | 'fileSync' | 'directorySync' | 'parentSync';
+}
+
+function signalMigrationPhase(
+  hooks: MigrationTestHooks,
+  phase: MigrationPhase,
+) {
+  if (!hooks.onPhase) return;
+  if (hooks.onPhase.constructor.name === 'AsyncFunction')
+    throw new LedgerMigrationError('MigrationFailed');
+  const result = hooks.onPhase(phase);
+  if (result !== undefined) throw new LedgerMigrationError('MigrationFailed');
 }
 
 const copyBufferBytes = 64 * 1024;
@@ -2241,6 +2256,7 @@ export function migrateLedgerV2(
             directoryIdentity,
           );
           requireEmptyWal(options.stateDirectory);
+          signalMigrationPhase(hooks, 'backup_verified');
           phase = 'migration';
           for (const sql of v2SchemaStatements) database!.run(sql);
           database!
@@ -2257,9 +2273,11 @@ export function migrateLedgerV2(
             coreProjectionDigest(database!) !== digest
           )
             throw new LedgerMigrationError('MigrationFailed');
+          signalMigrationPhase(hooks, 'before_commit');
           return digest;
         })
         .immediate();
+      signalMigrationPhase(hooks, 'after_commit');
       database.close();
       database = undefined;
       assertStorageIdentity(

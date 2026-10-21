@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Database, constants } from 'bun:sqlite';
 import { expect, test } from 'bun:test';
 import {
@@ -57,7 +57,7 @@ function fixture() {
   );
   const handles: { close(): void }[] = [];
   // Register cleanup before any init/open/fixture write. Preserve the tree on close failure.
-  const cleanup = () => {
+  const cleanup = (removeRoot = true) => {
     const failures: unknown[] = [];
     for (const handle of handles.reverse()) {
       try {
@@ -68,7 +68,7 @@ function fixture() {
     }
     if (failures.length)
       throw new AggregateError(failures, 'Fixture close failed.');
-    rmSync(root, { recursive: true });
+    if (removeRoot) rmSync(root, { recursive: true });
   };
   const track = <T extends { close(): void }>(handle: T) => {
     handles.push(handle);
@@ -1515,3 +1515,431 @@ for (const shape of [
     }
   });
 }
+
+async function migrationDeadline<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('Migration child deadline exceeded.')),
+          5000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function spawnMigrationProcess(home: string) {
+  return Bun.spawn(
+    [
+      process.execPath,
+      '--no-env-file',
+      resolve('tests/fixtures/retry-ledger-child.ts'),
+    ],
+    {
+      cwd: process.cwd(),
+      env: { HOME: home },
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
+}
+interface MigrationChild {
+  process: ReturnType<typeof spawnMigrationProcess>;
+  pauseAt: 'before_commit' | 'after_commit';
+  markers: string[];
+  phaseReady: Promise<void>;
+  stdoutDone?: Promise<void>;
+  stderrDone?: Promise<string>;
+  inputClosed: boolean;
+  exitResult?: number;
+}
+async function startMigrationChild(
+  config: {
+    stateDirectory: string;
+    backupDirectory: string;
+    pauseAt: 'before_commit' | 'after_commit';
+  },
+  home: string,
+  children: MigrationChild[],
+) {
+  let ready!: () => void;
+  let failed!: (error: unknown) => void;
+  const phaseReady = new Promise<void>((resolve, reject) => {
+    ready = resolve;
+    failed = reject;
+  });
+  void phaseReady.catch(() => {});
+  const process = spawnMigrationProcess(home);
+  const child: MigrationChild = {
+    process,
+    pauseAt: config.pauseAt,
+    markers: [],
+    phaseReady,
+    inputClosed: false,
+  };
+  children.push(child); // Cleanup registry owns the PID before stream startup or writes.
+  child.stderrDone = new Response(process.stderr).text();
+  void child.stderrDone.catch(() => {});
+  child.stdoutDone = (async () => {
+    const reader = process.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        if (buffer.length > 256)
+          throw new Error('Unexpected migration child output.');
+        while (buffer.includes('\n')) {
+          const newline = buffer.indexOf('\n');
+          const marker = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (
+            ![
+              'backup_verified',
+              'before_commit',
+              'after_commit',
+              'receipt',
+            ].includes(marker)
+          )
+            throw new Error('Unexpected migration child marker.');
+          child.markers.push(marker);
+          if (child.markers.length > 4)
+            throw new Error('Excess migration child output.');
+          if (marker === config.pauseAt) ready();
+        }
+      }
+      buffer += decoder.decode();
+      if (buffer !== '' || !child.markers.includes(config.pauseAt))
+        throw new Error('Migration child exited before its phase.');
+    } catch (error) {
+      failed(error);
+      throw error;
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+  void child.stdoutDone.catch(() => {});
+  await migrationDeadline(
+    Promise.resolve(process.stdin.write(JSON.stringify(config) + '\n')),
+  );
+  await migrationDeadline(Promise.resolve(process.stdin.flush()));
+  await migrationDeadline(Promise.resolve(process.stdin.end()));
+  child.inputClosed = true;
+  return child;
+}
+async function killMigrationChild(child: MigrationChild) {
+  if (child.process.exitCode === null && child.process.signalCode === null)
+    child.process.kill('SIGKILL');
+  child.exitResult = await migrationDeadline(child.process.exited);
+}
+async function closeMigrationFixture(
+  f: ReturnType<typeof fixture>,
+  children: MigrationChild[],
+  verified: boolean,
+) {
+  const failures: unknown[] = [];
+  const reaped = await Promise.allSettled(children.map(killMigrationChild));
+  for (const result of reaped)
+    if (result.status === 'rejected') failures.push(result.reason);
+  const drained = await Promise.allSettled(
+    children.map(async (child, index) => {
+      const settled = await Promise.allSettled([
+        migrationDeadline(
+          (async () => {
+            if (!child.inputClosed) {
+              await child.process.stdin.end();
+              child.inputClosed = true;
+            }
+          })(),
+        ),
+        migrationDeadline<void | string>(
+          child.stdoutDone ?? new Response(child.process.stdout).text(),
+        ),
+        migrationDeadline(
+          child.stderrDone ?? new Response(child.process.stderr).text(),
+        ),
+      ]);
+      for (const result of settled)
+        if (result.status === 'rejected') failures.push(result.reason);
+      const stderr = settled[2];
+      if (stderr?.status === 'fulfilled' && stderr.value !== '')
+        failures.push(new Error('Migration child stderr was not empty.'));
+      console.info(
+        'V2-04_PROCESS ' +
+          JSON.stringify({
+            pauseAt: child.pauseAt,
+            pid: child.process.pid,
+            reaped: reaped[index]?.status === 'fulfilled',
+            signal: child.process.signalCode,
+            exitResult: child.exitResult,
+            inputClosed: child.inputClosed,
+            stdoutSettled: settled[1]?.status === 'fulfilled',
+            stderrSettled: settled[2]?.status === 'fulfilled',
+            markers: child.markers,
+          }),
+      );
+    }),
+  );
+  for (const result of drained)
+    if (result.status === 'rejected') failures.push(result.reason);
+  try {
+    f.cleanup(verified && failures.length === 0);
+  } catch (error) {
+    failures.push(error);
+  }
+  const removed = !existsSync(f.root);
+  if (verified && failures.length === 0 && !removed)
+    failures.push(new Error('Owned migration root was not removed.'));
+  console.info(
+    'V2-04_CLEANUP ' +
+      JSON.stringify({
+        ownedRoot: f.root,
+        removed,
+        children: children.length,
+        failures: failures.length,
+      }),
+  );
+  if (failures.length)
+    throw new AggregateError(
+      failures,
+      'Migration fixture cleanup failed; owned root preserved.',
+    );
+}
+
+function seedCrashMigration(f: ReturnType<typeof fixture>, state: string) {
+  const ledger = f.init(state, 1);
+  for (const kind of ['prepared', 'dispatching', 'accepted'] as const) {
+    const value = {
+      ...input(`crash-${kind}`),
+      submittedUrls: [
+        `https://example.test/Crash/${kind}?Case=1`,
+        `https://example.test/é/${kind}/`,
+      ],
+    };
+    const prepared = newIntent(ledger, value);
+    if (kind === 'prepared') continue;
+    const claim = ledger.claimDispatch(prepared.dispatchCapability, 0);
+    if (claim.kind !== 'claimed')
+      throw new Error('Expected synthetic crash-fixture claim.');
+    if (kind === 'accepted')
+      ledger.recordDispatchOutcome({
+        credentialFingerprint: binding,
+        requestId: value.requestId,
+        expectedStateVersion: 1,
+        outcomeToken: claim.outcomeToken,
+        outcome: {
+          kind: 'accepted',
+          providerType: 'google/indexer',
+          providerTaskId: ' Synthetic-é ',
+        },
+      });
+  }
+  ledger.close();
+  const db = f.raw(state);
+  db.run('UPDATE intent_events SET event_id = event_id + 9007199254740992');
+  db.run('UPDATE sqlite_sequence SET seq = 9007199254745999');
+  const before = exactCoreRows(db);
+  db.close();
+  return before;
+}
+function expectCrashBackup(
+  f: ReturnType<typeof fixture>,
+  backup: string,
+  before: ReturnType<typeof exactCoreRows>,
+) {
+  const manifest = JSON.parse(
+    readFileSync(join(backup, 'backup-manifest.json'), 'utf8'),
+  ) as { files: Record<string, { size: string; sha256: string }> };
+  for (const [name, expected] of Object.entries(manifest.files)) {
+    const bytes = readFileSync(join(backup, name));
+    expect(createHash('sha256').update(bytes).digest('hex')).toBe(
+      expected.sha256,
+    );
+    expect(String(bytes.length)).toBe(expected.size);
+  }
+  const db = f.raw(backup);
+  expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 1 });
+  expect(exactCoreRows(db)).toEqual(before);
+}
+for (const pauseAt of ['before_commit', 'after_commit'] as const) {
+  test(`V2-04 ${pauseAt}: actual owned child death preserves the native transaction boundary`, async () => {
+    const f = fixture();
+    const children: MigrationChild[] = [];
+    let verified = false;
+    try {
+      const state = join(f.root, 'state');
+      const backup = join(f.root, 'backup');
+      const home = join(f.root, 'child-home');
+      mkdirSync(home, { mode: 0o700 });
+      const before = seedCrashMigration(f, state);
+      const inode = lstatSync(join(state, 'ledger.sqlite')).ino;
+      const child = await startMigrationChild(
+        { stateDirectory: state, backupDirectory: backup, pauseAt },
+        home,
+        children,
+      );
+      await migrationDeadline(child.phaseReady);
+      await killMigrationChild(child);
+      expect(child.process.signalCode).toBe('SIGKILL');
+      expect(child.process.pid).toBeGreaterThan(0);
+      await migrationDeadline(child.stdoutDone!);
+      expect(await migrationDeadline(child.stderrDone!)).toBe('');
+      expect(child.markers).toEqual(
+        pauseAt === 'before_commit'
+          ? ['backup_verified', 'before_commit']
+          : ['backup_verified', 'before_commit', 'after_commit'],
+      );
+      expectCrashBackup(f, backup, before);
+      // Normal open must validate the recovered exact schema, never repair or migrate it.
+      f.open(state).close();
+      const db = f.raw(state);
+      expect(exactCoreRows(db)).toEqual(before);
+      expect(lstatSync(join(state, 'ledger.sqlite')).ino).toBe(inode);
+      if (pauseAt === 'before_commit') expectV1Unchanged(db, before);
+      else {
+        expect(db.query('PRAGMA user_version').get()).toEqual({
+          user_version: 2,
+        });
+        expect(
+          db.query('SELECT COUNT(*) AS count FROM intent_context').get(),
+        ).toEqual({ count: before.intents!.length });
+        expect(
+          db
+            .query(
+              'SELECT DISTINCT origin_kind, parent_family, parent_task_id, source_manifest_digest, plan_fingerprint FROM intent_context',
+            )
+            .all(),
+        ).toEqual([
+          {
+            origin_kind: 'legacy_unattributed',
+            parent_family: null,
+            parent_task_id: null,
+            source_manifest_digest: null,
+            plan_fingerprint: null,
+          },
+        ]);
+        const completed = snapshot(db);
+        const unused = join(f.root, 'must-not-create');
+        expect(
+          migrateLedgerV2({ stateDirectory: state, backupDirectory: unused }),
+        ).toEqual({ migrated: false, schemaVersion: 2, reason: 'AlreadyV2' });
+        expect(existsSync(unused)).toBe(false);
+        expect(snapshot(db)).toEqual(completed);
+        expect(exactCoreRows(db)).toEqual(before);
+      }
+      verified = true;
+    } finally {
+      await closeMigrationFixture(f, children, verified);
+    }
+  }, 30000);
+}
+
+test('V2-04 exception: injected synchronous precommit exception rolls back DDL and returns exact sanitized failure', () => {
+  const f = fixture();
+  try {
+    const state = join(f.root, 'state');
+    const backup = join(f.root, 'backup');
+    const before = seedCrashMigration(f, state);
+    const phases: string[] = [];
+    expectMigrationError(
+      () =>
+        migrateLedgerV2(
+          { stateDirectory: state, backupDirectory: backup },
+          {
+            onPhase(phase) {
+              phases.push(phase);
+              if (phase === 'before_commit')
+                throw new Error(
+                  'Synthetic private transaction failure details.',
+                );
+            },
+          },
+        ),
+      'MigrationFailed',
+    );
+    expect(phases).toEqual(['backup_verified', 'before_commit']);
+    f.open(state).close();
+    expectV1Unchanged(f.raw(state), before);
+    expectCrashBackup(f, backup, before);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('V2-04 reactivation: repeated maintenance preserves new V2 unknown history, standalone context and held units', () => {
+  const f = fixture();
+  try {
+    const state = join(f.root, 'state');
+    const backup = join(f.root, 'backup');
+    seedCrashMigration(f, state);
+    expect(
+      migrateLedgerV2({ stateDirectory: state, backupDirectory: backup })
+        .migrated,
+    ).toBe(true);
+    const ledger = f.open(state);
+    const value = {
+      ...input('post-reactivation'),
+      submittedUrls: ['https://example.test/New/unknown'],
+    };
+    const prepared = newIntent(ledger, value);
+    const claim = ledger.claimDispatch(prepared.dispatchCapability, 0);
+    if (claim.kind !== 'claimed')
+      throw new Error('Expected synthetic reactivation claim.');
+    ledger.recordDispatchOutcome({
+      credentialFingerprint: binding,
+      requestId: value.requestId,
+      expectedStateVersion: 1,
+      outcomeToken: claim.outcomeToken,
+      outcome: { kind: 'unknown' },
+    });
+    const db = f.raw(state);
+    const before = snapshot(db);
+    const reactivatedCore = exactCoreRows(db);
+    const unused = join(f.root, 'must-not-restore');
+    expect(
+      migrateLedgerV2({ stateDirectory: state, backupDirectory: unused }),
+    ).toEqual({ migrated: false, schemaVersion: 2, reason: 'AlreadyV2' });
+    expect(existsSync(unused)).toBe(false);
+    expect(snapshot(db)).toEqual(before);
+    expect(exactCoreRows(db)).toEqual(reactivatedCore);
+    expect(
+      db
+        .query('SELECT origin_kind FROM intent_context WHERE request_id = ?')
+        .get(value.requestId),
+    ).toEqual({ origin_kind: 'standalone' });
+    expect(ledger.readIntent(binding, value.requestId)).toMatchObject({
+      state: 'unknown',
+      stateVersion: 2,
+      reservation: value.reservation,
+    });
+    expect(
+      db
+        .query(
+          'SELECT event_kind FROM intent_events WHERE request_id = ? ORDER BY event_id',
+        )
+        .all(value.requestId),
+    ).toEqual([
+      { event_kind: 'prepared' },
+      { event_kind: 'dispatching' },
+      { event_kind: 'unknown' },
+    ]);
+    expectLedgerError(
+      () =>
+        ledger.prepareIntent({
+          ...value,
+          requestId: 'must-still-overlap',
+          budget: { ...value.budget, budgetScope: 'another-scope' },
+        }),
+      'UrlOverlap',
+    );
+  } finally {
+    f.cleanup();
+  }
+});
