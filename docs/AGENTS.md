@@ -6,7 +6,7 @@ Maintain the roadmap, runtime architecture, dependency decisions, and source att
 
 ## Ownership
 
-`implementation-plan.md` owns proposed scope and delivery gates. `architecture.md` describes runtime boundaries; `dependencies.md` records compatibility decisions; [state-maintenance.md](state-maintenance.md) owns trusted internal V2 maintenance, private backup and manual recovery boundaries; CLI exposure is later work. `provenance.md` owns documentation sources and revisions. `dox-LICENSE.txt` preserves the upstream notice verbatim.
+`implementation-plan.md` owns proposed scope and delivery gates. `architecture.md` describes runtime boundaries; `dependencies.md` records compatibility decisions; [state-maintenance.md](state-maintenance.md) owns explicit V1/V2 commands, private backup and manual recovery boundaries. `provenance.md` owns documentation sources and revisions. `dox-LICENSE.txt` preserves the upstream notice verbatim.
 
 ## Local Contracts
 

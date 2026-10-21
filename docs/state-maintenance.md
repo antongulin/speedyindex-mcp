@@ -1,16 +1,40 @@
 # Local state maintenance
 
-The existing CLI `--init-submission-state` creates only V1. V2 initialization and migration are trusted internal entries in `src/submission-ledger.ts`, without CLI or MCP exposure in this delivery. They require explicit private paths, no API key or provider request, and select no policy, caps or paid enablement.
+These commands operate only on explicitly selected private local state. They require no API key, policy, provider request or MCP session. They do not enable paid submissions, choose caps or add public tools. Use Bun's `--no-env-file` before the entrypoint; the source entrypoint is `src/cli.ts`, and the current build is `dist/cli.js`.
 
-## Internal initialization and offline migration
+## New state
 
-The trusted call `initializeLedgerV2({ stateDirectory })` returns a common `SubmissionLedger` handle; its caller must close that handle. It creates only a new private leaf below an existing trusted parent. It refuses existing, partial or unsafe paths, creates no parents, and does not repair or clean up failed initialization. Normal submit opens existing complete V1/V2 state; startup and preview open no ledger and never migrate.
+The original command still creates V1:
+
+```sh
+bun --no-env-file dist/cli.js --init-submission-state '<canonical-absolute-new-directory>'
+```
+
+To create V2 explicitly:
+
+```sh
+bun --no-env-file dist/cli.js --init-submission-state-v2 '<canonical-absolute-new-directory>'
+```
+
+Successful initialization prints only `{"initialized":true,"schemaVersion":1}` or `{"initialized":true,"schemaVersion":2}`. Both commands require a new leaf below an existing trusted parent. They refuse existing, partial or unsafe paths and do not create parents, repair permissions or clean up failed initialization. Inspect any retained files. Never initialize replacement state to bypass reservations.
 
 Paths must be canonical absolute POSIX paths, with no symlink ancestors. Ancestors must be root/current-user owned and not group/other writable; root-owned sticky temporary directories are permitted. The final directory must be current-user owned, mode `0700`; database and sidecars must be current-user owned, regular, single-link files with mode `0600`. Resolve operating-system path aliases before invoking maintenance. These checks do not defend against a malicious process with the same user or root privileges.
 
-Before the trusted synchronous call `migrateLedgerV2({ stateDirectory, backupDirectory })`, drain all in-flight paid calls and stop ALL cooperating hosts and every other process using this store. Select an explicit new private backup directory under a trusted existing parent. A SQL lock or successful maintenance result does not prove all hosts stopped. Never overwrite backups or manually delete sidecars. Restart ALL hosts on the V2-capable binary only after inspecting the resulting state and verified backup. Policy changes independently require restarting all hosts.
+## Offline V1 to V2 migration
 
-The internal result is either `migrated: true, schemaVersion: 2, backupVerified: true` or `migrated: false, schemaVersion: 2, reason: AlreadyV2`. AlreadyV2 creates no new backup or contexts. Retain the private backup and final `backup-manifest.json`, and keep a private maintenance audit. Errors are sanitized; private records and paths do not belong in public logs.
+1. Drain all in-flight paid calls, then stop **ALL cooperating hosts**, scheduler/automation and other processes using this store. Stopping a host can lose its in-memory dispatch capability or outcome token. A SQL lock, idle-looking process or successful command does not prove that every old host stopped. Do not run old and new binaries together during migration.
+2. Preserve the existing state and select an explicit new private backup directory under a trusted existing parent. Do not overwrite an earlier backup or remove WAL, SHM or rollback-journal files manually.
+3. Run the exclusive local command:
+
+   ```sh
+   bun --no-env-file dist/cli.js \
+     --migrate-submission-state-v2 '<canonical-absolute-existing-v1-directory>' \
+     --backup-directory '<canonical-absolute-new-backup-directory>'
+   ```
+
+4. Retain the verified private backup, its `backup-manifest.json`, and a private maintenance audit. Inspect the resulting strict V2 state and command receipt. Restart **ALL cooperating hosts on the V2-capable binary** before resuming work. Policy changes independently require restarting all hosts.
+
+A completed migration prints only `{"migrated":true,"schemaVersion":2,"backupVerified":true}`. A strict store already at V2 prints `{"migrated":false,"schemaVersion":2,"reason":"AlreadyV2"}` and creates no new backup or contexts. The CLI validates the entire argument grammar before reading a key or configuration, opening state, making network requests or starting the MCP server. Mixed modes, duplicate, unknown or missing options fail at that boundary; local modes cannot be combined with fingerprint or stdio policy/state options. Errors are fixed sanitized messages, without paths, SQL or private records.
 
 Migration audits the exact V1 schema, rows, event chains and foreign keys without repair. It requires WAL/FULL discipline and a successful TRUNCATE checkpoint with empty WAL, then acquires a writer transaction and rechecks schema, identity and empty WAL to catch an intervening writer. It holds that transaction through a bounded checked file-descriptor copy to a new exclusive private backup, complete logical verification, close and final fsync. The private manifest records final retained file hashes after verification bookkeeping. Only then does it add two tables and two nonunique indexes, seed `legacy_unattributed` contexts, assign a random ledger identity and commit version 2 once. The original database inode and complete core rows, events, URL ordinals, unit reservations, policy/quote identities, ownership digests and sequence values are preserved. It does not infer legacy ancestry.
 
@@ -26,7 +50,7 @@ Migration preserves capability and outcome-token digests, but cannot recover los
 
 ## Delivered scope
 
-Ordinary V2 preparation inserts a `standalone` context in the same transaction as its core intent, URLs and event. This context records use of the ordinary preparation entry; it does not prove human intent or original ancestry. Migration leaves legacy attribution unknown and preserves all original core rows, ownership and holds. Common host interfaces, policy/body/quote/ACK contracts and the seven public tools remain unchanged. Internal snapshots and atomic retry admission now exist as trusted module APIs. V2 CLI commands, shared source/built V2 integration journeys, deterministic one-shot orchestration and the five remaining public tools remain later work.
+Ordinary V2 preparation inserts a `standalone` context in the same transaction as its core intent, URLs and event. This context records use of the ordinary preparation entry; it does not prove human intent or original ancestry. Migration leaves legacy attribution unknown and preserves all original core rows, ownership and holds. Common host interfaces, policy/body/quote/ACK contracts and the seven public tools remain unchanged. Internal snapshots and atomic retry admission now exist as trusted module APIs. Explicit V2 CLI commands and shared source/built maintenance and three-create integration journeys complete this local foundation. Deterministic one-shot orchestration and the five remaining public tools remain later work.
 
 ## Internal snapshots and retry admission
 
