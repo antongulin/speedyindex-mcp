@@ -20,6 +20,17 @@ import {
 } from 'bun:sqlite';
 import { taskFamilySchema, type TaskFamily } from './task-status';
 import { providerTaskIdSchema } from './submission-contract';
+import {
+  checkSnapshotBounds,
+  freezeSnapshot,
+  projectRetrySnapshot,
+  signalSnapshotPhase,
+  snapshotLimits,
+  SnapshotReadError,
+  type RetrySnapshot,
+  type SnapshotReadHooks,
+  type SnapshotUnavailableReason,
+} from './retry-ledger-snapshot';
 
 export type Unit = 'tokens' | 'indexer' | 'checker';
 export type UnitVector = Readonly<Record<Unit, number>>;
@@ -117,6 +128,52 @@ export type DispatchOutcome =
 
 export interface LedgerPathOptions {
   stateDirectory: string;
+}
+
+type RetryFamily = 'google/indexer' | 'yandex/indexer';
+export interface PrepareRetryIntentInput {
+  intent: PrepareIntentInput;
+  parent: { family: RetryFamily; taskId: string };
+  sourceManifestDigest: string;
+  planFingerprint: string;
+  expectedRevision: string;
+}
+export interface RetrySubmissionLedger extends SubmissionLedger {
+  prepareRetryIntent(input: PrepareRetryIntentInput): PrepareResult;
+}
+export interface RetryPrepareHooks {
+  // Trusted synchronous test wiring only; never receives state or ownership handles.
+  onPhase?: (phase: RetryLedgerPhase) => void;
+}
+export type RetryLedgerPhase =
+  | 'before_context'
+  | 'after_prepare_commit'
+  | 'before_accepted_commit'
+  | 'after_accepted_commit';
+export type RetryLedgerErrorCode =
+  | 'UpgradeRequired'
+  | 'SnapshotUnavailable'
+  | 'SnapshotLimitExceeded'
+  | 'SnapshotConflict'
+  | 'RetryLineageConflict'
+  | 'UnknownRetryDispatch';
+const retryErrorMessages: Record<RetryLedgerErrorCode, string> = {
+  UpgradeRequired: 'Retry submission requires an explicitly upgraded ledger.',
+  SnapshotUnavailable: 'Retry submission history is unavailable.',
+  SnapshotLimitExceeded: 'Retry submission history exceeds snapshot limits.',
+  SnapshotConflict: 'Retry submission history has changed.',
+  RetryLineageConflict:
+    'Retry submission lineage conflicts with local history.',
+  UnknownRetryDispatch: 'A retry dispatch has no confirmed provider identity.',
+};
+export class RetryLedgerError extends Error {
+  constructor(
+    readonly code: RetryLedgerErrorCode,
+    readonly reason?: SnapshotUnavailableReason,
+  ) {
+    super(retryErrorMessages[code]);
+    this.name = 'RetryLedgerError';
+  }
 }
 
 export type LedgerErrorCode =
@@ -432,6 +489,34 @@ function validateStateVersion(value: unknown): asserts value is number {
     fail('InvalidLedgerInput');
 }
 
+function validateRetryInput(
+  value: unknown,
+): asserts value is PrepareRetryIntentInput {
+  requireKeys(value, [
+    'intent',
+    'parent',
+    'sourceManifestDigest',
+    'planFingerprint',
+    'expectedRevision',
+  ]);
+  validatePrepareInput(value.intent);
+  if (
+    value.intent.taskFamily !== 'google/indexer' &&
+    value.intent.taskFamily !== 'yandex/indexer'
+  )
+    fail('InvalidLedgerInput');
+  requireKeys(value.parent, ['family', 'taskId']);
+  if (
+    (value.parent.family !== 'google/indexer' &&
+      value.parent.family !== 'yandex/indexer') ||
+    !providerTaskIdSchema.safeParse(value.parent.taskId).success
+  )
+    fail('InvalidLedgerInput');
+  requireDigest(value.sourceManifestDigest);
+  requireDigest(value.planFingerprint);
+  requireDigest(value.expectedRevision);
+}
+
 function validateOutcome(value: unknown): asserts value is DispatchOutcome {
   if (!isRecord(value)) fail('InvalidLedgerInput');
   if (value.kind === 'accepted') {
@@ -727,7 +812,11 @@ interface SchemaIdentity {
 
 function readLedgerId(database: Database): string {
   const rows = database
-    .query('SELECT singleton, ledger_id FROM retry_ledger_meta LIMIT 2')
+    .query(
+      `SELECT singleton,
+      CASE WHEN length(CAST(ledger_id AS BLOB)) = 64 THEN ledger_id END AS ledger_id
+      FROM retry_ledger_meta LIMIT 2`,
+    )
     .all() as {
     singleton: number;
     ledger_id: string;
@@ -793,7 +882,7 @@ function verifyCoreData(database: Database) {
     fail('LedgerUnavailable');
 }
 
-function verifyV2Data(database: Database) {
+function verifyV2Data(database: Database, binding?: string) {
   verifyCoreData(database);
   if (
     database
@@ -815,12 +904,14 @@ function verifyV2Data(database: Database) {
       task_family: string;
       provider_task_id: string | null;
     },
-    []
+    string[]
   >(`SELECT c.parent_family, c.parent_task_id, c.source_manifest_digest, c.plan_fingerprint,
       i.task_family, i.provider_task_id
     FROM intent_context c JOIN intents i USING (credential_fp, request_id)
-    WHERE c.origin_kind = 'retry'`);
-  for (const row of contexts.iterate()) {
+    WHERE c.origin_kind = 'retry'${binding === undefined ? '' : ' AND c.credential_fp = ?'}`);
+  for (const row of contexts.iterate(
+    ...(binding === undefined ? [] : [binding]),
+  )) {
     if (
       row.parent_family !== row.task_family ||
       !providerTaskIdSchema.safeParse(row.parent_task_id).success ||
@@ -835,6 +926,12 @@ function verifyV2Data(database: Database) {
 }
 
 function verifySchema(database: Database): SchemaIdentity {
+  const schema = verifySchemaShape(database);
+  if (schema.version === 2) verifyV2Data(database);
+  return schema;
+}
+
+function verifySchemaShape(database: Database): SchemaIdentity {
   const version = readUserVersion(database);
   if (version !== 1 && version !== 2) fail('LedgerUnavailable');
   const schemaObjects = versionedSchemaObjects[version];
@@ -852,7 +949,6 @@ function verifySchema(database: Database): SchemaIdentity {
   }
   if (version === 2) {
     const ledgerId = readLedgerId(database);
-    verifyV2Data(database);
     return { version, ledgerId };
   }
   return { version, ledgerId: null };
@@ -887,8 +983,12 @@ function configureConnection(database: Database) {
 function toLedgerError(
   error: unknown,
   fallback: LedgerErrorCode = 'LedgerUnavailable',
-): SubmissionLedgerError {
-  if (error instanceof SubmissionLedgerError) return error;
+): SubmissionLedgerError | RetryLedgerError {
+  if (
+    error instanceof SubmissionLedgerError ||
+    error instanceof RetryLedgerError
+  )
+    return error;
   if (error instanceof SQLiteError && error.code?.startsWith('SQLITE_BUSY'))
     return new SubmissionLedgerError('LedgerBusy');
   return new SubmissionLedgerError(fallback);
@@ -1235,7 +1335,7 @@ function checkToken(value: unknown) {
   return value;
 }
 
-class LocalSubmissionLedger implements SubmissionLedger {
+class LocalSubmissionLedger implements RetrySubmissionLedger {
   private closed = false;
   private schemaInvalidated = false;
 
@@ -1243,10 +1343,16 @@ class LocalSubmissionLedger implements SubmissionLedger {
     private readonly database: Database,
     private readonly stateDirectory: string,
     private readonly openedSchema: SchemaIdentity,
+    private readonly retryHooks: RetryPrepareHooks = {},
   ) {}
 
   private ensureOpen() {
     if (this.closed || this.schemaInvalidated) fail('LedgerUnavailable');
+  }
+
+  private signalRetryPhase(phase: RetryLedgerPhase) {
+    if (this.retryHooks.onPhase?.(phase) !== undefined)
+      fail('LedgerUnavailable');
   }
 
   private verifyMutationVersion() {
@@ -1263,6 +1369,19 @@ class LocalSubmissionLedger implements SubmissionLedger {
   }
 
   prepareIntent(value: PrepareIntentInput): PrepareResult {
+    return this.prepare(value);
+  }
+
+  prepareRetryIntent(value: PrepareRetryIntentInput): PrepareResult {
+    this.ensureOpen();
+    validateRetryInput(value);
+    return this.prepare(value.intent, value);
+  }
+
+  private prepare(
+    value: PrepareIntentInput,
+    retry?: PrepareRetryIntentInput,
+  ): PrepareResult {
     this.ensureOpen();
     validatePrepareInput(value);
     const input = value;
@@ -1272,6 +1391,12 @@ class LocalSubmissionLedger implements SubmissionLedger {
     try {
       const result = withImmediateTransaction(this.database, () => {
         this.verifyMutationVersion();
+        if (retry) {
+          if (this.openedSchema.version !== 2)
+            throw new RetryLedgerError('UpgradeRequired');
+          // Replay still audits schema/history, but never needs a bounded snapshot.
+          verifySchema(this.database);
+        }
         const existing = selectIntent(
           this.database,
           input.budget.credentialFingerprint,
@@ -1281,15 +1406,29 @@ class LocalSubmissionLedger implements SubmissionLedger {
           if (this.openedSchema.version === 2) {
             const context = this.database
               .query(
-                `SELECT origin_kind FROM intent_context
+                `SELECT origin_kind, parent_family, parent_task_id, source_manifest_digest, plan_fingerprint FROM intent_context
               WHERE credential_fp = ? AND request_id = ?`,
               )
               .get(input.budget.credentialFingerprint, input.requestId) as {
               origin_kind: string;
+              parent_family: string | null;
+              parent_task_id: string | null;
+              source_manifest_digest: string | null;
+              plan_fingerprint: string | null;
             } | null;
             if (!context) fail('LedgerUnavailable');
-            if (context.origin_kind === 'retry') fail('RequestIdConflict');
-            if (
+            if (retry) {
+              if (
+                context.origin_kind !== 'retry' ||
+                context.parent_family !== retry.parent.family ||
+                context.parent_task_id !== retry.parent.taskId ||
+                context.source_manifest_digest !== retry.sourceManifestDigest ||
+                context.plan_fingerprint !== retry.planFingerprint
+              )
+                fail('RequestIdConflict');
+            } else if (context.origin_kind === 'retry')
+              fail('RequestIdConflict');
+            else if (
               context.origin_kind !== 'standalone' &&
               context.origin_kind !== 'legacy_unattributed'
             )
@@ -1302,6 +1441,8 @@ class LocalSubmissionLedger implements SubmissionLedger {
             intent: rowToIntentView(existing),
           };
         }
+
+        if (retry) this.validateRetryAdmission(retry);
 
         const overlap = this.database
           .query(
@@ -1372,12 +1513,29 @@ class LocalSubmissionLedger implements SubmissionLedger {
           now,
         );
         if (this.openedSchema.version === 2) {
-          this.database
-            .query(
-              `INSERT INTO intent_context
+          if (retry) {
+            this.signalRetryPhase('before_context');
+            this.database
+              .query(
+                `INSERT INTO intent_context
+              (credential_fp, request_id, origin_kind, parent_family, parent_task_id, source_manifest_digest, plan_fingerprint)
+              VALUES (?, ?, 'retry', ?, ?, ?, ?)`,
+              )
+              .run(
+                input.budget.credentialFingerprint,
+                input.requestId,
+                retry.parent.family,
+                retry.parent.taskId,
+                retry.sourceManifestDigest,
+                retry.planFingerprint,
+              );
+          } else
+            this.database
+              .query(
+                `INSERT INTO intent_context
             (credential_fp, request_id, origin_kind) VALUES (?, ?, 'standalone')`,
-            )
-            .run(input.budget.credentialFingerprint, input.requestId);
+              )
+              .run(input.budget.credentialFingerprint, input.requestId);
         }
         const created = selectIntent(
           this.database,
@@ -1391,10 +1549,58 @@ class LocalSubmissionLedger implements SubmissionLedger {
           dispatchCapability: capability,
         };
       });
+      if (retry && result.kind === 'created')
+        this.signalRetryPhase('after_prepare_commit');
       return result;
     } catch (error) {
       throw toLedgerError(error);
     }
+  }
+
+  private validateRetryAdmission(retry: PrepareRetryIntentInput) {
+    const binding = retry.intent.budget.credentialFingerprint;
+    let snapshot;
+    try {
+      snapshot = projectRetrySnapshot(
+        this.database,
+        binding,
+        this.openedSchema.ledgerId!,
+        snapshotLimits(),
+      );
+    } catch (error) {
+      if (error instanceof SnapshotReadError)
+        throw new RetryLedgerError(
+          error.reason === 'LimitExceeded'
+            ? 'SnapshotLimitExceeded'
+            : 'SnapshotUnavailable',
+          error.reason,
+        );
+      throw new RetryLedgerError('SnapshotUnavailable');
+    }
+    if (snapshot.revision !== retry.expectedRevision)
+      throw new RetryLedgerError('SnapshotConflict');
+    const parent = snapshot.acceptedManifests.find(
+      (row) =>
+        row.taskFamily === retry.parent.family &&
+        row.providerTaskId === retry.parent.taskId,
+    );
+    const parentUrls = new Set(parent?.submittedUrls);
+    if (
+      retry.parent.family !== retry.intent.taskFamily ||
+      !parent ||
+      parent.originKind === 'retry' ||
+      parent.manifestDigest !== retry.sourceManifestDigest ||
+      !retry.intent.submittedUrls.every((url) => parentUrls.has(url))
+    )
+      throw new RetryLedgerError('RetryLineageConflict');
+    if (
+      snapshot.retryChildren.some(
+        (row) =>
+          (row.state === 'dispatching' || row.state === 'unknown') &&
+          row.providerTaskId === null,
+      )
+    )
+      throw new RetryLedgerError('UnknownRetryDispatch');
   }
 
   claimDispatch(
@@ -1484,7 +1690,7 @@ class LocalSubmissionLedger implements SubmissionLedger {
     validateOutcome(input.outcome);
 
     try {
-      return withImmediateTransaction(
+      const result = withImmediateTransaction(
         this.database,
         () => {
           this.verifyMutationVersion();
@@ -1527,6 +1733,41 @@ class LocalSubmissionLedger implements SubmissionLedger {
             input.outcome.kind === 'accepted'
               ? input.outcome.providerType
               : null;
+          if (
+            this.openedSchema.version === 2 &&
+            input.outcome.kind === 'accepted'
+          ) {
+            const context = this.database
+              .query<
+                {
+                  origin_kind: string;
+                  parent_family: string | null;
+                  parent_task_id: string | null;
+                },
+                [string, string]
+              >(
+                `SELECT origin_kind, parent_family, parent_task_id FROM intent_context WHERE credential_fp = ? AND request_id = ?`,
+              )
+              .get(input.credentialFingerprint, input.requestId);
+            if (!context) fail('OutcomePersistenceFailed');
+            const duplicate = this.database
+              .query(
+                `SELECT 1 FROM intents WHERE credential_fp = ? AND task_family = ? AND provider_task_id = ? AND state = 'accepted' AND request_id != ? LIMIT 1`,
+              )
+              .get(
+                input.credentialFingerprint,
+                row.task_family,
+                taskId,
+                input.requestId,
+              );
+            if (
+              duplicate ||
+              (context.origin_kind === 'retry' &&
+                context.parent_family === row.task_family &&
+                context.parent_task_id === taskId)
+            )
+              throw new RetryLedgerError('RetryLineageConflict');
+          }
           const updated = this.database
             .query(
               `UPDATE intents
@@ -1562,10 +1803,18 @@ class LocalSubmissionLedger implements SubmissionLedger {
             input.requestId,
           );
           if (!stored) fail('OutcomePersistenceFailed');
+          if (
+            this.openedSchema.version === 2 &&
+            input.outcome.kind === 'accepted'
+          )
+            this.signalRetryPhase('before_accepted_commit');
           return rowToIntentView(stored);
         },
         'OutcomePersistenceFailed',
       );
+      if (this.openedSchema.version === 2 && input.outcome.kind === 'accepted')
+        this.signalRetryPhase('after_accepted_commit');
+      return result;
     } catch (error) {
       throw toLedgerError(error, 'OutcomePersistenceFailed');
     }
@@ -1733,6 +1982,20 @@ function initializeVersionedLedger(
 }
 
 export function openLedger(options: LedgerPathOptions): SubmissionLedger {
+  return openLocalLedger(options);
+}
+
+export function openRetryLedgerV2(
+  options: LedgerPathOptions,
+  hooks: RetryPrepareHooks = {},
+): RetrySubmissionLedger {
+  return openLocalLedger(options, hooks);
+}
+
+function openLocalLedger(
+  options: LedgerPathOptions,
+  retryHooks?: RetryPrepareHooks,
+): LocalSubmissionLedger {
   validatePathInput(options);
   const uid = ensurePosixRuntime();
   let database: Database | undefined;
@@ -1748,6 +2011,8 @@ export function openLedger(options: LedgerPathOptions): SubmissionLedger {
     const openedSchema = database
       .transaction(() => verifySchema(database!))
       .deferred();
+    if (retryHooks !== undefined && openedSchema.version !== 2)
+      throw new RetryLedgerError('UpgradeRequired');
     configureConnection(database);
     validateCanonicalPathComponents(options.stateDirectory, uid);
     if (!sameIdentity(identity, validateDatabaseFile(path, uid, true)))
@@ -1758,6 +2023,7 @@ export function openLedger(options: LedgerPathOptions): SubmissionLedger {
       database,
       options.stateDirectory,
       openedSchema,
+      retryHooks,
     );
     database = undefined;
     return ledger;
@@ -1771,6 +2037,112 @@ export function openLedger(options: LedgerPathOptions): SubmissionLedger {
     }
     throw toLedgerError(error);
   }
+}
+
+// Trusted internal semantic reader. SQLite may update physical WAL bookkeeping;
+// query_only and a single read transaction prohibit logical ledger mutation.
+export function readRetrySnapshot(
+  options: LedgerPathOptions,
+  credentialFingerprint: string,
+  hooks: SnapshotReadHooks = {},
+): RetrySnapshot {
+  let database: Database | undefined;
+  let result: RetrySnapshot;
+  try {
+    validatePathInput(options);
+    requireDigest(credentialFingerprint);
+    const limits = snapshotLimits(hooks.limits);
+    const uid = ensurePosixRuntime();
+    if (!lstatOrMissing(options.stateDirectory))
+      throw new SnapshotReadError('MissingState');
+    const directoryIdentity = identityFrom(
+      validateCanonicalPathComponents(options.stateDirectory, uid),
+    );
+    const path = join(options.stateDirectory, databaseFilename);
+    validateSidecars(options.stateDirectory, uid);
+    if (!lstatOrMissing(path)) throw new SnapshotReadError('MissingState');
+    const identity = validateDatabaseFile(path, uid, true);
+    database = new Database(path, openFlags().database);
+    database.run('PRAGMA query_only = ON');
+    database.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+    database.run('PRAGMA foreign_keys = ON');
+    assertStorageIdentity(
+      options.stateDirectory,
+      uid,
+      identity,
+      directoryIdentity,
+    );
+    result = database
+      .transaction((): RetrySnapshot => {
+        // This schema SELECT, rather than BEGIN alone, pins the read snapshot.
+        const schemaBytes = database!
+          .query<{ n: number }, []>(
+            'SELECT COALESCE(SUM(length(CAST(sql AS BLOB))), 0) AS n FROM sqlite_schema',
+          )
+          .get()!.n;
+        signalSnapshotPhase(hooks, 'snapshot_fixed');
+        if (
+          !Number.isSafeInteger(schemaBytes) ||
+          schemaBytes > 16 * 1024 * 1024
+        )
+          throw new SnapshotReadError('LimitExceeded');
+        requireWal(database!);
+        const schema = verifySchemaShape(database!);
+        if (schema.version === 1)
+          throw new SnapshotReadError('UpgradeRequired');
+        checkSnapshotBounds(database!, credentialFingerprint, limits);
+        verifyV2Data(database!, credentialFingerprint);
+        signalSnapshotPhase(hooks, 'before_projection');
+        return projectRetrySnapshot(
+          database!,
+          credentialFingerprint,
+          schema.ledgerId!,
+          limits,
+        );
+      })
+      .deferred();
+    assertStorageIdentity(
+      options.stateDirectory,
+      uid,
+      identity,
+      directoryIdentity,
+    );
+    signalSnapshotPhase(hooks, 'before_close');
+    database.close(true);
+    database = undefined;
+    assertStorageIdentity(
+      options.stateDirectory,
+      uid,
+      identity,
+      directoryIdentity,
+    );
+  } catch (error) {
+    const reason =
+      error instanceof SnapshotReadError
+        ? error.reason
+        : error instanceof SubmissionLedgerError ||
+            error instanceof LedgerMigrationError
+          ? 'InvalidState'
+          : error instanceof SQLiteError &&
+              (error.code?.startsWith('SQLITE_BUSY') ||
+                error.code?.startsWith('SQLITE_LOCKED'))
+            ? 'Busy'
+            : error instanceof SQLiteError &&
+                (error.code?.startsWith('SQLITE_CORRUPT') ||
+                  error.code === 'SQLITE_NOTADB')
+              ? 'InvalidState'
+              : 'ReadFailure';
+    result = { availability: 'unavailable', reason };
+  } finally {
+    if (database) {
+      try {
+        database.close(true);
+      } catch {
+        result = { availability: 'unavailable', reason: 'ReadFailure' };
+      }
+    }
+  }
+  return freezeSnapshot(result);
 }
 
 export class LedgerMigrationError extends Error {
