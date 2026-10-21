@@ -677,6 +677,27 @@ test('C08 PURE output: unrecorded ACK remains distinct from durable accepted suc
   const wire = createIndexingTaskToolResult(result);
   expect(wire.structuredContent).toEqual(result);
   expect(wire.isError).toBe(true);
+  for (const taskId of [providerTaskId, 'different-ack-task']) {
+    const invalid = {
+      ...result,
+      status: 'accepted',
+      intent,
+      observation: { ...result.observation, taskId },
+      error: undefined,
+    } as const;
+    expect(createIndexingTaskResultSchema.safeParse(invalid).success).toBe(
+      false,
+    );
+    const fallback = createIndexingTaskToolResult(invalid);
+    expect(fallback.structuredContent).toEqual({
+      status: 'blocked',
+      error: createIndexingTaskError('InternalError'),
+    });
+    expect(fallback.isError).toBe(true);
+    expect(JSON.parse(fallback.content[0]!.text)).toEqual(
+      fallback.structuredContent,
+    );
+  }
   expect(
     createIndexingTaskResultSchema.safeParse({
       ...result,

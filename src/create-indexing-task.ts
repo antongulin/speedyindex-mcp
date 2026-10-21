@@ -531,6 +531,7 @@ export const createIndexingTaskResultSchema = z
     if (
       observation?.kind === 'accepted_ack' &&
       (observation.type !== request.family ||
+        (!observation.recorded && intent?.state === 'accepted') ||
         (observation.recorded &&
           (intent?.state !== 'accepted' ||
             intent.providerTaskId !== observation.taskId ||
