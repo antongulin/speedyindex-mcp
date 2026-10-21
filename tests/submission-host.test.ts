@@ -30,6 +30,10 @@ import {
   type CreateIndexingTaskResult,
 } from '../src/create-indexing-task';
 import {
+  createIndexCheckResultSchema,
+  createIndexCheckToolResult,
+} from '../src/create-index-check';
+import {
   createSubmissionContext,
   loadSubmissionConfiguration,
   submissionCredentialFingerprint,
@@ -167,6 +171,9 @@ const request = (id = 'request-1', urls = ['https://example.test/one']) =>
 const paths = new Set([
   '/v2/task/google/indexer/create',
   '/v2/task/yandex/indexer/create',
+  '/v2/task/google/checker/create',
+  '/v2/task/yandex/checker/create',
+  '/v2/task/bing/checker/create',
 ]);
 
 type ChildMode =
@@ -178,7 +185,7 @@ type ChildMode =
   | 'stop_after_claim'
   | 'abort_before_record'
   | 'read_fault_after_write_failure';
-function spawnHostProcess() {
+function spawnHostProcess(home: string) {
   return Bun.spawn(
     [
       process.execPath,
@@ -187,7 +194,7 @@ function spawnHostProcess() {
     ],
     {
       cwd: process.cwd(),
-      env: {},
+      env: { HOME: home },
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
@@ -212,8 +219,9 @@ async function startHostChild(
   setup: Record<string, unknown>,
   registry: HostProcess[],
   streams: HostChild[],
+  home: string,
 ) {
-  const process = spawnHostProcess();
+  const process = spawnHostProcess(home);
   // Register the raw handle before stream setup, serialization, writing or
   // flushing: every startup failure must still leave a reapable owned child.
   registry.push(process);
@@ -252,18 +260,26 @@ async function childEvent(child: HostChild, event: string) {
     if (message.event === event) return message;
   }
 }
-function childResult(child: HostChild) {
-  const operation = readChildResult(child);
+function childResult(
+  child: HostChild,
+  family: 'indexer' | 'checker' = 'indexer',
+) {
+  const operation = readChildResult(child, family);
   child.operations.push(operation);
   return operation;
 }
-async function readChildResult(child: HostChild) {
+async function readChildResult(
+  child: HostChild,
+  family: 'indexer' | 'checker',
+) {
   const message = await childEvent(child, 'RESULT');
   expect(await bounded(child.process.exited, 5_000)).toBe(0);
   expect(await bounded(child.stderr)).toBe('');
   expect(message.violations).toBe(0);
-  const result = message.result as CreateIndexingTaskResult;
-  expect(createIndexingTaskResultSchema.safeParse(result).success).toBe(true);
+  const result =
+    family === 'checker'
+      ? createIndexCheckResultSchema.parse(message.result)
+      : createIndexingTaskResultSchema.parse(message.result);
   expect(result.error?.code).not.toBe('InternalError');
   for (const secret of [key, fp, 'dispatchCapability', 'outcomeToken'])
     expect(JSON.stringify(child.messages).includes(secret)).toBe(false);
@@ -351,9 +367,11 @@ async function makeHarness() {
       JSON.stringify({
         code: 0,
         task_id: `provider-${records.length}`,
-        type: receipt.path?.includes('/yandex/')
-          ? 'yandex/indexer'
-          : 'google/indexer',
+        type: receipt.path?.includes('/checker/')
+          ? receipt.path.slice('/v2/task/'.length, -'/create'.length)
+          : receipt.path?.includes('/yandex/')
+            ? 'yandex/indexer'
+            : 'google/indexer',
       }),
     );
   let api: Awaited<ReturnType<typeof fixture>>;
@@ -543,6 +561,32 @@ async function makeHarness() {
     policy,
     host,
     call,
+    check(
+      instance: InstanceType<typeof Host>,
+      input: unknown,
+      signal?: AbortSignal,
+    ) {
+      const cleanup = new AbortController();
+      controllers.push(cleanup);
+      const operation = instance.createIndexCheck(
+        input,
+        signal ? AbortSignal.any([signal, cleanup.signal]) : cleanup.signal,
+      );
+      pending.push(operation);
+      return bounded(operation, 5_000).then((result) => {
+        expect(createIndexCheckResultSchema.safeParse(result).success).toBe(
+          true,
+        );
+        expect(result.error?.code).not.toBe('InternalError');
+        const wire = createIndexCheckToolResult(result);
+        expect(wire.structuredContent).toEqual(result);
+        expect(JSON.parse(wire.content[0]!.text)).toEqual(result);
+        expect(wire.isError).toBe(
+          result.status !== 'preview' && result.status !== 'accepted',
+        );
+        return result;
+      });
+    },
     read,
     rows,
     seed,
@@ -580,7 +624,11 @@ async function makeHarness() {
       pending.push(operation);
       return operation;
     },
-    async child(input: unknown, mode: ChildMode = 'normal') {
+    async child(
+      input: unknown,
+      mode: ChildMode = 'normal',
+      operation: 'indexer' | 'checker' = 'indexer',
+    ) {
       return startHostChild(
         {
           stateDirectory,
@@ -590,9 +638,11 @@ async function makeHarness() {
           now,
           input,
           mode,
+          operation,
         },
         children,
         childStreams,
+        root,
       );
     },
     writerLock() {
@@ -2052,10 +2102,11 @@ async function runChild(
   h: HostHarness,
   input: unknown,
   mode: ChildMode = 'normal',
+  operation: 'indexer' | 'checker' = 'indexer',
 ) {
-  const child = await h.child(input, mode);
+  const child = await h.child(input, mode, operation);
   await childControl(child, 'GO');
-  return { child, ...(await childResult(child)) };
+  return { child, ...(await childResult(child, operation)) };
 }
 function expectDispatchHeld(h: HostHarness, input: ReturnType<typeof request>) {
   expect(h.read(input.requestId)).toMatchObject({
@@ -2984,5 +3035,825 @@ test('C15 SOURCE CLI: incomplete or malformed trusted configuration disables wri
     expect(existsSync(h.stateDirectory)).toBe(false);
     expect(h.records).toHaveLength(5);
     expect(h.records.every((receipt) => receipt.method === 'GET')).toBe(true);
+  });
+}, 30_000);
+
+// Synthetic local reservation declarations, unrelated to provider fees.
+const checkerVector = { tokens: 7, indexer: 5, checker: 11 };
+const checkerPolicy: Partial<SubmissionPolicy> = {
+  allowIndexChecks: true,
+  indexCheckReservations: {
+    google: checkerVector,
+    yandex: checkerVector,
+    bing: checkerVector,
+  },
+  caps: { tokens: 2_000_000, indexer: 20_000, checker: 20_000 },
+};
+function checkRequest(
+  id = 'check-1',
+  engine: 'google' | 'yandex' | 'bing' = 'google',
+  urls = ['https://example.test/check'],
+) {
+  return { mode: 'submit', searchEngine: engine, requestId: id, urls } as const;
+}
+function checkerAck(result: Awaited<ReturnType<HostHarness['check']>>) {
+  if (
+    result.quote?.availability !== 'available' ||
+    !result.authorization?.fingerprint
+  )
+    throw new Error('Expected available configured preview.');
+  return {
+    quoteFingerprint: result.quote.fingerprint,
+    authorizationFingerprint: result.authorization.fingerprint,
+  };
+}
+function storedUnits(h: HostHarness, where = '1 = 1') {
+  return h.rows<{ tokens: number; indexer: number; checker: number }>(
+    `SELECT coalesce(sum(reserved_tokens),0) AS tokens, coalesce(sum(reserved_indexer),0) AS indexer, coalesce(sum(reserved_checker),0) AS checker FROM intents WHERE ${where}`,
+  )[0]!;
+}
+
+test.each(['google', 'yandex', 'bing'] as const)(
+  'IC02 HOST: %s checker sends one exact request and records selected three-unit reservation',
+  async (engine) => {
+    await withHost(async (h) => {
+      h.init();
+      const config = h.config(checkerPolicy);
+      const instance = h.host(config);
+      const urls = [
+        'HTTPS://Example.TEST/%2f?b=2&a=1#fragment',
+        'https://example.test/白🦊/',
+      ];
+      const result = await h.check(instance, {
+        ...checkRequest('wire-check', engine, urls),
+        title: '  白 "title"  ',
+      });
+      const expectedBody =
+        '{"title":"  白 \\"title\\"  ","urls":["HTTPS://Example.TEST/%2f?b=2&a=1#fragment","https://example.test/白🦊/"]}';
+      expect(result.status).toBe('accepted');
+      expect(result.observation).toMatchObject({
+        kind: 'accepted_ack',
+        recorded: true,
+        type: `${engine}/checker`,
+      });
+      expect(result.intent?.reservation).toEqual({
+        tokens: 14,
+        indexer: 10,
+        checker: 22,
+      });
+      expect(h.records).toEqual([
+        {
+          method: 'POST',
+          path: `/v2/task/${engine}/checker/create`,
+          auth: key,
+          agent: 'speedyindex-mcp/0.1.0',
+          accept: 'application/json',
+          contentType: 'application/json',
+          body: expectedBody,
+        },
+      ]);
+      expect(result.request?.payloadDigest).toBe(sha(expectedBody));
+      expect(storedUnits(h)).toEqual({ tokens: 14, indexer: 10, checker: 22 });
+      expect(
+        h.rows('SELECT url_text FROM intent_urls ORDER BY ordinal'),
+      ).toEqual(urls.map((url_text) => ({ url_text })));
+      expect(events(h, 'wire-check').map((row) => row.event_kind)).toEqual([
+        'prepared',
+        'dispatching',
+        'accepted',
+      ]);
+      expect(h.attempts).toBe(1);
+      assertNoPrivate(result, h);
+    });
+  },
+);
+
+test('IC03 HOST: checker preview and pre-open error precedence use configuration, permission, profile, clock and cancellation', async () => {
+  await withHost(async (h) => {
+    const stale = {
+      quoteFingerprint: 'a'.repeat(64),
+      authorizationFingerprint: 'b'.repeat(64),
+    };
+    const setups = [
+      {
+        config: loadSubmissionConfiguration(),
+        error: 'WritesDisabled',
+        availability: 'unavailable',
+        state: 'unconfigured',
+      },
+      {
+        config: h.config({ ...checkerPolicy, enabled: false }),
+        error: 'WritesDisabled',
+        availability: 'available',
+        state: 'disabled',
+      },
+      {
+        config: h.config(checkerPolicy, ''),
+        error: 'MissingCredentials',
+        availability: 'available',
+        state: 'credential_missing',
+      },
+      {
+        config: h.config(checkerPolicy, 'wrong-synthetic-key'),
+        error: 'CredentialMismatch',
+        availability: 'available',
+        state: 'credential_mismatch',
+      },
+      {
+        config: h.config({
+          ...checkerPolicy,
+          allowIndexChecks: false,
+          indexCheckReservations: {},
+        }),
+        error: 'WritesDisabled',
+        availability: 'unavailable',
+        state: 'disabled',
+      },
+      {
+        config: h.config({
+          ...checkerPolicy,
+          allowIndexChecks: undefined,
+          indexCheckReservations: {},
+        }),
+        error: 'WritesDisabled',
+        availability: 'unavailable',
+        state: 'disabled',
+      },
+      {
+        config: h.config({
+          ...checkerPolicy,
+          indexCheckReservations: { bing: checkerVector },
+        }),
+        error: 'ReservationProfileRequired',
+        availability: 'unavailable',
+        state: 'reservation_unavailable',
+      },
+      {
+        config: h.config({
+          ...checkerPolicy,
+          indexCheckReservations: {
+            google: { ...checkerVector, checker: Number.MAX_SAFE_INTEGER },
+          },
+        }),
+        error: 'ReservationOverflow',
+        availability: 'unavailable',
+        state: 'reservation_unavailable',
+      },
+    ];
+    // A valid policy alone supplies quotes; incomplete state never grants a submit.
+    h.config(checkerPolicy);
+    setups.push({
+      config: loadSubmissionConfiguration({ policyPath: h.policyPath }),
+      error: 'InvalidPolicy',
+      availability: 'available',
+      state: 'invalid',
+    });
+    for (const setup of setups) {
+      const instance = h.host(setup.config);
+      const preview = await h.check(instance, {
+        mode: 'preview',
+        searchEngine: 'google',
+        urls: ['https://example.test/a', 'https://example.test/b'],
+      });
+      expect(preview.status).toBe('preview');
+      expect(String(preview.quote?.availability)).toBe(setup.availability);
+      expect(String(preview.authorization?.state)).toBe(setup.state);
+      expect(preview.authorization?.stateChecked).toBe(false);
+      if (preview.quote?.availability === 'unavailable') {
+        expect(Object.hasOwn(preview.quote, 'fingerprint')).toBe(false);
+        expect(Object.hasOwn(preview.quote, 'reservation')).toBe(false);
+        expect(preview.authorization?.fingerprint).toBeUndefined();
+      }
+      const result = await h.check(instance, {
+        ...checkRequest('admission', 'google', [
+          'https://example.test/a',
+          'https://example.test/b',
+        ]),
+        acknowledgement: stale,
+      });
+      expect(String(result.error?.code)).toBe(setup.error);
+      assertNoPrivate(result, h);
+    }
+    const active = h.config(checkerPolicy);
+    const badClock = h.host(active, { clock: () => NaN });
+    expect((await h.check(badClock, checkRequest())).error?.code).toBe(
+      'StateUnavailable',
+    );
+    const aborted = new AbortController();
+    aborted.abort();
+    expect(
+      (await h.check(h.host(active), checkRequest(), aborted.signal)).error
+        ?.code,
+    ).toBe('Cancelled');
+    expect(
+      (
+        await h.check(h.host(active), {
+          ...checkRequest(),
+          acknowledgement: { quoteFingerprint: 'BAD' },
+        })
+      ).error?.code,
+    ).toBe('InvalidInput');
+    expect(h.opens).toBe(0);
+    expect(h.attempts).toBe(0);
+    expect(h.records).toHaveLength(0);
+    expect(existsSync(h.stateDirectory)).toBe(false);
+  });
+});
+
+test('IC03 HOST: admitted policy owns active quote; contradictory private preview view cannot override or grant a profile', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const config = h.config(checkerPolicy);
+    if (config.state !== 'configured')
+      throw new Error('Expected synthetic configuration.');
+    const contradictory = {
+      ...config,
+      indexCheckReservationSource: {
+        state: 'loaded' as const,
+        profiles: { google: { tokens: 99, indexer: 99, checker: 99 } },
+      },
+    };
+    const result = await h.check(h.host(contradictory), checkRequest());
+    expect(result.intent?.reservation).toEqual(checkerVector);
+    const missing = h.config({ ...checkerPolicy, indexCheckReservations: {} });
+    if (missing.state !== 'configured')
+      throw new Error('Expected synthetic configuration.');
+    const opens = h.opens;
+    const blocked = await h.check(
+      h.host({
+        ...missing,
+        indexCheckReservationSource: contradictory.indexCheckReservationSource,
+      }),
+      checkRequest('injected'),
+    );
+    expect(blocked.error?.code).toBe('ReservationProfileRequired');
+    expect(blocked.quote?.availability).toBe('unavailable');
+    expect(h.opens).toBe(opens);
+    expect(h.attempts).toBe(1);
+    expect(storedUnits(h)).toEqual(checkerVector);
+  });
+});
+
+test('IC05/IC07 HOST: exact checker replay precedes busy/current ack and retains old period without capability or events', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const config = h.config({
+      ...checkerPolicy,
+      mode: 'caller_acknowledgement',
+    });
+    const instance = h.host(config);
+    const input = checkRequest();
+    const preview = await h.check(instance, {
+      mode: 'preview',
+      searchEngine: input.searchEngine,
+      urls: input.urls,
+    });
+    const current = checkerAck(preview);
+    expect((await h.check(instance, input)).error?.code).toBe(
+      'AcknowledgementRequired',
+    );
+    expect(
+      (
+        await h.check(instance, {
+          ...input,
+          acknowledgement: {
+            ...current,
+            authorizationFingerprint: 'a'.repeat(64),
+          },
+        })
+      ).error?.code,
+    ).toBe('AcknowledgementMismatch');
+    expect(h.rows('SELECT request_id FROM intents')).toEqual([]);
+    expect(
+      (await h.check(instance, { ...input, acknowledgement: current })).status,
+    ).toBe('accepted');
+    const before = [
+      'budget_periods',
+      'intents',
+      'intent_urls',
+      'intent_events',
+    ].map((table) => h.rows(`SELECT * FROM ${table} ORDER BY rowid`));
+    h.now += 86_400_000;
+    let noCapability = 0;
+    const reopened = h.host(config, {
+      openLedger(options) {
+        const ledger = openLedger(options);
+        return new Proxy(ledger, {
+          get(target, property) {
+            if (property === 'prepareIntent')
+              return (value: PrepareIntentInput) => {
+                const replay = target.prepareIntent(value);
+                expect(replay.kind).toBe('replay');
+                expect('dispatchCapability' in replay).toBe(false);
+                noCapability++;
+                return replay;
+              };
+            const value = Reflect.get(target, property);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    });
+    for (const acknowledgement of [undefined, current]) {
+      const result = await h.check(reopened, {
+        ...input,
+        ...(acknowledgement ? { acknowledgement } : {}),
+      });
+      expect(result.status).toBe('accepted');
+      expect(result.replayed).toBe(true);
+      expect(result.observation).toBeUndefined();
+      expect(result.intent?.periodId).toBe('utc-day:2026-10-20');
+      expect(result.authorization?.fingerprint).not.toBe(
+        current.authorizationFingerprint,
+      );
+    }
+    expect(noCapability).toBe(2);
+    expect(
+      ['budget_periods', 'intents', 'intent_urls', 'intent_events'].map(
+        (table) => h.rows(`SELECT * FROM ${table} ORDER BY rowid`),
+      ),
+    ).toEqual(before);
+    expect(
+      (
+        await h.check(instance, {
+          ...input,
+          requestId: 'new-day',
+          acknowledgement: current,
+        })
+      ).error?.code,
+    ).toBe('AcknowledgementMismatch');
+    expect(h.attempts).toBe(1);
+  });
+});
+
+test.each([
+  {
+    label: 'definite rejection',
+    status: 401,
+    body: { code: 1 },
+    state: 'rejected',
+  },
+  {
+    label: 'contradictory PPR echo',
+    status: 200,
+    body: {
+      code: 0,
+      task_id: 'ambiguous-check',
+      type: 'google/checker',
+      pay_per_indexed: true,
+    },
+    state: 'unknown',
+  },
+  { label: 'HTTP ambiguous', status: 429, body: { code: 2 }, state: 'unknown' },
+])(
+  'IC04/IC05 HOST: $label records durable outcome and never resends replay',
+  async (vector) => {
+    await withHost(async (h) => {
+      h.init();
+      const config = h.config(checkerPolicy);
+      const instance = h.host(config);
+      h.handler = (_record, response) => {
+        response.statusCode = vector.status;
+        response.end(JSON.stringify(vector.body));
+      };
+      const input = checkRequest();
+      const result = await h.check(instance, input);
+      expect(String(result.status)).toBe(vector.state);
+      expect(result.observation?.recorded).toBe(true);
+      expect(h.read(input.requestId)?.reservation).toEqual(checkerVector);
+      const replay = await h.check(h.host(config), input);
+      expect(replay.replayed).toBe(true);
+      expect(String(replay.status)).toBe(vector.state);
+      expect(replay.observation).toBeUndefined();
+      expect(
+        (await h.call(h.host(config), request('overlap', input.urls))).error
+          ?.code,
+      ).toBe(vector.state === 'unknown' ? 'UrlOverlap' : 'ProviderRejected');
+      // For rejected rows the overlap is allowed to dispatch; the same synthetic
+      // rejection/ambiguous response then determines that new indexing outcome.
+      expect(h.attempts).toBe(vector.state === 'unknown' ? 1 : 2);
+      assertNoPrivate(result, h);
+    });
+  },
+);
+
+test('IC06 HOST: accepted checker and indexing reservations constrain shared current-day caps in both directions', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const caps = { tokens: 26, indexer: 6, checker: 11 };
+    const config = h.config({ ...checkerPolicy, caps });
+    expect((await h.check(h.host(config), checkRequest())).status).toBe(
+      'accepted',
+    );
+    const next = {
+      ...request('index-boundary', ['https://example.test/yandex-index']),
+      searchEngine: 'yandex',
+    };
+    expect((await h.call(h.host(config), next)).error?.code).toBe(
+      'BudgetExceeded',
+    );
+    expect(h.attempts).toBe(1);
+    const fitting = h.config({
+      ...checkerPolicy,
+      caps: { ...caps, tokens: 27 },
+    });
+    expect((await h.call(h.host(fitting), next)).status).toBe('accepted');
+    expect(storedUnits(h)).toEqual({ tokens: 27, indexer: 6, checker: 11 });
+    expect(
+      (
+        await h.check(
+          h.host(fitting),
+          checkRequest('over', 'google', ['https://example.test/over']),
+        )
+      ).error?.code,
+    ).toBe('BudgetExceeded');
+    expect(h.attempts).toBe(2);
+  });
+  await withHost(async (h) => {
+    h.init();
+    const config = h.config({
+      ...checkerPolicy,
+      caps: { tokens: 106, indexer: 5, checker: 11 },
+    });
+    expect((await h.call(h.host(config), request())).status).toBe('accepted');
+    expect((await h.check(h.host(config), checkRequest())).error?.code).toBe(
+      'BudgetExceeded',
+    );
+    const fitting = h.config({
+      ...checkerPolicy,
+      caps: { tokens: 107, indexer: 5, checker: 11 },
+    });
+    expect((await h.check(h.host(fitting), checkRequest())).status).toBe(
+      'accepted',
+    );
+    expect(storedUnits(h)).toEqual({ tokens: 107, indexer: 5, checker: 11 });
+    expect(
+      (await h.check(h.host(fitting), checkRequest('request-1'))).error?.code,
+    ).toBe('RequestIdConflict');
+    expect(h.attempts).toBe(2);
+  });
+});
+
+test('IC06 HOST: unknown checker holds retain all units across day/revision/profile changes while old accepted units roll over', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const original = h.config(checkerPolicy);
+    expect(
+      (await h.check(h.host(original), checkRequest('old-accepted'))).status,
+    ).toBe('accepted');
+    h.handler = (_r, response) =>
+      response.end(
+        JSON.stringify({ code: 0, task_id: 'hold', type: 'google/indexer' }),
+      );
+    const held = checkRequest('old-unknown', 'google', [
+      'https://example.test/held-check',
+    ]);
+    expect((await h.check(h.host(original), held)).status).toBe('unknown');
+    h.now += 86_400_000;
+    h.handler = (_r, response) =>
+      response.end(
+        JSON.stringify({
+          code: 0,
+          task_id: 'new-index',
+          type: 'yandex/indexer',
+        }),
+      );
+    const next = {
+      ...request('rollover-index', ['https://example.test/new-day-index']),
+      searchEngine: 'yandex',
+    };
+    const changed = {
+      ...checkerPolicy,
+      policyRevision: 'synthetic-v2',
+      indexCheckReservations: {
+        google: { tokens: 8, indexer: 9, checker: 12 },
+      },
+    };
+    for (const [caps, unit] of [
+      [{ tokens: 26, indexer: 6, checker: 11 }, 'tokens'],
+      [{ tokens: 27, indexer: 5, checker: 11 }, 'indexer'],
+      [{ tokens: 27, indexer: 6, checker: 10 }, 'checker'],
+    ] as const) {
+      const blocked = await h.call(
+        h.host(h.config({ ...changed, caps })),
+        next,
+      );
+      expect(blocked.error?.code).toBe('BudgetExceeded');
+      expect(String(blocked.error?.unit)).toBe(unit);
+      expect(h.read(held.requestId)?.reservation).toEqual(checkerVector);
+    }
+    expect(h.attempts).toBe(2);
+    expect(
+      (
+        await h.call(
+          h.host(
+            h.config({
+              ...changed,
+              caps: { tokens: 27, indexer: 6, checker: 11 },
+            }),
+          ),
+          next,
+        )
+      ).status,
+    ).toBe('accepted');
+    expect(
+      storedUnits(
+        h,
+        "state IN ('prepared','dispatching','unknown') OR (state = 'accepted' AND period_id = 'utc-day:2026-10-21')",
+      ),
+    ).toEqual({ tokens: 27, indexer: 6, checker: 11 });
+    expect(h.attempts).toBe(3);
+  });
+});
+
+test('IC07 HOST: family/body/profile policy conflicts preserve unknown identity; restore permits replay, disappearing authority blocks pre-read', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const config = h.config(checkerPolicy);
+    const input = checkRequest();
+    h.handler = (_r, response) =>
+      response.end(
+        JSON.stringify({ code: 0, task_id: 'held', type: 'google/indexer' }),
+      );
+    const first = await h.check(h.host(config), input);
+    expect(first.status).toBe('unknown');
+    expect(
+      (
+        await h.call(h.host(config), {
+          ...request(input.requestId, input.urls),
+        })
+      ).error?.code,
+    ).toBe('RequestIdConflict');
+    expect(
+      (await h.check(h.host(config), { ...input, searchEngine: 'bing' })).error
+        ?.code,
+    ).toBe('RequestIdConflict');
+    expect(
+      (await h.check(h.host(config), { ...input, title: '' })).error?.code,
+    ).toBe('RequestIdConflict');
+    for (const engine of ['google', 'bing'] as const) {
+      const profiles = {
+        ...checkerPolicy.indexCheckReservations,
+        [engine]: { ...checkerVector, tokens: 8 },
+      };
+      const changed = h.config({
+        ...checkerPolicy,
+        indexCheckReservations: profiles,
+      });
+      const result = await h.check(h.host(changed), input);
+      expect(result.error?.code).toBe('RequestIdConflict');
+      if (
+        first.quote?.availability !== 'available' ||
+        result.quote?.availability !== 'available'
+      )
+        throw new Error('Expected quote.');
+      if (engine === 'google')
+        expect(result.quote.fingerprint).not.toBe(first.quote.fingerprint);
+      else expect(result.quote.fingerprint).toBe(first.quote.fingerprint);
+      expect(result.authorization?.policyDigest).not.toBe(
+        first.authorization?.policyDigest,
+      );
+    }
+    const before = events(h, input.requestId);
+    const restored = h.config(checkerPolicy);
+    expect((await h.check(h.host(restored), input)).replayed).toBe(true);
+    expect(events(h, input.requestId)).toEqual(before);
+    expect(h.read(input.requestId)?.reservation).toEqual(checkerVector);
+    for (const [configuration, code] of [
+      [
+        h.config({ ...checkerPolicy, allowIndexChecks: false }),
+        'WritesDisabled',
+      ],
+      [
+        h.config({ ...checkerPolicy, indexCheckReservations: {} }),
+        'ReservationProfileRequired',
+      ],
+      [h.config(checkerPolicy, 'wrong-synthetic-key'), 'CredentialMismatch'],
+    ] as const) {
+      const opens = h.opens;
+      expect(
+        String((await h.check(h.host(configuration), input)).error?.code),
+      ).toBe(code);
+      expect(h.opens).toBe(opens);
+    }
+    expect(
+      (await h.call(h.host(restored), request('url-overlap', input.urls))).error
+        ?.code,
+    ).toBe('UrlOverlap');
+    const otherScope = h.config({
+      ...checkerPolicy,
+      budgetScope: 'other-scope',
+    });
+    expect(
+      (
+        await h.check(
+          h.host(otherScope),
+          checkRequest('other-engine', 'bing', input.urls),
+        )
+      ).error?.code,
+    ).toBe('UrlOverlap');
+    expect(h.attempts).toBe(1);
+    expect(events(h, input.requestId)).toEqual(before);
+  });
+});
+
+test.each(['indexer', 'checker'] as const)(
+  'IC08 HOST: %s-first shares one busy guard, permits replay, and releases for the other family',
+  async (firstFamily) => {
+    await withHost(async (h) => {
+      h.init();
+      const config = h.config(checkerPolicy);
+      const instance = h.host(config);
+      const fence = h.fence();
+      h.handler = async (receipt, response) => {
+        await fence.promise;
+        response.end(
+          JSON.stringify({
+            code: 0,
+            task_id: 'guard-job',
+            type: receipt.path!.slice('/v2/task/'.length, -'/create'.length),
+          }),
+        );
+      };
+      const indexing = request('guard-index', [
+        'https://example.test/guard-index',
+      ]);
+      const checking = checkRequest('guard-check', 'google', [
+        'https://example.test/guard-check',
+      ]);
+      const first =
+        firstFamily === 'indexer'
+          ? h.call(instance, indexing)
+          : h.check(instance, checking);
+      await bounded(h.received.promise);
+      const stale = {
+        quoteFingerprint: 'a'.repeat(64),
+        authorizationFingerprint: 'b'.repeat(64),
+      };
+      const busy =
+        firstFamily === 'indexer'
+          ? await h.check(instance, { ...checking, acknowledgement: stale })
+          : await h.call(instance, { ...indexing, acknowledgement: stale });
+      expect(busy.error?.code).toBe('SubmissionBusy');
+      const replay =
+        firstFamily === 'indexer'
+          ? await h.call(instance, indexing)
+          : await h.check(instance, checking);
+      expect(replay.replayed).toBe(true);
+      expect(replay.status).toBe('dispatching');
+      expect(h.attempts).toBe(1);
+      fence.resolve();
+      expect((await first).status).toBe('accepted');
+      const after =
+        firstFamily === 'indexer'
+          ? await h.check(instance, checking)
+          : await h.call(instance, indexing);
+      expect(after.status).toBe('accepted');
+      expect(h.attempts).toBe(2);
+      expect(h.records).toHaveLength(2);
+    });
+  },
+);
+
+test('IC08 HOST: two real mixed-family children race under one shared token cap without predetermined winner', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config({
+      ...checkerPolicy,
+      caps: { tokens: 100, indexer: 5, checker: 11 },
+    });
+    const inputs = [
+      request('mixed-index', ['https://example.test/mixed-index']),
+      checkRequest('mixed-check', 'google', [
+        'https://example.test/mixed-check',
+      ]),
+    ];
+    const families = ['indexer', 'checker'] as const;
+    const children = [
+      await h.child(inputs[0], 'normal', families[0]),
+      await h.child(inputs[1], 'normal', families[1]),
+    ];
+    const fence = h.fence();
+    h.handler = async (receipt, response) => {
+      await fence.promise;
+      response.end(
+        JSON.stringify({
+          code: 0,
+          task_id: 'mixed-winner',
+          type: receipt.path!.slice('/v2/task/'.length, -'/create'.length),
+        }),
+      );
+    };
+    await Promise.all(children.map((child) => childControl(child, 'GO')));
+    const outcomes = children.map(async (child, i) => ({
+      i,
+      ...(await childResult(child, families[i]!)),
+    }));
+    await bounded(h.received.promise, 8_000);
+    const loser = await bounded(Promise.race(outcomes), 8_000);
+    expect(loser.fetchInvocations).toBe(0);
+    expect(loser.result.error?.code).toBe('BudgetExceeded');
+    const winner = loser.i === 0 ? 1 : 0;
+    const units =
+      winner === 0 ? { tokens: 100, indexer: 0, checker: 0 } : checkerVector;
+    expect(storedUnits(h)).toEqual(units);
+    expect(h.rows('SELECT request_id FROM intents')).toHaveLength(1);
+    expect(h.records).toHaveLength(1);
+    expect(h.records[0]!.path).toBe(
+      `/v2/task/google/${families[winner]}/create`,
+    );
+    expect(h.records[0]!.body).toBe(
+      winner === 0
+        ? '{"urls":["https://example.test/mixed-index"],"pay_per_indexed":true,"drip_feed":false}'
+        : '{"urls":["https://example.test/mixed-check"]}',
+    );
+    fence.resolve();
+    const settled = await Promise.all(outcomes);
+    expect(settled[winner]!.result.status).toBe('accepted');
+    expect(settled[winner]!.fetchInvocations).toBe(1);
+    const replay = await runChild(
+      h,
+      inputs[winner],
+      'normal',
+      families[winner],
+    );
+    expect(replay.result.replayed).toBe(true);
+    expect(replay.fetchInvocations).toBe(0);
+    expect(
+      events(h, inputs[winner]!.requestId).map((row) => row.event_kind),
+    ).toEqual(['prepared', 'dispatching', 'accepted']);
+    expect(h.records).toHaveLength(1);
+    expect(storedUnits(h)).toEqual(units);
+  });
+}, 30_000);
+
+test('IC09 HOST: checker ACK under actual SQLite writer lock remains held/unrecorded and admitted restart never resends', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config(checkerPolicy);
+    const fence = h.fence();
+    h.handler = async (_receipt, response) => {
+      await fence.promise;
+      response.end(
+        JSON.stringify({
+          code: 0,
+          task_id: 'ack-check-not-recorded',
+          type: 'google/checker',
+        }),
+      );
+    };
+    const input = checkRequest('checker-outcome-busy');
+    const child = await h.child(input, 'normal', 'checker');
+    await childControl(child, 'GO');
+    await bounded(h.received.promise, 8_000);
+    const release = h.writerLock();
+    fence.resolve();
+    const observed = await childResult(child, 'checker');
+    expect(child.messages.filter((m) => m.event === 'RECORD_ENTER')).toEqual([
+      { event: 'RECORD_ENTER', outcome: 'accepted' },
+    ]);
+    const failed = child.messages.filter((m) => m.event === 'WRITE_FAILED');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.code).toBe('LedgerBusy');
+    expect(observed.result.status).toBe('dispatching');
+    expect(observed.result.error?.code).toBe('OutcomePersistenceFailed');
+    expect(observed.result.observation).toEqual({
+      kind: 'accepted_ack',
+      recorded: false,
+      taskId: 'ack-check-not-recorded',
+      type: 'google/checker',
+    });
+    release();
+    expect(h.read(input.requestId)).toMatchObject({
+      state: 'dispatching',
+      stateVersion: 1,
+      reservation: checkerVector,
+    });
+    expect(storedUnits(h)).toEqual(checkerVector);
+    const before = events(h, input.requestId);
+    const replay = await runChild(h, input, 'normal', 'checker');
+    expect(replay.result.replayed).toBe(true);
+    expect(replay.fetchInvocations).toBe(0);
+    expect(replay.result.status).toBe('dispatching');
+    expect(replay.result.observation).toBeUndefined();
+    const overlap = await runChild(
+      h,
+      request('checker-held-overlap', input.urls),
+    );
+    expect(overlap.result.error?.code).toBe('UrlOverlap');
+    expect(overlap.fetchInvocations).toBe(0);
+    expect(events(h, input.requestId)).toEqual(before);
+    expect(storedUnits(h)).toEqual(checkerVector);
+    expect(h.records).toHaveLength(1);
+    assertNoPrivate(observed.result, h);
+    console.info(
+      'IC09 checker SQL evidence',
+      JSON.stringify({
+        phases: child.messages.map((m) => m.event),
+        status: observed.result.status,
+        writeCode: failed[0]!.code,
+        reservation: checkerVector,
+      }),
+    );
   });
 }, 30_000);

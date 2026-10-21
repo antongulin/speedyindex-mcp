@@ -7,6 +7,16 @@ import {
   type CreateIndexingTaskResult,
 } from './create-indexing-task';
 import {
+  buildCreateIndexCheckRequest,
+  createIndexCheckError,
+  createIndexCheckToolResult,
+  normalizeCreateIndexCheckOutcome,
+  quoteIndexCheckRequest,
+  type CreateIndexCheckResult,
+  type CreateIndexCheckErrorCode,
+  type IndexCheckAuthorization,
+} from './create-index-check';
+import {
   submissionLimits,
   type PreparedSubmission,
   type SubmissionAuthorization,
@@ -16,7 +26,6 @@ import {
 } from './submission-contract';
 import {
   createSubmissionContext,
-  getSubmissionAuthorization,
   loadSubmissionConfiguration,
   type ConfiguredSubmission,
   type SubmissionConfiguration,
@@ -33,18 +42,22 @@ import {
   type SubmissionLedger,
 } from './submission-ledger';
 
-type PublicError = SubmissionError;
+type PublicError = SubmissionError<CreateIndexCheckErrorCode>;
 interface BaseResult {
   mode: 'preview' | 'submit';
   request: PreparedSubmission['request'];
   quote: PreparedSubmission['quote'];
-  authorization: Readonly<SubmissionAuthorization>;
+  authorization: Readonly<SubmissionAuthorization | IndexCheckAuthorization>;
 }
 
 // Internal operation wiring only. Execution ordering, state and transport belong
 // to the one coordinator below; a strategy cannot choose acknowledgement timing.
 interface SubmissionStrategy<Result> {
-  build(value: unknown): PreparedSubmission;
+  build(
+    value: unknown,
+    configuration: SubmissionConfiguration,
+  ): PreparedSubmission;
+  permitted(configuration: ConfiguredSubmission): boolean;
   checked(value: unknown): Result;
   error(code: SubmissionErrorCode): PublicError;
 }
@@ -62,6 +75,52 @@ const indexingStrategy: SubmissionStrategy<CreateIndexingTaskResult> =
     },
     checked,
     error: createIndexingTaskError,
+    permitted: () => true,
+  });
+
+const checkerStrategy: SubmissionStrategy<CreateIndexCheckResult> =
+  Object.freeze({
+    build(value: unknown, configuration: SubmissionConfiguration) {
+      const prepared = buildCreateIndexCheckRequest(value);
+      // An active host always quotes its admitted policy snapshot. A separate
+      // key-free preview view cannot replace that authority or its profile.
+      const source =
+        configuration.state === 'configured'
+          ? {
+              state: 'loaded' as const,
+              ...(configuration.snapshot.policy.indexCheckReservations ===
+              undefined
+                ? {}
+                : {
+                    profiles:
+                      configuration.snapshot.policy.indexCheckReservations,
+                  }),
+            }
+          : configuration.indexCheckReservationSource;
+      const quote = quoteIndexCheckRequest(prepared, source);
+      return Object.freeze({
+        ...prepared,
+        quote,
+        ...(quote.availability === 'available'
+          ? { reservation: quote.reservation }
+          : {
+              unavailableError: createIndexCheckError(
+                quote.reason === 'reservation_overflow'
+                  ? 'ReservationOverflow'
+                  : quote.reason === 'policy_invalid'
+                    ? 'InvalidPolicy'
+                    : 'ReservationProfileRequired',
+              ),
+            }),
+        normalizeOutcome: (status: number, decoded: unknown) =>
+          normalizeCreateIndexCheckOutcome(prepared, status, decoded),
+      });
+    },
+    permitted: (configuration: ConfiguredSubmission) =>
+      configuration.snapshot.policy.allowIndexChecks === true,
+    checked: (value: unknown) =>
+      createIndexCheckToolResult(value).structuredContent,
+    error: createIndexCheckError,
   });
 
 export interface SubmissionHostOptions {
@@ -291,6 +350,13 @@ export class SubmissionHost {
     return this.execute(indexingStrategy, value, signal);
   }
 
+  async createIndexCheck(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<CreateIndexCheckResult> {
+    return this.execute(checkerStrategy, value, signal);
+  }
+
   private async execute<Result>(
     strategy: SubmissionStrategy<Result>,
     value: unknown,
@@ -298,7 +364,7 @@ export class SubmissionHost {
   ): Promise<Result> {
     let prepared: PreparedSubmission;
     try {
-      prepared = strategy.build(value);
+      prepared = strategy.build(value, this.configuration);
     } catch {
       let mode: 'preview' | 'submit' | undefined;
       try {
@@ -315,21 +381,33 @@ export class SubmissionHost {
     }
     const config = this.configuration;
     let context: SubmissionContext | undefined;
-    let authorization: Readonly<SubmissionAuthorization>;
+    let authorization: Readonly<
+      SubmissionAuthorization | IndexCheckAuthorization
+    >;
+    const permitted =
+      config.state === 'configured' && strategy.permitted(config);
     try {
       if (config.state === 'configured') {
-        context = createSubmissionContext(
-          config,
-          prepared.quote.fingerprint,
-          this.clock(),
-        );
-        authorization = context.authorization;
+        if (!permitted)
+          authorization = { state: 'disabled', stateChecked: false };
+        else if (!prepared.quote.fingerprint || !prepared.reservation)
+          authorization = {
+            state: 'reservation_unavailable',
+            stateChecked: false,
+          };
+        else {
+          context = createSubmissionContext(
+            config,
+            prepared.quote.fingerprint,
+            this.clock(),
+          );
+          authorization = context.authorization;
+        }
       } else {
-        authorization = getSubmissionAuthorization(
-          config,
-          prepared.quote.fingerprint,
-          undefined,
-        );
+        authorization = Object.freeze({
+          state: config.state,
+          stateChecked: false,
+        });
       }
     } catch {
       authorization = { state: 'invalid', stateChecked: false };
@@ -344,7 +422,11 @@ export class SubmissionHost {
       return strategy.checked({ ...base, status: 'preview' });
     if (config.state !== 'configured')
       return blocked(strategy, base, strategy.error(config.error.code));
-    if (!context)
+    if (!permitted)
+      return blocked(strategy, base, strategy.error('WritesDisabled'));
+    if (prepared.unavailableError)
+      return blocked(strategy, base, prepared.unavailableError);
+    if (!context || !prepared.quote.fingerprint || !prepared.reservation)
       return blocked(strategy, base, strategy.error('StateUnavailable'));
     if (signal?.aborted)
       return blocked(strategy, base, strategy.error('Cancelled'));

@@ -192,16 +192,19 @@ export interface PreparedSubmission {
   };
   readonly body: string;
   readonly request: SubmissionRequestSummary;
-  readonly quote: Readonly<{ version: string; fingerprint: string }>;
-  readonly reservation: Readonly<SubmissionUnitVector>;
+  readonly quote: Readonly<{ version: string; fingerprint?: string }>;
+  readonly reservation?: Readonly<SubmissionUnitVector>;
+  readonly unavailableError?: SubmissionError<
+    SubmissionErrorCode | 'ReservationProfileRequired' | 'ReservationOverflow'
+  >;
   normalizeOutcome(
     status: number,
     decoded: unknown,
   ): NormalizedSubmissionOutcome;
 }
 
-export interface SubmissionError {
-  code: SubmissionErrorCode;
+export interface SubmissionError<Code extends string = SubmissionErrorCode> {
+  code: Code;
   message: string;
   unit?: 'tokens' | 'indexer' | 'checker';
   lastObservedState?: 'dispatching';

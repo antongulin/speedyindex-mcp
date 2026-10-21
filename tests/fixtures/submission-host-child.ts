@@ -8,6 +8,7 @@ interface Setup {
   origin: string;
   now: number;
   input: unknown;
+  operation?: 'indexer' | 'checker';
   mode:
     | 'normal'
     | 'already_aborted'
@@ -79,7 +80,10 @@ async function main() {
     origin.hostname !== '127.0.0.1' ||
     origin.username ||
     origin.password ||
-    setup.apiKey !== 'synthetic-host-key-only'
+    setup.apiKey !== 'synthetic-host-key-only' ||
+    (setup.operation !== undefined &&
+      setup.operation !== 'indexer' &&
+      setup.operation !== 'checker')
   )
     throw new Error('Invalid synthetic setup.');
   allowedOrigin = setup.origin;
@@ -195,6 +199,9 @@ async function main() {
         ![
           '/v2/task/google/indexer/create',
           '/v2/task/yandex/indexer/create',
+          '/v2/task/google/checker/create',
+          '/v2/task/yandex/checker/create',
+          '/v2/task/bing/checker/create',
         ].includes(target.pathname) ||
         target.search ||
         target.hash
@@ -218,7 +225,11 @@ async function main() {
         if (setup.mode === 'already_aborted') controller.abort();
         // Do not await here: stdin cancellation must remain readable while the
         // host awaits HTTP or yields after synchronous SQLite operations.
-        void host.createIndexingTask(setup.input, controller.signal).then(
+        const operation =
+          setup.operation === 'checker'
+            ? host.createIndexCheck(setup.input, controller.signal)
+            : host.createIndexingTask(setup.input, controller.signal);
+        void operation.then(
           (result) => {
             close();
             send({ event: 'RESULT', result, fetchInvocations, violations });
