@@ -335,6 +335,7 @@ test('C15 BUILT: seven-tool schemas, paid annotations, no-key preview, disabled 
       'create_index_check',
       'create_backlink_check',
     ]);
+    await verifyUnconfiguredReads(session.client);
     const checker = tools[5]!;
     const backlink = tools[6]!;
     expect(backlink.annotations).toEqual({
@@ -1225,3 +1226,17 @@ test('BC06 BUILT: operator-policy backlink accepts one exact POST, restarts with
     await session.close();
   });
 }, 30_000);
+
+import { verifyV2Maintenance } from './helpers';
+test(
+  'V2-10 BUILT maintenance grammar, private V2 init and populated V1 offline migration',
+  () => verifyV2Maintenance('dist/cli.js'),
+  60_000,
+);
+
+import { verifyV2CreateJourney, verifyUnconfiguredReads } from './helpers';
+test(
+  'V2-10 BUILT three-create V2 SDK persistence and restart replay',
+  () => verifyV2CreateJourney('dist/cli.js'),
+  60_000,
+);

@@ -656,6 +656,7 @@ test('IC10/C15 SOURCE SDK: seven tools expose strict schemas, paid annotations, 
       'create_index_check',
       'create_backlink_check',
     ]);
+    await verifyUnconfiguredReads(session.client);
     const checker = tools[5]!;
     const backlink = tools[6]!;
     expect(backlink.annotations).toEqual({
@@ -1272,3 +1273,10 @@ test('TR-07: SDK report cancellation aborts POST and the next report succeeds', 
     }
   }
 });
+
+import { verifyV2CreateJourney, verifyUnconfiguredReads } from './helpers';
+test(
+  'V2-10 SOURCE three-create V2 SDK persistence and restart replay',
+  () => verifyV2CreateJourney('src/cli.ts'),
+  60_000,
+);

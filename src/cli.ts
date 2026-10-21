@@ -7,7 +7,11 @@ import {
   loadSubmissionConfiguration,
   submissionCredentialFingerprint,
 } from './submission-policy';
-import { initializeLedger } from './submission-ledger';
+import {
+  initializeLedger,
+  initializeLedgerV2,
+  migrateLedgerV2,
+} from './submission-ledger';
 
 const args = process.argv.slice(2);
 if (args.length === 1 && args[0] === '--help') {
@@ -25,7 +29,12 @@ Provider requests have a 10-second deadline, support cancellation, and never ret
 
 Local modes (exclusive; no network or MCP server):
   --submission-credential-fingerprint
-  --init-submission-state <canonical-absolute-new-directory>
+  --init-submission-state <canonical-absolute-new-directory> (V1)
+  --init-submission-state-v2 <canonical-absolute-new-directory>
+  --migrate-submission-state-v2 <canonical-absolute-existing-directory>
+    --backup-directory <canonical-absolute-new-directory>
+Migration requires draining/stopping ALL hosts first and restarting ALL on V2.
+A missing receipt may follow a successful commit; inspect before manual recovery.
 Stdio configuration (explicit trusted paths; no automatic initialization):
   --submission-policy <canonical-absolute-file>
   --submission-state <canonical-absolute-existing-directory>
@@ -48,6 +57,9 @@ Restart all cooperating hosts after changing policy; there is no reload loop.`);
     else if (
       [
         '--init-submission-state',
+        '--init-submission-state-v2',
+        '--migrate-submission-state-v2',
+        '--backup-directory',
         '--submission-policy',
         '--submission-state',
       ].includes(flag)
@@ -65,7 +77,13 @@ Restart all cooperating hosts after changing policy; there is no reload loop.`);
   }
   const fingerprint = values.has('--submission-credential-fingerprint');
   const initialize = values.has('--init-submission-state');
-  if ((fingerprint || initialize) && values.size !== 1) syntaxError = true;
+  const initializeV2 = values.has('--init-submission-state-v2');
+  const migrateV2 = values.has('--migrate-submission-state-v2');
+  const backup = values.has('--backup-directory');
+  if ((fingerprint || initialize || initializeV2) && values.size !== 1)
+    syntaxError = true;
+  if (migrateV2 && (!backup || values.size !== 2)) syntaxError = true;
+  if (backup && !migrateV2) syntaxError = true;
   if (syntaxError) {
     console.error('Unsupported arguments. Use --help for usage.');
     process.exitCode = 1;
@@ -78,14 +96,38 @@ Restart all cooperating hosts after changing policy; there is no reload loop.`);
       console.error('Set SPEEDYINDEX_API_KEY to a valid submission API key.');
       process.exitCode = 1;
     }
-  } else if (initialize) {
+  } else if (initialize || initializeV2) {
     try {
-      initializeLedger({
-        stateDirectory: values.get('--init-submission-state')!,
+      const init = initializeV2 ? initializeLedgerV2 : initializeLedger;
+      init({
+        stateDirectory: values.get(
+          initializeV2
+            ? '--init-submission-state-v2'
+            : '--init-submission-state',
+        )!,
       }).close();
-      console.log(JSON.stringify({ initialized: true, schemaVersion: 1 }));
+      console.log(
+        JSON.stringify({
+          initialized: true,
+          schemaVersion: initializeV2 ? 2 : 1,
+        }),
+      );
     } catch {
       console.error('Could not initialize submission state.');
+      process.exitCode = 1;
+    }
+  } else if (migrateV2) {
+    try {
+      console.log(
+        JSON.stringify(
+          migrateLedgerV2({
+            stateDirectory: values.get('--migrate-submission-state-v2')!,
+            backupDirectory: values.get('--backup-directory')!,
+          }),
+        ),
+      );
+    } catch {
+      console.error('Could not migrate submission state.');
       process.exitCode = 1;
     }
   } else {

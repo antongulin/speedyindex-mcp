@@ -317,3 +317,10 @@ test('C16 CLI: local modes are exclusive and malformed/duplicate arguments have 
     expect(localSnapshot(h.root)).toEqual([]);
   });
 }, 30_000);
+
+import { verifyV2Maintenance } from './helpers';
+test(
+  'V2-10 SOURCE maintenance grammar, private V2 init and populated V1 offline migration',
+  () => verifyV2Maintenance('src/cli.ts'),
+  60_000,
+);
