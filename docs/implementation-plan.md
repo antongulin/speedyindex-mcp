@@ -1,6 +1,6 @@
 # Implementation plan
 
-The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_task_status`, `get_task_report`, `create_indexing_task`, and guarded `create_index_check`. The other six tools remain planned and unimplemented. No package or release is published.
+The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_task_status`, `get_task_report`, `create_indexing_task`, guarded `create_index_check`, and guarded `create_backlink_check`. The other five tools remain planned and unimplemented. No package or release is published.
 
 | Order       | Planned tool            | Intended scope                                       |
 | ----------- | ----------------------- | ---------------------------------------------------- |
@@ -10,16 +10,18 @@ The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_tas
 | Implemented | `get_task_report`       | Read one report; one bounded backlink page           |
 | Implemented | `create_indexing_task`  | Pure preview; explicitly configured guarded indexing |
 | Implemented | `create_index_check`    | Reservation preview; explicitly opted-in index check |
-| Later       | `create_backlink_check` | Submit a backlink check                              |
+| Implemented | `create_backlink_check` | Reservation preview; guarded donor/target check      |
 | Later       | `plan_retry`            | Prepare a retry proposal without submitting it       |
 | Later       | `submit_retry`          | Submit an explicitly approved retry                  |
 | Later       | `compare_reports`       | Compare task reports                                 |
 | Later       | `summarize_campaigns`   | Summarize related task outcomes                      |
 | Later       | `get_retry_history`     | Inspect recorded retry activity                      |
 
-The current runtime exposes all six implemented tools. Writes are disabled by default. Operators explicitly choose private policy/state paths, expected key binding and finite independent token/indexer/checker caps; no active configuration is selected here. Startup/preview never open state, and only the local new-only init command creates it. See [README.md](../README.md) for setup and [architecture](architecture.md) for validation, cancellation and persistence boundaries. Synthetic HTTP, real SQLite/process tests and SDK source/built journeys exercise these contracts without live provider calls.
+The current runtime exposes all seven implemented tools. Writes are disabled by default. Operators explicitly choose private policy/state paths, expected key binding and finite independent token/indexer/checker caps; no active configuration is selected here. Startup/preview never open state, and only the local new-only init command creates it. See [README.md](../README.md) for setup and [architecture](architecture.md) for validation, cancellation and persistence boundaries. Synthetic HTTP, real SQLite/process tests and SDK source/built journeys exercise these contracts without live provider calls.
 
-Index checks additionally require explicit permission and a private per-engine three-unit reservation profile. Missing profiles produce unpriced previews and block submission. Operator reservations are not provider fees; no actual prices, caps or activation values are selected here. Both create tools share the same host guard and V1 store.
+Index checks additionally require explicit permission and a private per-engine three-unit reservation profile. Missing profiles produce unpriced previews and block submission. Operator reservations are not provider fees; no actual prices, caps or activation values are selected here. All three create tools share the same host guard and V1 store.
+
+Backlink checks require enabled configuration plus their own opt-in and complete private profile. Target lists preserve 1 to 50 safe strings, including duplicates and order; exact body identity includes the targets while V1 unresolved holds remain donor-wide across families. The dated local token floor is 2 per donor from the [official API](https://en.speedyindex.com/api.php#backlink-create); other unit fees and target-count pricing effects remain unknown. Invalid optional policy fields block all three create tools until corrected and all hosts restart. No activation values are selected here.
 
 Standalone create uses immutable policy snapshots, UTC reservation periods, local request replay and retained uncertain holds. It does not supply provider idempotency, human authentication or campaign/parent lineage. Later tools need their own action boundaries and source/eligibility proof. An additive V2 relation table and explicit offline migration must preserve all V1 records, events, holds and dispatch ownership, leave unattributed legacy rows unknown, and insert new relations with preparation atomically. No V2 schema, migration or retry API is implemented; never reset V1 state to add lineage.
 

@@ -5,6 +5,7 @@ import {
   chmodSync,
   mkdtempSync,
   realpathSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -13,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { balanceResultSchema, listTasksResultSchema } from '../src/client';
 import { createIndexingTaskResultSchema } from '../src/create-indexing-task';
 import { createIndexCheckResultSchema } from '../src/create-index-check';
+import { createBacklinkCheckResultSchema } from '../src/create-backlink-check';
 import { taskStatusResultSchema } from '../src/task-status';
 import { taskReportOutputSchema } from '../src/task-report';
 import { account, bounded, connect, dummyKey, fixture } from './helpers';
@@ -83,6 +85,7 @@ test('LT-08: built CLI registers and calls all four read-only tools', async () =
       'get_task_report',
       'create_indexing_task',
       'create_index_check',
+      'create_backlink_check',
     ]);
     const result = await session.client.callTool({
       name: 'get_balance',
@@ -207,9 +210,12 @@ async function withBuiltSubmission(
             ? {
                 code: 0,
                 task_id: ' opaque built provider ID /? ',
-                type: req.url?.includes('/checker/')
-                  ? 'bing/checker'
-                  : 'google/indexer',
+                type:
+                  req.url === '/v2/task/backlink/checker/create'
+                    ? 'backlink/checker'
+                    : req.url?.includes('/checker/')
+                      ? 'bing/checker'
+                      : 'google/indexer',
                 ...(req.url?.includes('/checker/')
                   ? {}
                   : { pay_per_indexed: true, drip_feed: false }),
@@ -217,9 +223,12 @@ async function withBuiltSubmission(
             : {
                 code: 0,
                 result: { task_id: 'nested-id-is-not-an-ack' },
-                type: req.url?.includes('/checker/')
-                  ? 'bing/checker'
-                  : 'google/indexer',
+                type:
+                  req.url === '/v2/task/backlink/checker/create'
+                    ? 'backlink/checker'
+                    : req.url?.includes('/checker/')
+                      ? 'bing/checker'
+                      : 'google/indexer',
                 message: 'private-provider-diagnostic',
               },
         ),
@@ -313,7 +322,7 @@ async function withBuiltSubmission(
   if (failures.length) throw failures[0];
 }
 
-test('C15 BUILT: six-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
+test('C15 BUILT: seven-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
   await withBuiltSubmission(async (h) => {
     const session = await h.open([], '');
     const { tools } = await bounded(session.client.listTools());
@@ -324,8 +333,70 @@ test('C15 BUILT: six-tool schemas, paid annotations, no-key preview, disabled su
       'get_task_report',
       'create_indexing_task',
       'create_index_check',
+      'create_backlink_check',
     ]);
     const checker = tools[5]!;
+    const backlink = tools[6]!;
+    expect(backlink.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+    expect(backlink.inputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['mode', 'urls', 'targetDomains'],
+      properties: {
+        mode: { type: 'string', enum: ['preview', 'submit'] },
+        urls: { type: 'array', minItems: 1, maxItems: 10000 },
+        targetDomains: { type: 'array', minItems: 1, maxItems: 50 },
+      },
+    });
+    expect(backlink.outputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        request: {
+          additionalProperties: false,
+          properties: {
+            family: { const: 'backlink/checker' },
+            targetDomainCount: { type: 'integer', minimum: 1, maximum: 50 },
+          },
+        },
+      },
+    });
+    for (const mode of ['preview', 'submit']) {
+      const value = await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: {
+          mode,
+          urls: ['https://donor.test/default'],
+          targetDomains: ['target.test'],
+          ...(mode === 'submit' ? { requestId: 'disabled-backlink' } : {}),
+        },
+      });
+      const parsed = createBacklinkCheckResultSchema.parse(
+        value.structuredContent,
+      );
+      expect(value.content).toEqual([
+        { type: 'text', text: JSON.stringify(parsed) },
+      ]);
+      expect(value.isError).toBe(mode === 'submit');
+      expect(parsed.status).toBe(mode === 'preview' ? 'preview' : 'blocked');
+      expect(parsed.authorization).toEqual({
+        state: 'unconfigured',
+        stateChecked: false,
+      });
+      expect(parsed.quote).toMatchObject({
+        availability: 'unavailable',
+        providerFeesKnown: false,
+      });
+      expect(parsed.quote).not.toHaveProperty('reservation');
+      expect(parsed.quote).not.toHaveProperty('fingerprint');
+      if (mode === 'submit') expect(parsed.error?.code).toBe('WritesDisabled');
+    }
+    expect(readdirSync(h.root)).toEqual([]);
     expect(checker.annotations).toEqual({
       readOnlyHint: false,
       destructiveHint: true,
@@ -563,7 +634,7 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
       state,
     ];
     let session = await h.open(args);
-    expect((await bounded(session.client.listTools())).tools).toHaveLength(6);
+    expect((await bounded(session.client.listTools())).tools).toHaveLength(7);
     async function call(input: Record<string, unknown>) {
       const result = await bounded(
         session.client.callTool({
@@ -969,5 +1040,188 @@ test('IC10 BUILT: Bing reservation preview, one POST, no-ACK restart replay, mal
     } finally {
       db.close();
     }
+  });
+}, 30_000);
+
+test('BC06 BUILT: operator-policy backlink accepts one exact POST, restarts without ACK and rejects supplied bad ACK without another intent', async () => {
+  await withBuiltSubmission(async (h) => {
+    const state = join(h.root, 'backlink-state');
+    expect((await h.local(['--init-submission-state', state])).code).toBe(0);
+    const fingerprint = createHash('sha256')
+      .update(`speedyindex-credential-v1\0${dummyKey}`)
+      .digest('hex');
+    const vector = { tokens: 4, indexer: 3, checker: 2 };
+    const reservation = { tokens: 8, indexer: 6, checker: 4 };
+    const policyPath = join(h.root, 'backlink-policy.json');
+    writeFileSync(
+      policyPath,
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        mode: 'operator_policy',
+        policyRevision: 'synthetic-built-backlink',
+        budgetScope: 'synthetic-built-backlink',
+        credentialFingerprint: fingerprint,
+        period: { kind: 'utc_day' },
+        caps: { tokens: 1000, indexer: 1000, checker: 1000 },
+        allowBacklinkChecks: true,
+        backlinkCheckReservations: vector,
+      }),
+      { mode: 0o600 },
+    );
+    const args = [
+      '--submission-policy',
+      policyPath,
+      '--submission-state',
+      state,
+    ];
+    let session = await h.open(args);
+    const call = async (arguments_: Record<string, unknown>) => {
+      const value = await bounded(
+        session.client.callTool({
+          name: 'create_backlink_check',
+          arguments: arguments_,
+        }),
+      );
+      const parsed = createBacklinkCheckResultSchema.parse(
+        value.structuredContent,
+      );
+      expect(value.content).toEqual([
+        { type: 'text', text: JSON.stringify(parsed) },
+      ]);
+      expect(value.isError).toBe(
+        !['preview', 'accepted'].includes(parsed.status),
+      );
+      for (const secret of [
+        dummyKey,
+        fingerprint,
+        h.root,
+        'private-provider-diagnostic',
+      ])
+        expect(JSON.stringify(value)).not.toContain(secret);
+      return parsed;
+    };
+    const input = {
+      urls: ['HTTPS://Built.TEST/%2f?b=2&a=1#Part', 'https://built.test/donor'],
+      targetDomains: [' Target.TEST ', '例え.テスト', ' Target.TEST '],
+      title: '  synthetic backlink  ',
+    };
+    const preview = await call({ ...input, mode: 'preview' });
+    expect(preview.request?.targetDomainCount).toBe(3);
+    expect(preview.quote).toMatchObject({
+      availability: 'available',
+      providerFeesKnown: false,
+      providerEnforced: false,
+      perUrlReservation: vector,
+      reservation,
+    });
+    expect(h.receipts).toEqual([]);
+    const submit = {
+      ...input,
+      mode: 'submit',
+      requestId: 'built-backlink-accepted',
+    };
+    const accepted = await call(submit);
+    expect(accepted.status).toBe('accepted');
+    expect(accepted.intent).toMatchObject({
+      state: 'accepted',
+      stateVersion: 2,
+      providerType: 'backlink/checker',
+      reservation,
+    });
+    expect(accepted.observation).toEqual({
+      kind: 'accepted_ack',
+      recorded: true,
+      taskId: ' opaque built provider ID /? ',
+      type: 'backlink/checker',
+    });
+    const expectedBody =
+      '{"title":"  synthetic backlink  ","urls":["HTTPS://Built.TEST/%2f?b=2&a=1#Part","https://built.test/donor"],"target_domains":[" Target.TEST ","例え.テスト"," Target.TEST "]}';
+    expect(h.receipts).toEqual([
+      {
+        body: expectedBody,
+        contentType: 'application/json',
+        accept: 'application/json',
+      },
+    ]);
+    expect(accepted.request?.payloadDigest).toBe(
+      createHash('sha256').update(expectedBody).digest('hex'),
+    );
+    const snapshot = () => {
+      const db = new Database(
+        join(state, 'ledger.sqlite'),
+        constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_NOFOLLOW,
+      );
+      try {
+        expect(db.query('PRAGMA user_version').get()).toEqual({
+          user_version: 1,
+        });
+        expect(
+          db
+            .query(
+              'SELECT reserved_tokens,reserved_indexer,reserved_checker FROM intents',
+            )
+            .all(),
+        ).toEqual([
+          { reserved_tokens: 8, reserved_indexer: 6, reserved_checker: 4 },
+        ]);
+        expect(
+          db.query('SELECT url_text FROM intent_urls ORDER BY ordinal').all(),
+        ).toEqual(input.urls.map((url_text) => ({ url_text })));
+        expect(
+          db
+            .query(
+              'SELECT event_kind FROM intent_events ORDER BY state_version',
+            )
+            .all(),
+        ).toEqual([
+          { event_kind: 'prepared' },
+          { event_kind: 'dispatching' },
+          { event_kind: 'accepted' },
+        ]);
+        return [
+          'budget_periods',
+          'intents',
+          'intent_urls',
+          'intent_events',
+        ].map((table) =>
+          db.query(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+        );
+      } finally {
+        db.close();
+      }
+    };
+    const before = snapshot();
+    expect(session.stderr()).toBe('');
+    await session.close();
+    session = await h.open(args);
+    const replay = await call(submit);
+    expect(replay.replayed).toBe(true);
+    expect(replay.status).toBe('accepted');
+    expect(replay.intent).toEqual(accepted.intent);
+    expect(replay.observation).toBeUndefined();
+    const blocked = await call({
+      ...submit,
+      requestId: 'bad-ack-backlink',
+      urls: ['https://built.test/new-donor'],
+      acknowledgement: {
+        quoteFingerprint: 'a'.repeat(64),
+        authorizationFingerprint: 'b'.repeat(64),
+      },
+    });
+    expect(blocked.error?.code).toBe('AcknowledgementMismatch');
+    expect(blocked.intent).toBeUndefined();
+    expect(snapshot()).toEqual(before);
+    expect(h.receipts).toHaveLength(1);
+    expect(h.api.requests).toEqual([
+      {
+        method: 'POST',
+        path: '/v2/task/backlink/checker/create',
+        auth: dummyKey,
+        agent: 'speedyindex-mcp/0.1.0',
+      },
+    ]);
+    expect(session.stderr()).toBe('');
+    await session.close();
   });
 }, 30_000);

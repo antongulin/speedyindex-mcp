@@ -7,6 +7,7 @@ import { registerGetTaskStatus } from './tools/get-task-status';
 import { registerGetTaskReport } from './tools/get-task-report';
 import { registerCreateIndexingTask } from './tools/create-indexing-task';
 import { registerCreateIndexCheck } from './tools/create-index-check';
+import { registerCreateBacklinkCheck } from './tools/create-backlink-check';
 import { SubmissionHost } from './submission-host';
 
 export function createServer(
@@ -20,5 +21,6 @@ export function createServer(
   registerGetTaskReport(server, client);
   registerCreateIndexingTask(server, submissionHost);
   registerCreateIndexCheck(server, submissionHost);
+  registerCreateBacklinkCheck(server, submissionHost);
   return server;
 }

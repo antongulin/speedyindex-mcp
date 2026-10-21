@@ -2834,7 +2834,7 @@ test('C15 SOURCE SDK: real CLI cancellation after full POST persists unknown, fr
       );
     };
     const session = await h.sdk();
-    expect((await session.client.listTools()).tools).toHaveLength(6);
+    expect((await session.client.listTools()).tools).toHaveLength(7);
     const controller = new AbortController();
     const input = request('sdk-after-receipt');
     const call = h.track(
@@ -3057,7 +3057,7 @@ test('C15 SOURCE CLI: incomplete or malformed trusted configuration disables wri
         state: 'invalid',
         stateChecked: false,
       });
-      expect((await session.client.listTools()).tools).toHaveLength(6);
+      expect((await session.client.listTools()).tools).toHaveLength(7);
       expect(
         (await session.client.callTool({ name: 'get_balance', arguments: {} }))
           .isError,
@@ -4800,3 +4800,140 @@ test.each(['backlink', 'indexer'] as const)(
     });
   },
 );
+
+test('BC06 SOURCE SDK: keyless default backlink preview and blocked submit open no state and send no HTTP', async () => {
+  await withHost(async (h) => {
+    const session = await h.sdk(false, [], '');
+    for (const mode of ['preview', 'submit']) {
+      const value = await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: {
+          mode,
+          urls: ['https://donor.test/default'],
+          targetDomains: ['target.test'],
+          ...(mode === 'submit' ? { requestId: 'disabled-backlink' } : {}),
+        },
+      });
+      const parsed = createBacklinkCheckResultSchema.parse(
+        value.structuredContent,
+      );
+      expect(value.content).toEqual([
+        { type: 'text', text: JSON.stringify(parsed) },
+      ]);
+      expect(value.isError).toBe(mode === 'submit');
+      expect(parsed.status).toBe(mode === 'preview' ? 'preview' : 'blocked');
+      expect(parsed.authorization).toEqual({
+        state: 'unconfigured',
+        stateChecked: false,
+      });
+      expect(parsed.quote).toMatchObject({
+        availability: 'unavailable',
+        reason: 'policy_unconfigured',
+        providerFeesKnown: false,
+      });
+      expect(parsed.quote).not.toHaveProperty('reservation');
+      expect(parsed.quote).not.toHaveProperty('fingerprint');
+      if (mode === 'submit') expect(parsed.error?.code).toBe('WritesDisabled');
+      assertNoPrivate(value, h);
+    }
+    expect(existsSync(h.stateDirectory)).toBe(false);
+    expect(h.records).toEqual([]);
+    expect(h.api.requests).toEqual([]);
+    expect(session.stderr()).toBe('');
+  });
+});
+
+test('BC06 SOURCE SDK: current caller ACK accepts backlink once; next-day controlled-clock restart replays without ACK or ledger mutation', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config({ ...backlinkPolicy, mode: 'caller_acknowledgement' });
+    const session = await h.sdk(true);
+    await session.phases.wait('READY');
+    const input = backlinkRequest(
+      'sdk-backlink-ack',
+      ['HTTPS://Donor.TEST/%2f'],
+      [' Target.TEST ', ' Target.TEST '],
+    );
+    const application = (value: {
+      structuredContent?: unknown;
+      content: unknown;
+      isError?: boolean | undefined;
+    }) => {
+      const result = createBacklinkCheckResultSchema.parse(
+        value.structuredContent,
+      );
+      expect(value.content).toEqual([
+        { type: 'text', text: JSON.stringify(result) },
+      ]);
+      expect(value.isError).toBe(
+        !['preview', 'accepted'].includes(result.status),
+      );
+      assertNoPrivate(value, h);
+      return result;
+    };
+    const preview = application(
+      await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: {
+          mode: 'preview',
+          urls: input.urls,
+          targetDomains: input.targetDomains,
+        },
+      }),
+    );
+    expect(preview.quote).toMatchObject({
+      availability: 'available',
+      reservation: backlinkVector,
+    });
+    expect(preview.authorization?.stateChecked).toBe(false);
+    const accepted = application(
+      await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: { ...input, acknowledgement: backlinkAck(preview) },
+      }),
+    );
+    expect(accepted.status).toBe('accepted');
+    expect(accepted.intent).toMatchObject({
+      providerType: 'backlink/checker',
+      reservation: backlinkVector,
+    });
+    expect(accepted.observation).toMatchObject({
+      kind: 'accepted_ack',
+      recorded: true,
+      type: 'backlink/checker',
+    });
+    await session.phases.wait('CLOSED', 1);
+    const snapshot = () =>
+      ['budget_periods', 'intents', 'intent_urls', 'intent_events'].map(
+        (table) => h.rows(`SELECT * FROM ${table} ORDER BY rowid`),
+      );
+    const before = snapshot();
+    await session.close();
+    h.now += 86_400_000;
+    const restarted = await h.sdk(true);
+    await restarted.phases.wait('READY');
+    const replay = application(
+      await restarted.client.callTool({
+        name: 'create_backlink_check',
+        arguments: input,
+      }),
+    );
+    await restarted.phases.wait('CLOSED', 1);
+    expect(replay.replayed).toBe(true);
+    expect(replay.intent).toEqual(accepted.intent);
+    expect(replay.intent?.periodId).toBe('utc-day:2026-10-20');
+    expect(replay.observation).toBeUndefined();
+    expect(replay.authorization?.fingerprint).not.toBe(
+      accepted.authorization?.fingerprint,
+    );
+    expect(snapshot()).toEqual(before);
+    expect(h.records).toHaveLength(1);
+    expect(h.records[0]?.path).toBe('/v2/task/backlink/checker/create');
+    expect(h.records[0]?.body).toBe(
+      '{"urls":["HTTPS://Donor.TEST/%2f"],"target_domains":[" Target.TEST "," Target.TEST "]}',
+    );
+    expect(restarted.phases.messages.some((m) => m.event === 'CLAIM')).toBe(
+      false,
+    );
+  });
+}, 30_000);

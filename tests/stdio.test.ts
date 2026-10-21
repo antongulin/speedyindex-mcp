@@ -4,6 +4,7 @@ import { taskStatusResultSchema } from '../src/task-status';
 import { taskReportOutputSchema } from '../src/task-report';
 import { createIndexingTaskResultSchema } from '../src/create-indexing-task';
 import { createIndexCheckResultSchema } from '../src/create-index-check';
+import { createBacklinkCheckResultSchema } from '../src/create-backlink-check';
 import {
   account,
   bounded,
@@ -113,6 +114,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       'get_task_report',
       'create_indexing_task',
       'create_index_check',
+      'create_backlink_check',
     ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
@@ -639,7 +641,7 @@ test('F02: direct stdin EOF after initialize exits successfully', async () => {
   await verifyEof('src/cli.ts');
 });
 
-test('IC10/C15 SOURCE SDK: six tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
+test('IC10/C15 SOURCE SDK: seven tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
   const api = await fixture((_request, response) => response.end('unexpected'));
   let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
@@ -652,8 +654,136 @@ test('IC10/C15 SOURCE SDK: six tools expose strict schemas, paid annotations, un
       'get_task_report',
       'create_indexing_task',
       'create_index_check',
+      'create_backlink_check',
     ]);
     const checker = tools[5]!;
+    const backlink = tools[6]!;
+    expect(backlink.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+    expect(backlink.inputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['mode', 'urls', 'targetDomains'],
+      properties: {
+        mode: { type: 'string', enum: ['preview', 'submit'] },
+        urls: { type: 'array', minItems: 1, maxItems: 10000 },
+        targetDomains: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 50,
+          items: { type: 'string' },
+        },
+      },
+    });
+    expect(Object.keys(backlink.inputSchema.properties ?? {}).sort()).toEqual([
+      'acknowledgement',
+      'mode',
+      'requestId',
+      'targetDomains',
+      'title',
+      'urls',
+    ]);
+    expect(backlink.outputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        request: {
+          type: 'object',
+          additionalProperties: false,
+          required: [
+            'family',
+            'providerRoute',
+            'urlCount',
+            'targetDomainCount',
+            'providerBodyBytes',
+            'payloadDigest',
+          ],
+          properties: {
+            family: { const: 'backlink/checker' },
+            providerRoute: { const: '/v2/task/backlink/checker/create' },
+            targetDomainCount: { type: 'integer', minimum: 1, maximum: 50 },
+          },
+        },
+        quote: {
+          oneOf: expect.arrayContaining([
+            expect.objectContaining({
+              additionalProperties: false,
+              properties: expect.objectContaining({
+                availability: { type: 'string', const: 'available' },
+                reservation: expect.any(Object),
+                fingerprint: expect.any(Object),
+              }),
+            }),
+            expect.objectContaining({
+              additionalProperties: false,
+              properties: expect.objectContaining({
+                availability: { type: 'string', const: 'unavailable' },
+                reason: expect.any(Object),
+              }),
+            }),
+          ]),
+        },
+      },
+    });
+    for (const mode of ['preview', 'submit']) {
+      const value = await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: {
+          mode,
+          urls: ['https://donor.test/default'],
+          targetDomains: [' Target.TEST ', ' Target.TEST '],
+          ...(mode === 'submit' ? { requestId: 'default-backlink' } : {}),
+        },
+      });
+      const parsed = createBacklinkCheckResultSchema.parse(
+        value.structuredContent,
+      );
+      expect(value.content).toEqual([
+        { type: 'text', text: JSON.stringify(parsed) },
+      ]);
+      expect(value.isError).toBe(mode === 'submit');
+      expect(parsed.status).toBe(mode === 'preview' ? 'preview' : 'blocked');
+      expect(parsed.request?.targetDomainCount).toBe(2);
+      expect(parsed.authorization).toEqual({
+        state: 'unconfigured',
+        stateChecked: false,
+      });
+      expect(parsed.quote).toEqual({
+        version: 'speedyindex-backlink-check-reservation-2026-10-21-v1',
+        basis: 'operator_configured_reservation',
+        providerEnforced: false,
+        providerFeesKnown: false,
+        availability: 'unavailable',
+        reason: 'policy_unconfigured',
+      });
+      if (mode === 'submit') expect(parsed.error?.code).toBe('WritesDisabled');
+    }
+    for (const arguments_ of [
+      { mode: 'preview', urls: ['https://donor.test/a'] },
+      {
+        mode: 'preview',
+        urls: ['https://donor.test/a'],
+        targetDomains: ['target.test'],
+        searchEngine: 'google',
+      },
+      {
+        mode: 'preview',
+        urls: ['https://donor.test/a'],
+        targetDomains: ['target.test'],
+        allowBacklinkChecks: true,
+      },
+    ]) {
+      const value = await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: arguments_,
+      });
+      expect(value.isError).toBe(true);
+      expect(value.structuredContent).toBeUndefined();
+    }
     expect(checker.annotations).toEqual({
       readOnlyHint: false,
       destructiveHint: true,
