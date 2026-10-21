@@ -12,6 +12,6 @@
 
 ## Official provider resources
 
-- [SpeedyIndex](https://speedyindex.com/): Official provider website; this MCP integration is unofficial
+- [SpeedyIndex signup](https://app.speedyindex.com/r/zqgax9): This referral link may support project maintenance; this MCP integration is unofficial
 - [Public API reference](https://en.speedyindex.com/api.php): Official provider API documentation
 - [API key setup](https://app.speedyindex.com/cabinet/api): Official API page; sign in to obtain your key

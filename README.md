@@ -111,7 +111,7 @@ Use only canonical absolute POSIX paths you explicitly select. The state parent 
 bun --no-env-file dist/cli.js --init-submission-state '<canonical-absolute-new-directory>'
 ```
 
-The command creates version-one `ledger.sqlite` state and prints `{"initialized":true,"schemaVersion":1}`. It refuses existing paths, including broken or partial state, and does not create parents. A failed init may leave files for inspection. Do not replace an existing store to bypass reservations. Normal submit opens existing state only; startup and preview do not open it. Normal open can configure WAL and touch sidecars, including SHM bookkeeping before rejecting a wrong schema version, while preserving existing database data. It performs no repair, bootstrap or reset.
+The command creates version-one `ledger.sqlite` state and prints `{"initialized":true,"schemaVersion":1}`. It refuses existing paths, including broken or partial state, and does not create parents. A failed init may leave files for inspection. Do not replace an existing store to bypass reservations. Normal submit opens existing state only; startup and preview do not open it. Normal open verifies complete V1 state before configuring persistent WAL. SQLite opening and reads can touch sidecar bookkeeping even when an unsupported version is rejected. It performs no repair, bootstrap or reset.
 
 With your key already supplied in the process environment, obtain its expected policy binding locally:
 
