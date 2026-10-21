@@ -850,6 +850,153 @@ test('IC03 POLICY: absent extensions retain literal legacy bytes; explicit false
       );
   });
 });
+
+test('P0-01 POLICY: optional retry policy preserves legacy identity and binds every present value', () => {
+  withFixture((fixture) => {
+    const legacy = loadSubmissionPolicy(fixture.policyPath);
+    expect(legacy.digest).toBe(expectedPolicyDigest());
+    expect(Object.hasOwn(legacy.policy, 'retry')).toBe(false);
+
+    const retryPolicies = [
+      {
+        enabled: true,
+        allowUnattributedParents: false,
+        maxAttemptsPerSource: 2,
+      },
+      {
+        enabled: false,
+        allowUnattributedParents: false,
+        maxAttemptsPerSource: 2,
+      },
+      {
+        enabled: true,
+        allowUnattributedParents: true,
+        maxAttemptsPerSource: 2,
+      },
+      {
+        enabled: true,
+        allowUnattributedParents: true,
+        maxAttemptsPerSource: 5,
+      },
+      {
+        enabled: false,
+        allowUnattributedParents: true,
+        maxAttemptsPerSource: 5,
+      },
+    ];
+    const digests = new Set<string>();
+    for (const retry of retryPolicies) {
+      writePolicy(fixture, { ...policy(), retry });
+      const expectedCanonical = JSON.stringify({ ...policy(), retry });
+      const loaded = loadSubmissionPolicy(fixture.policyPath);
+      expect(JSON.stringify(loaded.policy)).toBe(expectedCanonical);
+      expect(loaded.digest).toBe(
+        sha('speedyindex-submission-policy-v1\0' + expectedCanonical),
+      );
+      expect(loaded.digest).not.toBe(legacy.digest);
+      digests.add(loaded.digest);
+    }
+    expect(digests.size).toBe(retryPolicies.length);
+  });
+});
+
+test('P0-01 POLICY: admitted retry policy is copied, deeply frozen and isolated from file changes', () => {
+  withFixture((fixture) => {
+    const retryInput = {
+      enabled: true,
+      allowUnattributedParents: false,
+      maxAttemptsPerSource: 3,
+    };
+    writePolicy(fixture, { ...policy(), retry: retryInput });
+    const config = configured(fixture);
+    const digest = config.snapshot.digest;
+    const admittedRetry = config.snapshot.policy.retry;
+    if (admittedRetry === undefined)
+      throw new Error('Expected an admitted retry policy.');
+
+    retryInput.enabled = false;
+    retryInput.allowUnattributedParents = true;
+    retryInput.maxAttemptsPerSource = 9;
+    expect(admittedRetry).toEqual({
+      enabled: true,
+      allowUnattributedParents: false,
+      maxAttemptsPerSource: 3,
+    });
+    expect(Object.isFrozen(admittedRetry)).toBe(true);
+    expect(() =>
+      Object.assign(admittedRetry, { maxAttemptsPerSource: 99 }),
+    ).toThrow();
+
+    writePolicy(fixture, {
+      ...policy(),
+      retry: {
+        enabled: false,
+        allowUnattributedParents: true,
+        maxAttemptsPerSource: 9,
+      },
+    });
+    expect(config.snapshot.policy.retry).toEqual(admittedRetry);
+    expect(config.snapshot.digest).toBe(digest);
+  });
+});
+
+test('P0-01 POLICY: malformed retry policy invalidates the complete private policy', () => {
+  withFixture((fixture) => {
+    const valid = {
+      enabled: true,
+      allowUnattributedParents: true,
+      maxAttemptsPerSource: 3,
+    };
+    const malformed: unknown[] = [
+      null,
+      [],
+      'retry',
+      {},
+      { enabled: true, allowUnattributedParents: true },
+      { enabled: true, maxAttemptsPerSource: 3 },
+      { allowUnattributedParents: true, maxAttemptsPerSource: 3 },
+      { ...valid, extra: false },
+    ];
+    for (const field of ['enabled', 'allowUnattributedParents'])
+      for (const value of [null, 0, 1, 'true', [], {}])
+        malformed.push({ ...valid, [field]: value });
+    for (const maxAttemptsPerSource of [
+      0,
+      -1,
+      1.5,
+      NaN,
+      Infinity,
+      -Infinity,
+      Number.MAX_SAFE_INTEGER + 1,
+      null,
+      '3',
+    ])
+      malformed.push({ ...valid, maxAttemptsPerSource });
+
+    for (const retry of malformed) {
+      const value = { ...policy(), retry };
+      expect(submissionPolicySchema.safeParse(value).success).toBe(false);
+      writePolicy(fixture, value);
+      fixedError(
+        () => loadSubmissionPolicy(fixture.policyPath),
+        'InvalidPolicy',
+      );
+      const config = loadSubmissionConfiguration({
+        ...fixture,
+        apiKey: dummyKey,
+      });
+      expect(config.state).toBe('invalid');
+      if (config.state !== 'configured') {
+        expect(config.error.code).toBe('InvalidPolicy');
+        expect(config.error.message).toBe(
+          'Submission policy is invalid or unavailable.',
+        );
+      }
+    }
+    expect(existsSync(fixture.stateDirectory)).toBe(false);
+  });
+});
+
 test('IC03 POLICY: strict partial profiles require all three safe units and compiled local floors', () => {
   withFixture((fixture) => {
     for (const indexCheckReservations of [
