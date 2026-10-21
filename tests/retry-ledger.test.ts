@@ -6348,7 +6348,7 @@ test('P0-02 matching first-unique reports retain exact category order and propos
     );
   }));
 
-test('P0-02 R3 pure fixed public tuple has an independent canonical oracle and excludes incidental metadata', () =>
+test('P0-02 R3 FP-INVALID-TUPLE-1 pure public tuple has a canonical oracle and rejects semantic boundary mutations', () =>
   retryProcessCase(async (f) => {
     const h = verifiedFixture(f);
     const a = candidate(await h.composition.collect(h.selection));
@@ -6444,6 +6444,26 @@ test('P0-02 R3 pure fixed public tuple has an independent canonical oracle and e
         provenance: 'legacy_unattributed',
       }),
     ).not.toBe(expected);
+    const invalidTuples: RetryPlanFingerprintInput[] = [
+      { ...value, providerRoute: '/v2/task/yandex/indexer/create' },
+      {
+        ...value,
+        period: { ...value.period, endMs: value.period.endMs - 1 },
+      },
+      { ...value, urlCount: 0 },
+      { ...value, urlCount: 10001 },
+      { ...value, providerBodyBytes: 0 },
+      { ...value, providerBodyBytes: 2097153 },
+      {
+        ...value,
+        reservation: { ...value.reservation, tokens: -1 },
+      },
+    ];
+    for (const invalid of invalidTuples)
+      expectLedgerError(
+        () => computeRetryPlanFingerprint(invalid),
+        'InvalidLedgerInput',
+      );
     const writer = verifiedWriter(f, h);
     expectRetryError(
       () => writer.prepareVerifiedRetryIntent(b.input, a.proof),
@@ -6888,6 +6908,133 @@ test('P0-04 external child keeps native owner-first duplicate/self-parent ACK gu
       writer.readIntent(retryFixtureBinding, c.input.intent.requestId)?.state,
     ).toBe('accepted');
     expect(verifiedLogical(h.db).intents).toHaveLength(3);
+  }));
+
+test('WRAPPER-FOREIGN-BINDING-1 readIntent rejects a foreign prepared row without disclosure or state change', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const foreignBinding = hash('wrapper-foreign-read-binding');
+    expect(foreignBinding).not.toBe(retryFixtureBinding);
+    const foreignInput = input('wrapper-foreign-read');
+    const foreign = newIntent(h.ordinary, {
+      ...foreignInput,
+      budget: {
+        ...foreignInput.budget,
+        credentialFingerprint: foreignBinding,
+      },
+    });
+    expect(
+      h.ordinary.readIntent(foreignBinding, foreign.intent.requestId)?.state,
+    ).toBe('prepared');
+
+    const writer = verifiedWriter(f, h);
+    const before = verifiedLogical(h.db);
+    expectLedgerError(
+      () => writer.readIntent(foreignBinding, foreign.intent.requestId),
+      'InvalidLedgerInput',
+    );
+    expect(verifiedLogical(h.db)).toEqual(before);
+  }));
+
+test('WRAPPER-FOREIGN-BINDING-1 cancelPrepared rejects a foreign prepared row despite a valid native cancel control', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const foreignBinding = hash('wrapper-foreign-cancel-binding');
+    expect(foreignBinding).not.toBe(retryFixtureBinding);
+    const targetInput = input('wrapper-foreign-cancel-target');
+    const target = newIntent(h.ordinary, {
+      ...targetInput,
+      budget: {
+        ...targetInput.budget,
+        credentialFingerprint: foreignBinding,
+      },
+      submittedUrls: ['https://example.test/wrapper-foreign-cancel-target'],
+    });
+    const controlInput = input('wrapper-foreign-cancel-control');
+    const control = newIntent(h.ordinary, {
+      ...controlInput,
+      budget: {
+        ...controlInput.budget,
+        credentialFingerprint: foreignBinding,
+      },
+      submittedUrls: ['https://example.test/wrapper-foreign-cancel-control'],
+    });
+    expect(
+      h.ordinary.cancelPrepared(foreignBinding, control.intent.requestId, 0),
+    ).toEqual({ kind: 'cancelled', stateVersion: 1 });
+    expect(
+      h.ordinary.readIntent(foreignBinding, target.intent.requestId)?.state,
+    ).toBe('prepared');
+
+    const writer = verifiedWriter(f, h);
+    const before = verifiedLogical(h.db);
+    expectLedgerError(
+      () => writer.cancelPrepared(foreignBinding, target.intent.requestId, 0),
+      'InvalidLedgerInput',
+    );
+    expect(verifiedLogical(h.db)).toEqual(before);
+  }));
+
+test('WRAPPER-FOREIGN-BINDING-1 recordDispatchOutcome rejects a foreign dispatching row with a genuine native token', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const foreignBinding = hash('wrapper-foreign-outcome-binding');
+    expect(foreignBinding).not.toBe(retryFixtureBinding);
+    const targetInput = input('wrapper-foreign-outcome-target');
+    const target = newIntent(h.ordinary, {
+      ...targetInput,
+      budget: {
+        ...targetInput.budget,
+        credentialFingerprint: foreignBinding,
+      },
+      submittedUrls: ['https://example.test/wrapper-foreign-outcome-target'],
+    });
+    const targetClaim = h.ordinary.claimDispatch(target.dispatchCapability, 0);
+    if (targetClaim.kind !== 'claimed')
+      throw new Error('Expected genuine foreign dispatch claim.');
+    expect(
+      h.ordinary.readIntent(foreignBinding, target.intent.requestId)?.state,
+    ).toBe('dispatching');
+
+    const controlInput = input('wrapper-foreign-outcome-control');
+    const control = newIntent(h.ordinary, {
+      ...controlInput,
+      budget: {
+        ...controlInput.budget,
+        credentialFingerprint: foreignBinding,
+      },
+      submittedUrls: ['https://example.test/wrapper-foreign-outcome-control'],
+    });
+    const controlClaim = h.ordinary.claimDispatch(
+      control.dispatchCapability,
+      0,
+    );
+    if (controlClaim.kind !== 'claimed')
+      throw new Error('Expected genuine native control claim.');
+    expect(
+      h.ordinary.recordDispatchOutcome({
+        credentialFingerprint: foreignBinding,
+        requestId: control.intent.requestId,
+        expectedStateVersion: controlClaim.stateVersion,
+        outcomeToken: controlClaim.outcomeToken,
+        outcome: { kind: 'unknown' },
+      }).state,
+    ).toBe('unknown');
+
+    const writer = verifiedWriter(f, h);
+    const before = verifiedLogical(h.db);
+    expectLedgerError(
+      () =>
+        writer.recordDispatchOutcome({
+          credentialFingerprint: foreignBinding,
+          requestId: target.intent.requestId,
+          expectedStateVersion: targetClaim.stateVersion,
+          outcomeToken: targetClaim.outcomeToken,
+          outcome: { kind: 'unknown' },
+        }),
+      'InvalidLedgerInput',
+    );
+    expect(verifiedLogical(h.db)).toEqual(before);
   }));
 
 test('P0-02 boundary raw entries and safety digests succeed without truncation', () =>
