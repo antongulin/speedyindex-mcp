@@ -20,6 +20,16 @@ import {
 } from 'bun:sqlite';
 import { taskFamilySchema, type TaskFamily } from './task-status';
 import { providerTaskIdSchema } from './submission-contract';
+import {
+  checkSnapshotBounds,
+  freezeSnapshot,
+  projectRetrySnapshot,
+  signalSnapshotPhase,
+  snapshotLimits,
+  SnapshotReadError,
+  type RetrySnapshot,
+  type SnapshotReadHooks,
+} from './retry-ledger-snapshot';
 
 export type Unit = 'tokens' | 'indexer' | 'checker';
 export type UnitVector = Readonly<Record<Unit, number>>;
@@ -727,7 +737,11 @@ interface SchemaIdentity {
 
 function readLedgerId(database: Database): string {
   const rows = database
-    .query('SELECT singleton, ledger_id FROM retry_ledger_meta LIMIT 2')
+    .query(
+      `SELECT singleton,
+      CASE WHEN length(CAST(ledger_id AS BLOB)) = 64 THEN ledger_id END AS ledger_id
+      FROM retry_ledger_meta LIMIT 2`,
+    )
     .all() as {
     singleton: number;
     ledger_id: string;
@@ -793,7 +807,7 @@ function verifyCoreData(database: Database) {
     fail('LedgerUnavailable');
 }
 
-function verifyV2Data(database: Database) {
+function verifyV2Data(database: Database, binding?: string) {
   verifyCoreData(database);
   if (
     database
@@ -815,12 +829,14 @@ function verifyV2Data(database: Database) {
       task_family: string;
       provider_task_id: string | null;
     },
-    []
+    string[]
   >(`SELECT c.parent_family, c.parent_task_id, c.source_manifest_digest, c.plan_fingerprint,
       i.task_family, i.provider_task_id
     FROM intent_context c JOIN intents i USING (credential_fp, request_id)
-    WHERE c.origin_kind = 'retry'`);
-  for (const row of contexts.iterate()) {
+    WHERE c.origin_kind = 'retry'${binding === undefined ? '' : ' AND c.credential_fp = ?'}`);
+  for (const row of contexts.iterate(
+    ...(binding === undefined ? [] : [binding]),
+  )) {
     if (
       row.parent_family !== row.task_family ||
       !providerTaskIdSchema.safeParse(row.parent_task_id).success ||
@@ -835,6 +851,12 @@ function verifyV2Data(database: Database) {
 }
 
 function verifySchema(database: Database): SchemaIdentity {
+  const schema = verifySchemaShape(database);
+  if (schema.version === 2) verifyV2Data(database);
+  return schema;
+}
+
+function verifySchemaShape(database: Database): SchemaIdentity {
   const version = readUserVersion(database);
   if (version !== 1 && version !== 2) fail('LedgerUnavailable');
   const schemaObjects = versionedSchemaObjects[version];
@@ -852,7 +874,6 @@ function verifySchema(database: Database): SchemaIdentity {
   }
   if (version === 2) {
     const ledgerId = readLedgerId(database);
-    verifyV2Data(database);
     return { version, ledgerId };
   }
   return { version, ledgerId: null };
@@ -1771,6 +1792,112 @@ export function openLedger(options: LedgerPathOptions): SubmissionLedger {
     }
     throw toLedgerError(error);
   }
+}
+
+// Trusted internal semantic reader. SQLite may update physical WAL bookkeeping;
+// query_only and a single read transaction prohibit logical ledger mutation.
+export function readRetrySnapshot(
+  options: LedgerPathOptions,
+  credentialFingerprint: string,
+  hooks: SnapshotReadHooks = {},
+): RetrySnapshot {
+  let database: Database | undefined;
+  let result: RetrySnapshot;
+  try {
+    validatePathInput(options);
+    requireDigest(credentialFingerprint);
+    const limits = snapshotLimits(hooks.limits);
+    const uid = ensurePosixRuntime();
+    if (!lstatOrMissing(options.stateDirectory))
+      throw new SnapshotReadError('MissingState');
+    const directoryIdentity = identityFrom(
+      validateCanonicalPathComponents(options.stateDirectory, uid),
+    );
+    const path = join(options.stateDirectory, databaseFilename);
+    validateSidecars(options.stateDirectory, uid);
+    if (!lstatOrMissing(path)) throw new SnapshotReadError('MissingState');
+    const identity = validateDatabaseFile(path, uid, true);
+    database = new Database(path, openFlags().database);
+    database.run('PRAGMA query_only = ON');
+    database.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+    database.run('PRAGMA foreign_keys = ON');
+    assertStorageIdentity(
+      options.stateDirectory,
+      uid,
+      identity,
+      directoryIdentity,
+    );
+    result = database
+      .transaction((): RetrySnapshot => {
+        // This schema SELECT, rather than BEGIN alone, pins the read snapshot.
+        const schemaBytes = database!
+          .query<{ n: number }, []>(
+            'SELECT COALESCE(SUM(length(CAST(sql AS BLOB))), 0) AS n FROM sqlite_schema',
+          )
+          .get()!.n;
+        signalSnapshotPhase(hooks, 'snapshot_fixed');
+        if (
+          !Number.isSafeInteger(schemaBytes) ||
+          schemaBytes > 16 * 1024 * 1024
+        )
+          throw new SnapshotReadError('LimitExceeded');
+        requireWal(database!);
+        const schema = verifySchemaShape(database!);
+        if (schema.version === 1)
+          throw new SnapshotReadError('UpgradeRequired');
+        checkSnapshotBounds(database!, credentialFingerprint, limits);
+        verifyV2Data(database!, credentialFingerprint);
+        signalSnapshotPhase(hooks, 'before_projection');
+        return projectRetrySnapshot(
+          database!,
+          credentialFingerprint,
+          schema.ledgerId!,
+          limits,
+        );
+      })
+      .deferred();
+    assertStorageIdentity(
+      options.stateDirectory,
+      uid,
+      identity,
+      directoryIdentity,
+    );
+    signalSnapshotPhase(hooks, 'before_close');
+    database.close(true);
+    database = undefined;
+    assertStorageIdentity(
+      options.stateDirectory,
+      uid,
+      identity,
+      directoryIdentity,
+    );
+  } catch (error) {
+    const reason =
+      error instanceof SnapshotReadError
+        ? error.reason
+        : error instanceof SubmissionLedgerError ||
+            error instanceof LedgerMigrationError
+          ? 'InvalidState'
+          : error instanceof SQLiteError &&
+              (error.code?.startsWith('SQLITE_BUSY') ||
+                error.code?.startsWith('SQLITE_LOCKED'))
+            ? 'Busy'
+            : error instanceof SQLiteError &&
+                (error.code?.startsWith('SQLITE_CORRUPT') ||
+                  error.code === 'SQLITE_NOTADB')
+              ? 'InvalidState'
+              : 'ReadFailure';
+    result = { availability: 'unavailable', reason };
+  } finally {
+    if (database) {
+      try {
+        database.close(true);
+      } catch {
+        result = { availability: 'unavailable', reason: 'ReadFailure' };
+      }
+    }
+  }
+  return freezeSnapshot(result);
 }
 
 export class LedgerMigrationError extends Error {

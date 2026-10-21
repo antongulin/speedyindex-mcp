@@ -14,7 +14,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { Database, constants } from 'bun:sqlite';
+import { Database, constants, SQLiteError } from 'bun:sqlite';
 import { expect, test } from 'bun:test';
 import {
   initializeLedger,
@@ -22,10 +22,15 @@ import {
   migrateLedgerV2,
   LedgerMigrationError,
   openLedger,
+  readRetrySnapshot,
   SubmissionLedgerError,
   type PrepareIntentInput,
   type SubmissionLedger,
 } from '../src/submission-ledger';
+import {
+  type AvailableRetrySnapshot,
+  type SnapshotReadHooks,
+} from '../src/retry-ledger-snapshot';
 
 const binding = 'a'.repeat(64);
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -401,6 +406,11 @@ for (const [name, corrupt] of corruptions) {
       const before = snapshotWithMissingTables(db);
       const inode = lstatSync(join(state, 'ledger.sqlite')).ino;
       expectUnavailable(() => f.open(state));
+      // V2-05 reuses this real corruption matrix at the new aggregate boundary.
+      expect(readRetrySnapshot({ stateDirectory: state }, binding)).toEqual({
+        availability: 'unavailable',
+        reason: 'InvalidState',
+      });
       expect(snapshotWithMissingTables(db)).toEqual(before);
       expect(lstatSync(join(state, 'ledger.sqlite')).ino).toBe(inode);
     } finally {
@@ -767,6 +777,10 @@ test('V2-01 history: event order and ACK association are checked without rewriti
       if (fault === 'self-parent') makeRetryContext(db, 'synthetic-ack');
       const before = snapshot(db);
       expectUnavailable(() => f.open(state));
+      expect(readRetrySnapshot({ stateDirectory: state }, binding)).toEqual({
+        availability: 'unavailable',
+        reason: 'InvalidState',
+      });
       expect(snapshot(db)).toEqual(before);
     } finally {
       f.cleanup();
@@ -1942,4 +1956,835 @@ test('V2-04 reactivation: repeated maintenance preserves new V2 unknown history,
   } finally {
     f.cleanup();
   }
+});
+
+function snapshotCase(body: (owned: ReturnType<typeof fixture>) => void) {
+  const owned = fixture();
+  let passed = false;
+  try {
+    body(owned);
+    passed = true;
+  } finally {
+    // Close every registered handle first. A failed case or close preserves its
+    // owned root; successful cases independently verify their cleanup.
+    owned.cleanup(passed);
+    if (passed) expect(existsSync(owned.root)).toBe(false);
+  }
+}
+
+function availableSnapshot(
+  state: string,
+  hooks: SnapshotReadHooks = {},
+  selected = binding,
+): AvailableRetrySnapshot {
+  const result = readRetrySnapshot({ stateDirectory: state }, selected, hooks);
+  expect(result.availability).toBe('available');
+  if (result.availability !== 'available')
+    throw new Error('Expected available synthetic snapshot.');
+  return result;
+}
+function seedSnapshotState(
+  ledger: SubmissionLedger,
+  value: PrepareIntentInput,
+  state:
+    | 'prepared'
+    | 'dispatching'
+    | 'accepted'
+    | 'rejected'
+    | 'unknown'
+    | 'cancelled',
+  providerTaskId = ' Local-é-ACK ',
+) {
+  const prepared = newIntent(ledger, value);
+  if (state === 'prepared') return;
+  if (state === 'cancelled') {
+    expect(
+      ledger.cancelPrepared(
+        value.budget.credentialFingerprint,
+        value.requestId,
+        0,
+      ).kind,
+    ).toBe('cancelled');
+    return;
+  }
+  const claim = ledger.claimDispatch(prepared.dispatchCapability, 0);
+  expect(claim.kind).toBe('claimed');
+  if (claim.kind !== 'claimed') throw new Error('Expected synthetic claim.');
+  if (state === 'dispatching') return;
+  ledger.recordDispatchOutcome({
+    credentialFingerprint: value.budget.credentialFingerprint,
+    requestId: value.requestId,
+    expectedStateVersion: 1,
+    outcomeToken: claim.outcomeToken,
+    outcome:
+      state === 'accepted'
+        ? { kind: state, providerTaskId, providerType: value.taskFamily }
+        : { kind: state },
+  });
+}
+function assertDeepFrozen(value: unknown) {
+  if (!value || typeof value !== 'object') return;
+  expect(Object.isFrozen(value)).toBe(true);
+  const before = JSON.stringify(value);
+  for (const [key, child] of Object.entries(value)) {
+    try {
+      Reflect.set(value, key, 'MUTATION');
+    } catch {
+      /* Strict caller mutation may throw. */
+    }
+    expect(JSON.stringify(value)).toBe(before);
+    assertDeepFrozen(child);
+  }
+  if (Array.isArray(value)) {
+    expect(() => value.push('MUTATION')).toThrow();
+    expect(JSON.stringify(value)).toBe(before);
+  }
+}
+
+// Independent oracle: explicit public storage contract columns, not production
+// projection imports, table_info enumeration, or the production digest helper.
+function snapshotRevisionOracle(db: Database, selected = binding) {
+  const core = db
+    .query(
+      `SELECT credential_fp,request_id,budget_scope,period_id,CAST(period_start_ms AS TEXT),
+    policy_revision,policy_digest,task_family,provider_route,payload_digest,quote_version,quote_fingerprint,
+    CAST(reserved_tokens AS TEXT),CAST(reserved_indexer AS TEXT),CAST(reserved_checker AS TEXT),state,CAST(state_version AS TEXT),
+    claim_token_digest,dispatch_outcome_token_digest,CAST(created_at_ms AS TEXT),provider_task_id,provider_type
+    FROM intents WHERE credential_fp=? ORDER BY request_id COLLATE BINARY`,
+    )
+    .values(selected);
+  const contexts = db
+    .query(
+      `SELECT credential_fp,request_id,origin_kind,parent_family,parent_task_id,source_manifest_digest,plan_fingerprint
+    FROM intent_context WHERE credential_fp=? ORDER BY request_id COLLATE BINARY`,
+    )
+    .values(selected);
+  const urls = db
+    .query(
+      `SELECT credential_fp,request_id,CAST(ordinal AS TEXT),url_text
+    FROM intent_urls WHERE credential_fp=? ORDER BY request_id COLLATE BINARY,ordinal`,
+    )
+    .values(selected);
+  const events = db
+    .query(
+      `SELECT CAST(event_id AS TEXT),credential_fp,request_id,CAST(state_version AS TEXT),event_kind,CAST(occurred_at_ms AS TEXT),provider_task_id,provider_type
+    FROM intent_events WHERE credential_fp=? ORDER BY event_id`,
+    )
+    .values(selected);
+  const ledgerId = (
+    db
+      .query('SELECT ledger_id FROM retry_ledger_meta WHERE singleton=1')
+      .get() as { ledger_id: string }
+  ).ledger_id;
+  return createHash('sha256')
+    .update('speedyindex-retry-ledger-snapshot-v2\0')
+    .update(JSON.stringify([ledgerId, selected, core, contexts, urls, events]))
+    .digest('hex');
+}
+
+test('V2-05 complete local DTO spans scopes, periods, six families, every state, legacy gaps and ambiguous ACK history without secrets', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state, 1);
+    const families = [
+      'google/indexer',
+      'google/checker',
+      'yandex/indexer',
+      'yandex/checker',
+      'bing/checker',
+      'backlink/checker',
+    ] as const;
+    const states = [
+      'prepared',
+      'dispatching',
+      'accepted',
+      'rejected',
+      'unknown',
+      'cancelled',
+    ] as const;
+    for (const [fi, family] of families.entries()) {
+      for (const [si, status] of states.entries()) {
+        const value: PrepareIntentInput = {
+          ...input(`matrix-${fi}-${status}`),
+          taskFamily: family,
+          providerRoute: `/v2/task/${family}/create`,
+          budget: {
+            ...input().budget,
+            budgetScope: `scope-${si}`,
+            periodId: `period-${si}`,
+            periodStartMs: 1000 + si,
+          },
+          submittedUrls: [
+            `HTTP://Example.test/${fi}/${si}?q=Case#É`,
+            `http://example.test/${fi}/${si}?q=case#é/`,
+          ],
+        };
+        seedSnapshotState(ledger, value, status);
+      }
+    }
+    seedSnapshotState(
+      ledger,
+      {
+        ...input('duplicate'),
+        budget: { ...input().budget, budgetScope: 'duplicate' },
+        submittedUrls: ['https://example.test/duplicate'],
+      },
+      'accepted',
+    );
+    seedSnapshotState(
+      ledger,
+      {
+        ...input('other-binding'),
+        budget: { ...input().budget, credentialFingerprint: 'b'.repeat(64) },
+        submittedUrls: ['https://example.test/other'],
+      },
+      'unknown',
+    );
+    ledger.close();
+    migrateLedgerV2({
+      stateDirectory: state,
+      backupDirectory: join(f.root, 'backup'),
+    });
+    const db = f.raw(state);
+    // Explicit synthetic retry contexts exercise projection only, not admission.
+    db.run(
+      `UPDATE intent_context SET origin_kind='retry',parent_family='google/indexer',parent_task_id=' Parent ',source_manifest_digest='${hash('manifest')}',plan_fingerprint='${hash('plan')}' WHERE request_id LIKE 'matrix-0-%'`,
+    );
+    const before = snapshot(db);
+    const result = availableSnapshot(state);
+    expect(result.coverage).toEqual({
+      localStore: true,
+      keyBindingOnly: true,
+      allBudgetScopes: true,
+      allFamilies: true,
+      globalProviderAccount: false,
+      ancestry: 'cooperating_v2_retry_contexts_only',
+    });
+    expect(result.holds.length).toBe(18);
+    expect(new Set(result.holds.map((row) => row.taskFamily)).size).toBe(6);
+    expect(
+      result.holds.every((row) =>
+        ['prepared', 'dispatching', 'unknown'].includes(row.state),
+      ),
+    ).toBe(true);
+    const first = result.holds.find(
+      (row) => row.requestId === 'matrix-0-prepared',
+    )!;
+    expect(first.urls).toEqual([
+      { ordinal: '0', url: 'HTTP://Example.test/0/0?q=Case#É' },
+      { ordinal: '1', url: 'http://example.test/0/0?q=case#é/' },
+    ]);
+    expect(result.unresolvedHistory.length).toBe(18);
+    const unknown = result.unresolvedHistory.find(
+      (row) => row.requestId === 'matrix-0-unknown',
+    )!;
+    expect(unknown.events.map((row) => row.kind)).toEqual([
+      'prepared',
+      'dispatching',
+      'unknown',
+    ]);
+    expect(unknown.reservation).toEqual({
+      tokens: '3',
+      indexer: '2',
+      checker: '1',
+    });
+    expect(unknown.budgetScope).toBe('scope-4');
+    expect(unknown.periodId).toBe('period-4');
+    expect(result.retryChildren.map((row) => row.state).sort()).toEqual(
+      [...states].sort(),
+    );
+    expect(
+      result.retryChildren.filter((row) => row.providerTaskId === null).length,
+    ).toBe(5);
+    expect(
+      result.retryChildren.every(
+        (row) =>
+          row.parentTaskId === ' Parent ' &&
+          row.sourceManifestDigest === hash('manifest') &&
+          row.planFingerprint === hash('plan'),
+      ),
+    ).toBe(true);
+    expect(result.acceptedManifests.length).toBe(5);
+    const backlink = result.acceptedManifests.find(
+      (row) => row.taskFamily === 'backlink/checker',
+    )!;
+    expect(backlink.originKind).toBe('legacy_unattributed');
+    expect(backlink.provenance).toBe('durable_local_intent_ack');
+    expect(backlink.submittedUrls).toEqual([
+      'HTTP://Example.test/5/2?q=Case#É',
+      'http://example.test/5/2?q=case#é/',
+    ]);
+    expect(backlink.manifestDigest).toBe(
+      hash(
+        'speedyindex-intent-url-manifest-v1\0' +
+          JSON.stringify(['backlink/checker', backlink.submittedUrls]),
+      ),
+    );
+    expect(Object.keys(backlink).sort()).toEqual(
+      [
+        'manifestDigest',
+        'originKind',
+        'payloadDigest',
+        'provenance',
+        'providerTaskId',
+        'requestId',
+        'submittedUrls',
+        'taskFamily',
+      ].sort(),
+    );
+    expect(result.ambiguousProviderRefs.length).toBe(1);
+    const ambiguous = result.ambiguousProviderRefs[0]!;
+    expect(ambiguous.requestIds).toEqual(['duplicate', 'matrix-0-accepted']);
+    expect(ambiguous.records.map((row) => row.requestId)).toEqual([
+      ...ambiguous.requestIds,
+    ]);
+    expect(
+      ambiguous.records.every(
+        (row) =>
+          row.state === 'accepted' &&
+          row.events.length === 3 &&
+          row.providerTaskId === ' Local-é-ACK ',
+      ),
+    ).toBe(true);
+    expect(ambiguous.records[0]!.urls[0]!.url).toBe(
+      'https://example.test/duplicate',
+    );
+    expect(result.attributionGaps.length).toBe(31);
+    expect(
+      result.attributionGaps.every(
+        (row) => row.reason === 'legacy_unattributed',
+      ),
+    ).toBe(true);
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain('other-binding');
+    expect(serialized).not.toContain(binding);
+    expect(serialized).not.toContain(state);
+    for (const row of db
+      .query(
+        'SELECT claim_token_digest,dispatch_outcome_token_digest FROM intents',
+      )
+      .all() as Record<string, string | null>[]) {
+      for (const secret of Object.values(row))
+        if (secret) expect(serialized).not.toContain(secret);
+    }
+    expect(serialized).not.toContain('claim_token');
+    expect(serialized).not.toContain('outcome_token');
+    expect(result.revision).toBe(snapshotRevisionOracle(db));
+    assertDeepFrozen(result);
+    expect(snapshot(db)).toEqual(before);
+  });
+});
+
+test('V2-05 one pinned read transaction stays coherent across a real second-connection commit; next call sees it', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    const prepared = newIntent(ledger);
+    const before = availableSnapshot(state);
+    const phases: string[] = [];
+    const old = availableSnapshot(state, {
+      onPhase(phase) {
+        phases.push(phase);
+        if (phase === 'snapshot_fixed') {
+          const claim = ledger.claimDispatch(prepared.dispatchCapability, 0);
+          if (claim.kind !== 'claimed')
+            throw new Error('Expected synthetic concurrent claim.');
+          ledger.recordDispatchOutcome({
+            credentialFingerprint: binding,
+            requestId: input().requestId,
+            expectedStateVersion: 1,
+            outcomeToken: claim.outcomeToken,
+            outcome: { kind: 'unknown' },
+          });
+        }
+      },
+    });
+    expect(phases).toEqual([
+      'snapshot_fixed',
+      'before_projection',
+      'before_close',
+    ]);
+    expect(old.revision).toBe(before.revision);
+    expect(old.holds[0]!.state).toBe('prepared');
+    expect(old.unresolvedHistory[0]!.events.map((row) => row.kind)).toEqual([
+      'prepared',
+    ]);
+    const fresh = availableSnapshot(state);
+    expect(fresh.revision).not.toBe(old.revision);
+    expect(fresh.holds[0]!.state).toBe('unknown');
+    expect(fresh.unresolvedHistory[0]!.events.map((row) => row.kind)).toEqual([
+      'prepared',
+      'dispatching',
+      'unknown',
+    ]);
+  });
+});
+
+test('V2-05 valid empty and other-binding-only V2 are available-empty without logical mutation', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    const db = f.raw(state);
+    const before = snapshot(db);
+    const empty = availableSnapshot(state);
+    expect(empty.holds).toEqual([]);
+    expect(empty.acceptedManifests).toEqual([]);
+    expect(empty.retryChildren).toEqual([]);
+    expect(empty.unresolvedHistory).toEqual([]);
+    expect(empty.attributionGaps).toEqual([]);
+    expect(empty.ambiguousProviderRefs).toEqual([]);
+    expect(snapshot(db)).toEqual(before);
+    newIntent(ledger, {
+      ...input(),
+      budget: { ...input().budget, credentialFingerprint: 'b'.repeat(64) },
+    });
+    expect(availableSnapshot(state).revision).toBe(empty.revision);
+  });
+});
+
+for (const variant of [
+  'missing',
+  'v1',
+  'partial',
+  'context',
+  'event',
+  'ack',
+  'url',
+  'period',
+  'ownership',
+  'journal',
+  'symlink',
+  'hardlink',
+  'mode',
+  'corrupt',
+] as const) {
+  test(`V2-05 strict sanitized unavailable: ${variant}`, () => {
+    return snapshotCase((f) => {
+      const state = join(f.root, 'state');
+      if (variant === 'missing') {
+        expect(readRetrySnapshot({ stateDirectory: state }, binding)).toEqual({
+          availability: 'unavailable',
+          reason: 'MissingState',
+        });
+        expect(existsSync(state)).toBe(false);
+        return;
+      }
+      const ledger = f.init(state, variant === 'v1' ? 1 : 2);
+      seedSnapshotState(ledger, input(), 'accepted');
+      ledger.close();
+      let requested = state;
+      if (variant === 'journal') {
+        writeFileSync(
+          join(state, 'ledger.sqlite-journal'),
+          'nonempty owned journal',
+          { mode: 0o600 },
+        );
+      } else if (variant === 'symlink') {
+        requested = join(f.root, 'alias');
+        symlinkSync(state, requested);
+      } else if (variant === 'hardlink') {
+        linkSync(join(state, 'ledger.sqlite'), join(f.root, 'linked'));
+      } else if (variant === 'mode')
+        chmodSync(join(state, 'ledger.sqlite'), 0o644);
+      else if (variant === 'corrupt')
+        writeFileSync(join(state, 'ledger.sqlite'), 'not SQLite');
+      else if (variant !== 'v1') {
+        const db = f.raw(state);
+        switch (variant) {
+          case 'partial':
+            db.run('DROP TABLE intent_context');
+            break;
+          case 'context':
+            db.run('DELETE FROM intent_context');
+            break;
+          case 'event':
+            db.run('DELETE FROM intent_events WHERE state_version=1');
+            break;
+          case 'ack':
+            db.run(
+              "UPDATE intent_events SET provider_task_id='different' WHERE state_version=2",
+            );
+            break;
+          case 'url':
+            db.run('DELETE FROM intent_urls WHERE ordinal=0');
+            break;
+          case 'period':
+            db.run('UPDATE intents SET period_start_ms=1234');
+            break;
+          case 'ownership':
+            db.run('PRAGMA ignore_check_constraints=ON');
+            db.run("UPDATE intents SET claim_token_digest='bad'");
+            break;
+        }
+        db.close(true);
+      }
+      expect(readRetrySnapshot({ stateDirectory: requested }, binding)).toEqual(
+        {
+          availability: 'unavailable',
+          reason: variant === 'v1' ? 'UpgradeRequired' : 'InvalidState',
+        },
+      );
+    });
+  });
+}
+
+for (const reason of ['ReadFailure', 'Busy'] as const) {
+  test(`V2-05 injected synchronous read boundary ${reason} is sanitized and leaves no read lock`, () => {
+    return snapshotCase((f) => {
+      const state = join(f.root, 'state');
+      const ledger = f.init(state);
+      newIntent(ledger);
+      const db = f.raw(state);
+      const before = snapshot(db);
+      let injected: SQLiteError | undefined;
+      const lock = reason === 'Busy' ? f.raw(state) : undefined;
+      try {
+        lock?.run('BEGIN IMMEDIATE');
+        db.run('PRAGMA busy_timeout=0');
+        try {
+          db.run(
+            reason === 'Busy'
+              ? 'BEGIN IMMEDIATE'
+              : 'SELECT * FROM owned_missing_read_fixture',
+          );
+        } catch (error) {
+          expect(error).toBeInstanceOf(SQLiteError);
+          injected = error as SQLiteError;
+        }
+      } finally {
+        lock?.run('ROLLBACK');
+      }
+      if (!injected) throw new Error('Expected owned SQL read error.');
+      // A real owned SQLite error is rethrown at the trusted read seam. The Busy
+      // case proves classification, not that this WAL read transaction was locked.
+      expect(injected.code).toBe(
+        reason === 'Busy' ? 'SQLITE_BUSY' : 'SQLITE_ERROR',
+      );
+      const result = readRetrySnapshot({ stateDirectory: state }, binding, {
+        onPhase(phase) {
+          if (phase === 'before_projection') throw injected;
+        },
+      });
+      expect(result).toEqual({ availability: 'unavailable', reason });
+      expect(Object.isFrozen(result)).toBe(true);
+      expect(snapshot(db)).toEqual(before);
+      expect(ledger.cancelPrepared(binding, input().requestId, 0).kind).toBe(
+        'cancelled',
+      );
+      expect(availableSnapshot(state).holds).toEqual([]);
+    });
+  });
+}
+
+test('V2-05 before-close exception and asynchronous phase result never yield an available DTO', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    f.init(state);
+    expect(
+      readRetrySnapshot({ stateDirectory: state }, binding, {
+        onPhase(phase) {
+          if (phase === 'before_close')
+            throw new Error('private source path/provider body');
+        },
+      }),
+    ).toEqual({ availability: 'unavailable', reason: 'ReadFailure' });
+    // Deliberately violates the synchronous trusted seam; no transaction crosses await.
+    expect(
+      readRetrySnapshot({ stateDirectory: state }, binding, {
+        onPhase: () => Promise.resolve(),
+      }),
+    ).toEqual({ availability: 'unavailable', reason: 'ReadFailure' });
+    expect(availableSnapshot(state).holds).toEqual([]);
+  });
+});
+
+test('V2-06 independent complete-column tuple oracle, BINARY order, exact unsafe event integers and private ownership revisions', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    const db = f.raw(state);
+    for (const [id, status] of [
+      ['z', 'prepared'],
+      ['legacy', 'dispatching'],
+      ['A', 'unknown'],
+    ] as const) {
+      seedSnapshotState(
+        ledger,
+        { ...input(id), submittedUrls: [`https://example.test/${id}`] },
+        status,
+      );
+    }
+    // Legacy SQL allows Unicode request identities that the ordinary API doesn't create.
+    db.transaction(() => {
+      for (const table of [
+        'intents',
+        'intent_context',
+        'intent_urls',
+        'intent_events',
+      ])
+        db.run(`UPDATE ${table} SET request_id='É' WHERE request_id='legacy'`);
+    }).immediate();
+    db.run('UPDATE intent_events SET event_id=event_id+9007199254740992');
+    db.run(
+      "UPDATE intents SET reserved_tokens=9007199254740993 WHERE request_id='z'",
+    );
+    const first = availableSnapshot(state);
+    expect(first.revision).toBe(snapshotRevisionOracle(db));
+    expect(first.holds.map((row) => row.requestId)).toEqual(['A', 'z', 'É']);
+    expect(
+      first.unresolvedHistory.find((row) => row.requestId === 'z')!.reservation
+        .tokens,
+    ).toBe('9007199254740993');
+    const ids = first.unresolvedHistory.flatMap((row) =>
+      row.events.map((event) => event.eventId),
+    );
+    expect(new Set(ids).size).toBe(6);
+    expect(ids).toContain('9007199254740993');
+    expect(ids).toContain('9007199254740994');
+    db.run(
+      "UPDATE intents SET claim_token_digest='" +
+        hash('changed-private-claim') +
+        "' WHERE request_id='z'",
+    );
+    const changed = availableSnapshot(state);
+    expect(changed.revision).not.toBe(first.revision);
+    expect(changed.revision).toBe(snapshotRevisionOracle(db));
+    db.run(
+      "UPDATE intents SET dispatch_outcome_token_digest='" +
+        hash('changed-private-outcome') +
+        "' WHERE request_id='É'",
+    );
+    const again = availableSnapshot(state);
+    expect(again.revision).not.toBe(changed.revision);
+    expect(again.revision).toBe(snapshotRevisionOracle(db));
+    expect(JSON.stringify(again)).not.toContain(hash('changed-private-claim'));
+    expect(JSON.stringify(again)).not.toContain(
+      hash('changed-private-outcome'),
+    );
+    // Captured time changes independently; unrelated committed history is excluded.
+    const NativeDate = globalThis.Date;
+    try {
+      globalThis.Date = class extends NativeDate {
+        constructor() {
+          super('2031-01-01T00:00:00Z');
+        }
+      } as DateConstructor;
+      const later = availableSnapshot(state);
+      expect(later.capturedAt).not.toBe(again.capturedAt);
+      expect(later.revision).toBe(again.revision);
+    } finally {
+      globalThis.Date = NativeDate;
+    }
+    seedSnapshotState(
+      ledger,
+      {
+        ...input('other'),
+        budget: { ...input().budget, credentialFingerprint: 'b'.repeat(64) },
+      },
+      'unknown',
+    );
+    expect(availableSnapshot(state).revision).toBe(again.revision);
+  });
+});
+
+test('V2-06 valid selected identity, units, lineage, URL order/case, event and ACK changes each bind revision', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    const db = f.raw(state);
+    seedSnapshotState(ledger, input(), 'accepted', 'ACK');
+    let previous = availableSnapshot(state);
+    const changes = [
+      "UPDATE intents SET policy_revision='revision-two'",
+      `UPDATE intents SET policy_digest='${hash('policy-two')}'`,
+      `UPDATE intents SET payload_digest='${hash('payload-two')}'`,
+      "UPDATE intents SET quote_version='quote-two'",
+      `UPDATE intents SET quote_fingerprint='${hash('quote-two')}'`,
+      'UPDATE intents SET reserved_tokens=4,reserved_indexer=5,reserved_checker=6',
+      'UPDATE intents SET created_at_ms=created_at_ms+1',
+      "UPDATE budget_periods SET budget_scope='other-scope'; UPDATE intents SET budget_scope='other-scope'",
+      "UPDATE budget_periods SET period_id='other-period',period_start_ms=2000; UPDATE intents SET period_id='other-period',period_start_ms=2000",
+      "UPDATE intent_context SET origin_kind='legacy_unattributed'",
+      `UPDATE intent_context SET origin_kind='retry',parent_family='google/indexer',parent_task_id='Parent',source_manifest_digest='${hash('source')}',plan_fingerprint='${hash('plan')}'`,
+      "UPDATE intent_context SET parent_task_id='ParentCase'",
+      `UPDATE intent_context SET source_manifest_digest='${hash('source-two')}'`,
+      `UPDATE intent_context SET plan_fingerprint='${hash('plan-two')}'`,
+      "UPDATE intent_urls SET url_text=replace(url_text,'example.test','Example.test')",
+      'UPDATE intent_urls SET ordinal=ordinal+2; UPDATE intent_urls SET ordinal=3-ordinal',
+      'UPDATE intent_events SET event_id=event_id+100',
+      'UPDATE intent_events SET occurred_at_ms=-state_version',
+      "UPDATE intents SET provider_task_id='AckCase'; UPDATE intent_events SET provider_task_id='AckCase' WHERE state_version=2",
+      "UPDATE intents SET task_family='yandex/indexer',provider_route='/v2/task/yandex/indexer/create',provider_type='yandex/indexer'; UPDATE intent_context SET parent_family='yandex/indexer'; UPDATE intent_events SET provider_type='yandex/indexer' WHERE state_version=2",
+      "UPDATE intents SET request_id='renamed'; UPDATE intent_context SET request_id='renamed'; UPDATE intent_urls SET request_id='renamed'; UPDATE intent_events SET request_id='renamed'",
+    ];
+    for (const sql of changes) {
+      db.transaction(() => db.run(sql)).immediate();
+      const current = availableSnapshot(state);
+      expect(current.revision).not.toBe(previous.revision);
+      expect(current.revision).toBe(snapshotRevisionOracle(db));
+      previous = current;
+    }
+    expect(previous.acceptedManifests[0]!.submittedUrls).toEqual([
+      'https://Example.test/é/',
+      'https://Example.test/Case?q=1',
+    ]);
+    const manifest = previous.acceptedManifests[0]!;
+    expect(manifest.manifestDigest).toBe(
+      hash(
+        'speedyindex-intent-url-manifest-v1\0' +
+          JSON.stringify(['yandex/indexer', manifest.submittedUrls]),
+      ),
+    );
+  });
+});
+
+test('V2-06 preparation, claim, outcome and cancel advance selected revision with valid histories', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    let previous = availableSnapshot(state).revision;
+    const step = () => {
+      const current = availableSnapshot(state);
+      expect(current.revision).not.toBe(previous);
+      previous = current.revision;
+      return current;
+    };
+    const prepared = newIntent(ledger);
+    step();
+    const claim = ledger.claimDispatch(prepared.dispatchCapability, 0);
+    if (claim.kind !== 'claimed') throw new Error('Expected claim');
+    step();
+    ledger.recordDispatchOutcome({
+      credentialFingerprint: binding,
+      requestId: input().requestId,
+      expectedStateVersion: 1,
+      outcomeToken: claim.outcomeToken,
+      outcome: { kind: 'unknown' },
+    });
+    expect(step().holds[0]!.state).toBe('unknown');
+    newIntent(ledger, {
+      ...input('cancel'),
+      submittedUrls: ['https://example.test/cancel'],
+    });
+    step();
+    ledger.cancelPrepared(binding, 'cancel', 0);
+    expect(step().holds.map((row) => row.requestId)).toEqual([
+      input().requestId,
+    ]);
+  });
+});
+
+for (const cap of ['intents', 'events', 'urls'] as const) {
+  test(`V2-06 exact and over ${cap} limits use actual selected queries without partial projections`, () => {
+    return snapshotCase((f) => {
+      const state = join(f.root, 'state');
+      const ledger = f.init(state);
+      seedSnapshotState(ledger, input(), 'unknown');
+      const exact = cap === 'intents' ? 1 : cap === 'events' ? 3 : 2;
+      expect(
+        availableSnapshot(state, { limits: { [cap]: exact } }).holds.length,
+      ).toBe(1);
+      const phases: string[] = [];
+      expect(
+        readRetrySnapshot({ stateDirectory: state }, binding, {
+          limits: { [cap]: exact - 1 },
+          onPhase(phase) {
+            phases.push(phase);
+          },
+        }),
+      ).toEqual({ availability: 'unavailable', reason: 'LimitExceeded' });
+      expect(phases).toEqual(['snapshot_fixed']);
+      expect(availableSnapshot(state).holds.length).toBe(1);
+    });
+  });
+}
+
+test('V2-06 exact retained UTF8 DTO bytes and overlarge legacy TEXT are bounded before projection; seams cannot raise ceilings', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    newIntent(ledger);
+    const db = f.raw(state);
+    const original = availableSnapshot(state);
+    const bytes = Buffer.byteLength(JSON.stringify(original), 'utf8');
+    expect(availableSnapshot(state, { limits: { bytes } }).revision).toBe(
+      original.revision,
+    );
+    expect(
+      readRetrySnapshot({ stateDirectory: state }, binding, {
+        limits: { bytes: bytes - 1 },
+      }),
+    ).toEqual({ availability: 'unavailable', reason: 'LimitExceeded' });
+    db.query('UPDATE intent_urls SET url_text=? WHERE ordinal=0').run(
+      'https://example.test/' + 'é🧪'.repeat(10000),
+    );
+    const before = exactCoreRows(db);
+    const phases: string[] = [];
+    expect(
+      readRetrySnapshot({ stateDirectory: state }, binding, {
+        limits: { bytes: 4096 },
+        onPhase(phase) {
+          phases.push(phase);
+        },
+      }),
+    ).toEqual({ availability: 'unavailable', reason: 'LimitExceeded' });
+    expect(phases).toEqual(['snapshot_fixed']);
+    expect(exactCoreRows(db)).toEqual(before);
+    // Larger valid legacy values remain valid for the ordinary API and default reader.
+    expect(f.open(state).readIntent(binding, input().requestId)?.state).toBe(
+      'prepared',
+    );
+    expect(availableSnapshot(state).holds[0]!.urls[0]!.url).toBe(
+      'https://example.test/' + 'é🧪'.repeat(10000),
+    );
+    for (const limits of [
+      { intents: 2001 },
+      { events: 6001 },
+      { urls: 20001 },
+      { bytes: 16 * 1024 * 1024 + 1 },
+      { intents: -1 },
+      { urls: 0.5 },
+    ])
+      expect(
+        readRetrySnapshot({ stateDirectory: state }, binding, { limits }),
+      ).toEqual({ availability: 'unavailable', reason: 'InvalidState' });
+  });
+});
+
+test('V2-06 URL ordinals above nine retain numeric order and the independently hashed exact manifest', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    const submittedUrls = Array.from(
+      { length: 12 },
+      (_, n) => `https://example.test/Exact/${n}?q=É#Frag`,
+    );
+    seedSnapshotState(ledger, { ...input(), submittedUrls }, 'accepted');
+    const result = availableSnapshot(state);
+    expect(result.acceptedManifests[0]!.submittedUrls).toEqual(submittedUrls);
+    expect(result.acceptedManifests[0]!.manifestDigest).toBe(
+      hash(
+        'speedyindex-intent-url-manifest-v1\0' +
+          JSON.stringify(['google/indexer', submittedUrls]),
+      ),
+    );
+    expect(result.revision).toBe(snapshotRevisionOracle(f.raw(state)));
+  });
+});
+
+test('V2-05 post-read identity validation rejects a changed private file mode without returning partial data', () => {
+  return snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    f.init(state);
+    const result = readRetrySnapshot({ stateDirectory: state }, binding, {
+      onPhase(phase) {
+        if (phase === 'before_close')
+          chmodSync(join(state, 'ledger.sqlite'), 0o640);
+      },
+    });
+    expect(result).toEqual({
+      availability: 'unavailable',
+      reason: 'InvalidState',
+    });
+  });
 });
