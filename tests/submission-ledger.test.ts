@@ -1801,12 +1801,13 @@ test('L07: unsafe or incomplete storage fails closed without replacing state', a
     );
     expectFileUnchanged(emptyVersionPath, emptyVersionBefore);
 
-    const unknownVersionDirectory = join(root, 'unknown-version');
+    const unknownVersionDirectory = join(root, 'incomplete-version-two');
     mkdirSync(unknownVersionDirectory, { mode: 0o700 });
     chmodSync(unknownVersionDirectory, 0o700);
     const unknownVersionPath = join(unknownVersionDirectory, 'ledger.sqlite');
     createBareSqlite(unknownVersionPath, (database) => {
       database.run('CREATE TABLE known_fixture (value INTEGER)');
+      // V2 requires its complete versioned schema; a foreign V2 label is invalid.
       database.run('PRAGMA user_version = 2');
     });
     const unknownVersionBefore = snapshotFile(unknownVersionPath);

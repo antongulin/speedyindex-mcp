@@ -16,6 +16,7 @@ import {
   SQLiteError,
 } from 'bun:sqlite';
 import { taskFamilySchema, type TaskFamily } from './task-status';
+import { providerTaskIdSchema } from './submission-contract';
 
 export type Unit = 'tokens' | 'indexer' | 'checker';
 export type UnitVector = Readonly<Record<Unit, number>>;
@@ -163,7 +164,7 @@ const units = [
   'checker',
 ] as const satisfies readonly Unit[];
 const databaseFilename = 'ledger.sqlite';
-const schemaVersion = 1;
+type SchemaVersion = 1 | 2;
 const busyTimeoutMs = 2_000;
 const maxSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
 const minSafeInteger = BigInt(Number.MIN_SAFE_INTEGER);
@@ -247,13 +248,48 @@ const schemaStatements = [
   'CREATE INDEX intent_urls_overlap_idx ON intent_urls (credential_fp, url_text)',
 ] as const;
 
-const schemaObjects = new Map(
-  schemaStatements.map((sql) => {
-    const match = /^CREATE (TABLE|INDEX) (\w+)/i.exec(sql);
-    if (!match) throw new Error('Invalid built-in ledger schema.');
-    return [`${match[1]!.toLowerCase()}:${match[2]}`, sql] as const;
-  }),
-);
+const v2SchemaStatements = [
+  `CREATE TABLE retry_ledger_meta (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    ledger_id TEXT NOT NULL CHECK (length(ledger_id) = 64 AND ledger_id NOT GLOB '*[^0-9a-f]*')
+  )`,
+  `CREATE TABLE intent_context (
+    credential_fp TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    origin_kind TEXT NOT NULL CHECK (origin_kind IN ('legacy_unattributed', 'standalone', 'retry')),
+    parent_family TEXT,
+    parent_task_id TEXT,
+    source_manifest_digest TEXT,
+    plan_fingerprint TEXT,
+    PRIMARY KEY (credential_fp, request_id),
+    FOREIGN KEY (credential_fp, request_id)
+      REFERENCES intents (credential_fp, request_id),
+    CHECK (
+      (origin_kind IN ('legacy_unattributed', 'standalone') AND parent_family IS NULL AND parent_task_id IS NULL AND source_manifest_digest IS NULL AND plan_fingerprint IS NULL)
+      OR (origin_kind = 'retry' AND parent_family IS NOT NULL AND parent_family IN ('google/indexer', 'yandex/indexer')
+        AND parent_task_id IS NOT NULL AND length(trim(parent_task_id)) > 0
+        AND source_manifest_digest IS NOT NULL AND length(source_manifest_digest) = 64 AND source_manifest_digest NOT GLOB '*[^0-9a-f]*'
+        AND plan_fingerprint IS NOT NULL AND length(plan_fingerprint) = 64 AND plan_fingerprint NOT GLOB '*[^0-9a-f]*')
+    )
+  )`,
+  'CREATE INDEX intent_context_parent_idx ON intent_context (credential_fp, parent_family, parent_task_id)',
+  "CREATE INDEX intents_provider_ref_idx ON intents (credential_fp, task_family, provider_task_id) WHERE state = 'accepted'",
+] as const;
+
+function schemaObjectMap(statements: readonly string[]) {
+  return new Map(
+    statements.map((sql) => {
+      const match = /^CREATE (TABLE|INDEX) (\w+)/i.exec(sql);
+      if (!match) throw new Error('Invalid built-in ledger schema.');
+      return [`${match[1]!.toLowerCase()}:${match[2]}`, sql] as const;
+    }),
+  );
+}
+
+const versionedSchemaObjects = {
+  1: schemaObjectMap(schemaStatements),
+  2: schemaObjectMap([...schemaStatements, ...v2SchemaStatements]),
+};
 
 export interface SubmissionLedger {
   prepareIntent(input: PrepareIntentInput): PrepareResult;
@@ -557,7 +593,8 @@ function validateSidecars(directory: string, uid: number) {
       !stats.isFile() ||
       stats.uid !== uid ||
       stats.nlink !== 1 ||
-      (stats.mode & 0o777) !== 0o600
+      (stats.mode & 0o777) !== 0o600 ||
+      (suffix === '-journal' && stats.size !== 0)
     ) {
       fail('LedgerUnavailable');
     }
@@ -680,8 +717,123 @@ function readUserVersion(database: Database): number {
   return row.user_version;
 }
 
-function verifySchema(database: Database) {
-  if (readUserVersion(database) !== schemaVersion) fail('LedgerUnavailable');
+interface SchemaIdentity {
+  version: SchemaVersion;
+  ledgerId: string | null;
+}
+
+function readLedgerId(database: Database): string {
+  const rows = database
+    .query('SELECT singleton, ledger_id FROM retry_ledger_meta LIMIT 2')
+    .all() as {
+    singleton: number;
+    ledger_id: string;
+  }[];
+  if (
+    rows.length !== 1 ||
+    rows[0]!.singleton !== 1 ||
+    typeof rows[0]!.ledger_id !== 'string' ||
+    !sha256Pattern.test(rows[0]!.ledger_id)
+  )
+    fail('LedgerUnavailable');
+  return rows[0]!.ledger_id;
+}
+
+function verifyV2Data(database: Database) {
+  const check = database.query('PRAGMA quick_check').get() as {
+    quick_check: string;
+  } | null;
+  if (
+    check?.quick_check !== 'ok' ||
+    database.query('PRAGMA foreign_key_check').get()
+  )
+    fail('LedgerUnavailable');
+  if (
+    database
+      .query(
+        `SELECT 1 FROM intents i
+      LEFT JOIN intent_context c USING (credential_fp, request_id)
+      WHERE c.request_id IS NULL LIMIT 1`,
+      )
+      .get()
+  )
+    fail('LedgerUnavailable');
+
+  // These are consistency checks, not snapshot resource limits or new V1 scalar limits.
+  if (
+    database
+      .query(
+        `SELECT 1 FROM intents i
+      WHERE NOT EXISTS (SELECT 1 FROM budget_periods b
+        WHERE b.credential_fp = i.credential_fp AND b.budget_scope = i.budget_scope
+          AND b.period_id = i.period_id AND b.period_start_ms = i.period_start_ms)
+        OR NOT EXISTS (SELECT 1 FROM intent_urls u
+          WHERE u.credential_fp = i.credential_fp AND u.request_id = i.request_id
+          GROUP BY u.credential_fp, u.request_id
+          HAVING MIN(u.ordinal) = 0 AND MAX(u.ordinal) = COUNT(*) - 1
+            AND COUNT(DISTINCT u.url_text) = COUNT(*))
+        OR (SELECT COUNT(*) FROM intent_events e
+          WHERE e.credential_fp = i.credential_fp AND e.request_id = i.request_id) != i.state_version + 1
+        OR NOT EXISTS (SELECT 1 FROM intent_events e
+          WHERE e.credential_fp = i.credential_fp AND e.request_id = i.request_id
+            AND e.state_version = 0 AND e.event_kind = 'prepared')
+        OR (i.state_version >= 1 AND NOT EXISTS (SELECT 1 FROM intent_events e
+          WHERE e.credential_fp = i.credential_fp AND e.request_id = i.request_id
+            AND e.state_version = 1
+            AND e.event_kind = CASE WHEN i.state = 'cancelled' THEN 'cancelled' ELSE 'dispatching' END))
+        OR (i.state_version = 2 AND NOT EXISTS (SELECT 1 FROM intent_events e
+          WHERE e.credential_fp = i.credential_fp AND e.request_id = i.request_id
+            AND e.state_version = 2 AND e.event_kind = i.state
+            AND e.provider_task_id IS i.provider_task_id AND e.provider_type IS i.provider_type))
+      LIMIT 1`,
+      )
+      .get()
+  )
+    fail('LedgerUnavailable');
+  if (
+    database
+      .query(
+        `SELECT 1 FROM intent_events earlier JOIN intent_events later
+      USING (credential_fp, request_id)
+      WHERE earlier.state_version < later.state_version AND earlier.event_id >= later.event_id
+      LIMIT 1`,
+      )
+      .get()
+  )
+    fail('LedgerUnavailable');
+
+  const contexts = database.query<
+    {
+      parent_family: string;
+      parent_task_id: string;
+      source_manifest_digest: unknown;
+      plan_fingerprint: unknown;
+      task_family: string;
+      provider_task_id: string | null;
+    },
+    []
+  >(`SELECT c.parent_family, c.parent_task_id, c.source_manifest_digest, c.plan_fingerprint,
+      i.task_family, i.provider_task_id
+    FROM intent_context c JOIN intents i USING (credential_fp, request_id)
+    WHERE c.origin_kind = 'retry'`);
+  for (const row of contexts.iterate()) {
+    if (
+      row.parent_family !== row.task_family ||
+      !providerTaskIdSchema.safeParse(row.parent_task_id).success ||
+      typeof row.source_manifest_digest !== 'string' ||
+      !sha256Pattern.test(row.source_manifest_digest) ||
+      typeof row.plan_fingerprint !== 'string' ||
+      !sha256Pattern.test(row.plan_fingerprint) ||
+      row.parent_task_id === row.provider_task_id
+    )
+      fail('LedgerUnavailable');
+  }
+}
+
+function verifySchema(database: Database): SchemaIdentity {
+  const version = readUserVersion(database);
+  if (version !== 1 && version !== 2) fail('LedgerUnavailable');
+  const schemaObjects = versionedSchemaObjects[version];
   const actualRows = schemaRows(database);
   if (actualRows.length !== schemaObjects.size) fail('LedgerUnavailable');
   const actual = new Map(
@@ -694,6 +846,12 @@ function verifySchema(database: Database) {
     if (normalizeSql(actualSql) !== normalizeSql(expectedSql))
       fail('LedgerUnavailable');
   }
+  if (version === 2) {
+    const ledgerId = readLedgerId(database);
+    verifyV2Data(database);
+    return { version, ledgerId };
+  }
+  return { version, ledgerId: null };
 }
 
 function configureConnection(database: Database) {
@@ -1075,14 +1233,29 @@ function checkToken(value: unknown) {
 
 class LocalSubmissionLedger implements SubmissionLedger {
   private closed = false;
+  private schemaInvalidated = false;
 
   constructor(
     private readonly database: Database,
     private readonly stateDirectory: string,
+    private readonly openedSchema: SchemaIdentity,
   ) {}
 
   private ensureOpen() {
-    if (this.closed) fail('LedgerUnavailable');
+    if (this.closed || this.schemaInvalidated) fail('LedgerUnavailable');
+  }
+
+  private verifyMutationVersion() {
+    // Called after BEGIN IMMEDIATE, before replay or any write. Old binaries
+    // still require the operator's offline stop/restart discipline.
+    if (
+      readUserVersion(this.database) !== this.openedSchema.version ||
+      (this.openedSchema.version === 2 &&
+        readLedgerId(this.database) !== this.openedSchema.ledgerId)
+    ) {
+      this.schemaInvalidated = true;
+      fail('LedgerUnavailable');
+    }
   }
 
   prepareIntent(value: PrepareIntentInput): PrepareResult {
@@ -1094,12 +1267,30 @@ class LocalSubmissionLedger implements SubmissionLedger {
 
     try {
       const result = withImmediateTransaction(this.database, () => {
+        this.verifyMutationVersion();
         const existing = selectIntent(
           this.database,
           input.budget.credentialFingerprint,
           input.requestId,
         );
         if (existing) {
+          if (this.openedSchema.version === 2) {
+            const context = this.database
+              .query(
+                `SELECT origin_kind FROM intent_context
+              WHERE credential_fp = ? AND request_id = ?`,
+              )
+              .get(input.budget.credentialFingerprint, input.requestId) as {
+              origin_kind: string;
+            } | null;
+            if (!context) fail('LedgerUnavailable');
+            if (context.origin_kind === 'retry') fail('RequestIdConflict');
+            if (
+              context.origin_kind !== 'standalone' &&
+              context.origin_kind !== 'legacy_unattributed'
+            )
+              fail('LedgerUnavailable');
+          }
           if (!isExactReplay(this.database, existing, input))
             fail('RequestIdConflict');
           return {
@@ -1176,6 +1367,14 @@ class LocalSubmissionLedger implements SubmissionLedger {
           'prepared',
           now,
         );
+        if (this.openedSchema.version === 2) {
+          this.database
+            .query(
+              `INSERT INTO intent_context
+            (credential_fp, request_id, origin_kind) VALUES (?, ?, 'standalone')`,
+            )
+            .run(input.budget.credentialFingerprint, input.requestId);
+        }
         const created = selectIntent(
           this.database,
           input.budget.credentialFingerprint,
@@ -1205,6 +1404,7 @@ class LocalSubmissionLedger implements SubmissionLedger {
     try {
       const capabilityDigest = digestToken(capability);
       return withImmediateTransaction(this.database, () => {
+        this.verifyMutationVersion();
         const row = this.database
           .query(
             `SELECT credential_fp, request_id, state_version, claim_token_digest
@@ -1283,6 +1483,7 @@ class LocalSubmissionLedger implements SubmissionLedger {
       return withImmediateTransaction(
         this.database,
         () => {
+          this.verifyMutationVersion();
           const row = this.database
             .query(
               `SELECT credential_fp, request_id, state, state_version,
@@ -1377,6 +1578,7 @@ class LocalSubmissionLedger implements SubmissionLedger {
     validateStateVersion(expectedStateVersion);
     try {
       return withImmediateTransaction(this.database, () => {
+        this.verifyMutationVersion();
         const updated = this.database
           .query(
             `UPDATE intents
@@ -1463,6 +1665,20 @@ function openDatabase(path: string): Database {
 }
 
 export function initializeLedger(options: LedgerPathOptions): SubmissionLedger {
+  return initializeVersionedLedger(options, 1);
+}
+
+// Internal explicit new-only initializer. No CLI/startup migration or activation.
+export function initializeLedgerV2(
+  options: LedgerPathOptions,
+): SubmissionLedger {
+  return initializeVersionedLedger(options, 2);
+}
+
+function initializeVersionedLedger(
+  options: LedgerPathOptions,
+  version: SchemaVersion,
+): SubmissionLedger {
   validatePathInput(options);
   const uid = ensurePosixRuntime();
   let database: Database | undefined;
@@ -1475,17 +1691,29 @@ export function initializeLedger(options: LedgerPathOptions): SubmissionLedger {
     configureConnection(database);
     validateSidecars(options.stateDirectory, uid);
 
-    withImmediateTransaction(database, () => {
+    const openedSchema = withImmediateTransaction(database, () => {
       ensureEmptyVersionZero(database!);
       for (const sql of schemaStatements) database!.run(sql);
-      database!.run(`PRAGMA user_version = ${schemaVersion}`);
-      verifySchema(database!);
+      if (version === 2) {
+        for (const sql of v2SchemaStatements) database!.run(sql);
+        database!
+          .query(
+            'INSERT INTO retry_ledger_meta (singleton, ledger_id) VALUES (1, ?)',
+          )
+          .run(randomBytes(32).toString('hex'));
+      }
+      database!.run(`PRAGMA user_version = ${version}`);
+      return verifySchema(database!);
     });
 
     validateCanonicalPathComponents(options.stateDirectory, uid);
     validateDatabaseFile(path, uid, true);
     validateSidecars(options.stateDirectory, uid);
-    const ledger = new LocalSubmissionLedger(database, options.stateDirectory);
+    const ledger = new LocalSubmissionLedger(
+      database,
+      options.stateDirectory,
+      openedSchema,
+    );
     database = undefined;
     return ledger;
   } catch (error) {
@@ -1513,14 +1741,20 @@ export function openLedger(options: LedgerPathOptions): SubmissionLedger {
     if (!sameIdentity(identity, validateDatabaseFile(path, uid, true)))
       fail('LedgerUnavailable');
 
-    verifySchema(database);
+    const openedSchema = database
+      .transaction(() => verifySchema(database!))
+      .deferred();
     configureConnection(database);
     validateCanonicalPathComponents(options.stateDirectory, uid);
     if (!sameIdentity(identity, validateDatabaseFile(path, uid, true)))
       fail('LedgerUnavailable');
     validateSidecars(options.stateDirectory, uid);
 
-    const ledger = new LocalSubmissionLedger(database, options.stateDirectory);
+    const ledger = new LocalSubmissionLedger(
+      database,
+      options.stateDirectory,
+      openedSchema,
+    );
     database = undefined;
     return ledger;
   } catch (error) {
