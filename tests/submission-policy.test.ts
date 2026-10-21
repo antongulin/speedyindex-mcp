@@ -25,6 +25,10 @@ import {
   quoteIndexCheckRequest,
 } from '../src/create-index-check';
 import {
+  buildCreateBacklinkCheckRequest,
+  quoteBacklinkCheckRequest,
+} from '../src/create-backlink-check';
+import {
   createSubmissionContext,
   getSubmissionAuthorization,
   loadSubmissionConfiguration,
@@ -808,12 +812,22 @@ test('IC03 POLICY: absent extensions retain literal legacy bytes; explicit false
     expect(legacy.digest).toBe(expectedPolicyDigest());
     expect(Object.hasOwn(legacy.policy, 'allowIndexChecks')).toBe(false);
     expect(Object.hasOwn(legacy.policy, 'indexCheckReservations')).toBe(false);
+    expect(Object.hasOwn(legacy.policy, 'allowBacklinkChecks')).toBe(false);
+    expect(Object.hasOwn(legacy.policy, 'backlinkCheckReservations')).toBe(
+      false,
+    );
     const hashes = new Set([legacy.digest]);
     for (const extension of [
       { allowIndexChecks: false },
       { indexCheckReservations: {} },
       { allowIndexChecks: false, indexCheckReservations: {} },
       { allowIndexChecks: true },
+      { allowBacklinkChecks: false },
+      { backlinkCheckReservations: { tokens: 4, indexer: 3, checker: 2 } },
+      {
+        allowBacklinkChecks: true,
+        backlinkCheckReservations: { tokens: 4, indexer: 3, checker: 2 },
+      },
     ]) {
       writePolicy(fixture, { ...policy(), ...extension });
       const loaded = loadSubmissionPolicy(fixture.policyPath);
@@ -822,7 +836,7 @@ test('IC03 POLICY: absent extensions retain literal legacy bytes; explicit false
       );
       hashes.add(loaded.digest);
     }
-    expect(hashes.size).toBe(5);
+    expect(hashes.size).toBe(8);
     // Checker-only schema growth must not widen either old public enum alias.
     expect(
       indexingAuthorizationSchema.safeParse({
@@ -1010,11 +1024,19 @@ test('IC03 POLICY: policy-only/inactive startup keeps only frozen profiles and n
           stateChecked: false,
         });
         expect(Object.keys(config).sort()).toEqual(
-          ['state', 'error', 'indexCheckReservationSource'].sort(),
+          [
+            'state',
+            'error',
+            'indexCheckReservationSource',
+            'backlinkCheckReservationSource',
+          ].sort(),
         );
         expect(config.indexCheckReservationSource).toEqual({
           state: 'loaded',
           profiles: checkerProfiles,
+        });
+        expect(config.backlinkCheckReservationSource).toEqual({
+          state: 'loaded',
         });
         const serialized = JSON.stringify(config.indexCheckReservationSource);
         for (const secret of [
@@ -1059,6 +1081,205 @@ test('IC03 POLICY: policy-only/inactive startup keeps only frozen profiles and n
       loadSubmissionConfiguration({ policyPath: fixture.policyPath })
         .indexCheckReservationSource,
     ).toEqual({ state: 'invalid' });
+  });
+});
+
+const backlinkReservation = { tokens: 4, indexer: 3, checker: 2 };
+const backlinkRequest = buildCreateBacklinkCheckRequest({
+  mode: 'preview',
+  urls: ['https://donor.example.test/a', 'https://donor.example.test/b'],
+  targetDomains: ['target.example.test'],
+});
+
+test('BC02 POLICY: backlink profile requires all safe units and its token floor even when permission is false', () => {
+  withFixture((fixture) => {
+    for (const valid of [
+      { tokens: 2, indexer: 0, checker: 0 },
+      backlinkReservation,
+    ]) {
+      const value = {
+        ...policy(),
+        allowBacklinkChecks: false,
+        backlinkCheckReservations: valid,
+      };
+      expect(submissionPolicySchema.safeParse(value).success).toBe(true);
+      writePolicy(fixture, value);
+      expect(
+        loadSubmissionPolicy(fixture.policyPath).policy
+          .backlinkCheckReservations,
+      ).toEqual(valid);
+    }
+
+    const invalidProfiles: unknown[] = [
+      null,
+      [],
+      {},
+      { tokens: 2, indexer: 0 },
+      { tokens: 2, checker: 0 },
+      { indexer: 0, checker: 0 },
+      { ...backlinkReservation, extra: 0 },
+      { tokens: 1, indexer: 0, checker: 0 },
+    ];
+    for (const unit of ['tokens', 'indexer', 'checker'])
+      for (const invalidUnit of [
+        -1,
+        0.5,
+        NaN,
+        Infinity,
+        Number.MAX_SAFE_INTEGER + 1,
+        null,
+        '0',
+      ])
+        invalidProfiles.push({
+          ...backlinkReservation,
+          [unit]: invalidUnit,
+        });
+
+    for (const backlinkCheckReservations of invalidProfiles) {
+      const value = {
+        ...policy(),
+        allowBacklinkChecks: false,
+        backlinkCheckReservations,
+      };
+      expect(submissionPolicySchema.safeParse(value).success).toBe(false);
+      writePolicy(fixture, value);
+      fixedError(
+        () => loadSubmissionPolicy(fixture.policyPath),
+        'InvalidPolicy',
+      );
+      const config = loadSubmissionConfiguration({
+        policyPath: fixture.policyPath,
+      });
+      expect(config.state).toBe('invalid');
+      expect(config.indexCheckReservationSource).toEqual({ state: 'invalid' });
+      expect(config.backlinkCheckReservationSource).toEqual({
+        state: 'invalid',
+      });
+    }
+
+    for (const allowBacklinkChecks of [null, 0, 'true', {}]) {
+      writePolicy(fixture, {
+        ...policy(),
+        allowBacklinkChecks,
+        backlinkCheckReservations: backlinkReservation,
+      });
+      fixedError(
+        () => loadSubmissionPolicy(fixture.policyPath),
+        'InvalidPolicy',
+      );
+    }
+    expect(existsSync(fixture.stateDirectory)).toBe(false);
+  });
+});
+
+test('BC02 POLICY: optional backlink fields append after checker fields and freeze a key-free startup quote source', () => {
+  withFixture((fixture) => {
+    const value = {
+      ...policy(),
+      allowIndexChecks: true,
+      indexCheckReservations: checkerProfiles,
+      allowBacklinkChecks: true,
+      backlinkCheckReservations: backlinkReservation,
+    };
+    writePolicy(fixture, value);
+    const config = configured(fixture);
+    const backlinkSource = config.backlinkCheckReservationSource;
+    expect(backlinkSource).toEqual({
+      state: 'loaded',
+      profile: backlinkReservation,
+    });
+    expect(Object.keys(config.snapshot.policy)).toEqual([
+      'version',
+      'enabled',
+      'mode',
+      'policyRevision',
+      'budgetScope',
+      'credentialFingerprint',
+      'period',
+      'caps',
+      'allowIndexChecks',
+      'indexCheckReservations',
+      'allowBacklinkChecks',
+      'backlinkCheckReservations',
+    ]);
+    expect(JSON.stringify(config.snapshot.policy)).toBe(JSON.stringify(value));
+    expect(config.snapshot.digest).toBe(
+      sha('speedyindex-submission-policy-v1\0' + JSON.stringify(value)),
+    );
+    expect(Object.isFrozen(config.snapshot.policy)).toBe(true);
+    expect(
+      Object.isFrozen(config.snapshot.policy.backlinkCheckReservations),
+    ).toBe(true);
+    expect(backlinkSource && Object.isFrozen(backlinkSource)).toBe(true);
+    if (backlinkSource?.state !== 'loaded')
+      throw new Error('Expected loaded backlink reservation source.');
+    expect(backlinkSource.profile).toBe(
+      config.snapshot.policy.backlinkCheckReservations,
+    );
+    expect(() =>
+      Object.assign(backlinkSource, { profile: undefined }),
+    ).toThrow();
+    expect(() =>
+      Object.assign(backlinkSource.profile!, { checker: 99 }),
+    ).toThrow();
+
+    const quote = quoteBacklinkCheckRequest(backlinkRequest, backlinkSource);
+    expect(quote).toMatchObject({
+      basis: 'operator_configured_reservation',
+      providerEnforced: false,
+      providerFeesKnown: false,
+      availability: 'available',
+      perUrlReservation: backlinkReservation,
+      reservation: { tokens: 8, indexer: 6, checker: 4 },
+    });
+    const inactive = loadSubmissionConfiguration({
+      policyPath: fixture.policyPath,
+      stateDirectory: fixture.stateDirectory,
+    });
+    expect(inactive.state).toBe('credential_missing');
+    expect(inactive.backlinkCheckReservationSource).toEqual(backlinkSource);
+    expect(
+      quoteBacklinkCheckRequest(
+        backlinkRequest,
+        inactive.backlinkCheckReservationSource!,
+      ),
+    ).toEqual(quote);
+    const serializedSource = JSON.stringify(
+      inactive.backlinkCheckReservationSource,
+    );
+    for (const privateValue of [
+      dummyKey,
+      expectedKeyFingerprint,
+      fixture.policyPath,
+      fixture.stateDirectory,
+      'credential',
+      'caps',
+    ])
+      expect(serializedSource.includes(privateValue)).toBe(false);
+    expect(existsSync(fixture.stateDirectory)).toBe(false);
+
+    writePolicy(fixture, {
+      ...policy(),
+      allowBacklinkChecks: true,
+    });
+    expect(quoteBacklinkCheckRequest(backlinkRequest, backlinkSource)).toEqual(
+      quote,
+    );
+    const missing = loadSubmissionConfiguration({
+      policyPath: fixture.policyPath,
+      stateDirectory: fixture.stateDirectory,
+      apiKey: dummyKey,
+    });
+    expect(missing.backlinkCheckReservationSource).toEqual({
+      state: 'loaded',
+    });
+    expect(
+      quoteBacklinkCheckRequest(
+        backlinkRequest,
+        missing.backlinkCheckReservationSource!,
+      ),
+    ).toMatchObject({ availability: 'unavailable', reason: 'profile_missing' });
+    expect(existsSync(fixture.stateDirectory)).toBe(false);
   });
 });
 test('IC03 POLICY: frozen startup profile source survives file change/removal and overflow does not open state', () => {

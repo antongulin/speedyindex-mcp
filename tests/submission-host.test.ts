@@ -34,6 +34,11 @@ import {
   createIndexCheckToolResult,
 } from '../src/create-index-check';
 import {
+  createBacklinkCheckResultSchema,
+  createBacklinkCheckToolResult,
+  type CreateBacklinkCheckResult,
+} from '../src/create-backlink-check';
+import {
   createSubmissionContext,
   loadSubmissionConfiguration,
   submissionCredentialFingerprint,
@@ -174,6 +179,7 @@ const paths = new Set([
   '/v2/task/google/checker/create',
   '/v2/task/yandex/checker/create',
   '/v2/task/bing/checker/create',
+  '/v2/task/backlink/checker/create',
 ]);
 
 type ChildMode =
@@ -587,6 +593,33 @@ async function makeHarness() {
         return result;
       });
     },
+    backlink(
+      instance: InstanceType<typeof Host>,
+      input: unknown,
+      signal?: AbortSignal,
+    ) {
+      const cleanup = new AbortController();
+      controllers.push(cleanup);
+      const operation = instance.createBacklinkCheck(
+        input,
+        signal ? AbortSignal.any([signal, cleanup.signal]) : cleanup.signal,
+      );
+      pending.push(operation);
+      return bounded(operation, 5_000).then((result) => {
+        expect(createBacklinkCheckResultSchema.safeParse(result).success).toBe(
+          true,
+        );
+        expect(result.error?.code).not.toBe('InternalError');
+        const wire = createBacklinkCheckToolResult(result);
+        expect(wire.structuredContent).toEqual(result);
+        expect(JSON.parse(wire.content[0]!.text)).toEqual(result);
+        expect(wire.isError).toBe(
+          result.status !== 'preview' && result.status !== 'accepted',
+        );
+        assertNoPrivate(wire, { root });
+        return result;
+      });
+    },
     read,
     rows,
     seed,
@@ -791,10 +824,7 @@ function ack(preview: CreateIndexingTaskResult) {
     authorizationFingerprint: preview.authorization!.fingerprint!,
   };
 }
-function assertNoPrivate(
-  value: unknown,
-  h: Awaited<ReturnType<typeof makeHarness>>,
-) {
+function assertNoPrivate(value: unknown, h: { root: string }) {
   const serialized = JSON.stringify(value);
   for (const secret of [
     key,
@@ -2804,7 +2834,7 @@ test('C15 SOURCE SDK: real CLI cancellation after full POST persists unknown, fr
       );
     };
     const session = await h.sdk();
-    expect((await session.client.listTools()).tools).toHaveLength(6);
+    expect((await session.client.listTools()).tools).toHaveLength(7);
     const controller = new AbortController();
     const input = request('sdk-after-receipt');
     const call = h.track(
@@ -3027,7 +3057,7 @@ test('C15 SOURCE CLI: incomplete or malformed trusted configuration disables wri
         state: 'invalid',
         stateChecked: false,
       });
-      expect((await session.client.listTools()).tools).toHaveLength(6);
+      expect((await session.client.listTools()).tools).toHaveLength(7);
       expect(
         (await session.client.callTool({ name: 'get_balance', arguments: {} }))
           .isError,
@@ -4069,6 +4099,841 @@ test('IC09 SOURCE SDK: checker cancellation after full POST persists all-unit ho
         replay: replay.status,
         overlap: overlap.error?.code,
       }),
+    );
+  });
+}, 30_000);
+
+// Synthetic operator reservations; these are not provider fee estimates.
+const backlinkVector = { tokens: 4, indexer: 3, checker: 2 };
+const backlinkPolicy: Partial<SubmissionPolicy> = {
+  ...checkerPolicy,
+  allowBacklinkChecks: true,
+  backlinkCheckReservations: backlinkVector,
+};
+function backlinkRequest(
+  id = 'backlink-1',
+  urls = ['https://donor.test/one'],
+  targetDomains = ['target.test'],
+) {
+  return { mode: 'submit', requestId: id, urls, targetDomains } as const;
+}
+function backlinkAck(result: Awaited<ReturnType<HostHarness['backlink']>>) {
+  if (
+    result.quote?.availability !== 'available' ||
+    !result.authorization?.fingerprint
+  )
+    throw new Error('Expected available configured backlink preview.');
+  return {
+    quoteFingerprint: result.quote.fingerprint,
+    authorizationFingerprint: result.authorization.fingerprint,
+  };
+}
+
+test('BC04 HOST: exact backlink wire and target count survive the shared coordinator and record all three donor reservations', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const config = h.config(backlinkPolicy);
+    const urls = [
+      'HTTPS://Example.TEST/%2f?b=2&a=1#fragment',
+      'https://donor.test/白🦊/',
+    ];
+    const targets = [' Example.COM ', '例え.テスト', ' Example.COM '];
+    const result = await h.backlink(h.host(config), {
+      ...backlinkRequest('backlink-wire', urls, targets),
+      title: '  白 backlink  ',
+    });
+    const expectedBody =
+      '{"title":"  白 backlink  ","urls":["HTTPS://Example.TEST/%2f?b=2&a=1#fragment","https://donor.test/白🦊/"],"target_domains":[" Example.COM ","例え.テスト"," Example.COM "]}';
+    expect(h.records).toEqual([
+      {
+        method: 'POST',
+        path: '/v2/task/backlink/checker/create',
+        auth: key,
+        agent: 'speedyindex-mcp/0.1.0',
+        accept: 'application/json',
+        contentType: 'application/json',
+        body: expectedBody,
+      },
+    ]);
+    expect(result.status).toBe('accepted');
+    expect(result.request).toEqual({
+      family: 'backlink/checker',
+      providerRoute: '/v2/task/backlink/checker/create',
+      urlCount: 2,
+      targetDomainCount: 3,
+      providerBodyBytes: Buffer.byteLength(expectedBody, 'utf8'),
+      payloadDigest: sha(expectedBody),
+    });
+    expect(result.observation).toEqual({
+      kind: 'accepted_ack',
+      recorded: true,
+      taskId: 'provider-1',
+      type: 'backlink/checker',
+    });
+    const reservation = { tokens: 8, indexer: 6, checker: 4 };
+    expect(result.intent).toMatchObject({
+      state: 'accepted',
+      providerTaskId: 'provider-1',
+      providerType: 'backlink/checker',
+      reservation,
+    });
+    expect(h.read('backlink-wire')).toMatchObject({
+      taskFamily: 'backlink/checker',
+      payloadDigest: sha(expectedBody),
+      reservation,
+    });
+    expect(storedUnits(h)).toEqual(reservation);
+    expect(h.rows('SELECT url_text FROM intent_urls ORDER BY ordinal')).toEqual(
+      urls.map((url_text) => ({ url_text })),
+    );
+    expect(events(h, 'backlink-wire').map((row) => row.event_kind)).toEqual([
+      'prepared',
+      'dispatching',
+      'accepted',
+    ]);
+    expect(h.attempts).toBe(1);
+  });
+});
+
+test('BC02 HOST: backlink configuration, key, independent permission, pricing, context and cancellation gates precede state open', async () => {
+  await withHost(async (h) => {
+    const legacyInactive = { ...loadSubmissionConfiguration() };
+    delete legacyInactive.backlinkCheckReservationSource;
+    const setups: {
+      config: SubmissionConfiguration;
+      error: NonNullable<CreateBacklinkCheckResult['error']>['code'];
+      availability: 'available' | 'unavailable';
+      state: NonNullable<CreateBacklinkCheckResult['authorization']>['state'];
+    }[] = [
+      {
+        config: loadSubmissionConfiguration(),
+        error: 'WritesDisabled',
+        availability: 'unavailable',
+        state: 'unconfigured',
+      },
+      {
+        config: legacyInactive,
+        error: 'WritesDisabled',
+        availability: 'unavailable',
+        state: 'unconfigured',
+      },
+      {
+        config: h.config({ ...backlinkPolicy, enabled: false }),
+        error: 'WritesDisabled',
+        availability: 'available',
+        state: 'disabled',
+      },
+      {
+        config: h.config(backlinkPolicy, ''),
+        error: 'MissingCredentials',
+        availability: 'available',
+        state: 'credential_missing',
+      },
+      {
+        config: h.config(backlinkPolicy, 'wrong-synthetic-key'),
+        error: 'CredentialMismatch',
+        availability: 'available',
+        state: 'credential_mismatch',
+      },
+      // Index-check permission and profiles alone grant no backlink authority.
+      {
+        config: h.config(checkerPolicy),
+        error: 'WritesDisabled',
+        availability: 'unavailable',
+        state: 'disabled',
+      },
+      {
+        config: h.config({
+          ...backlinkPolicy,
+          allowBacklinkChecks: false,
+          backlinkCheckReservations: undefined,
+        }),
+        error: 'WritesDisabled',
+        availability: 'unavailable',
+        state: 'disabled',
+      },
+      {
+        config: h.config({
+          ...backlinkPolicy,
+          backlinkCheckReservations: undefined,
+        }),
+        error: 'ReservationProfileRequired',
+        availability: 'unavailable',
+        state: 'reservation_unavailable',
+      },
+      {
+        config: h.config({
+          ...backlinkPolicy,
+          backlinkCheckReservations: {
+            ...backlinkVector,
+            checker: Number.MAX_SAFE_INTEGER,
+          },
+        }),
+        error: 'ReservationOverflow',
+        availability: 'unavailable',
+        state: 'reservation_unavailable',
+      },
+      {
+        config: h.config({
+          ...backlinkPolicy,
+          allowBacklinkChecks: false,
+          backlinkCheckReservations: { ...backlinkVector, tokens: 1 },
+        }),
+        error: 'InvalidPolicy',
+        availability: 'unavailable',
+        state: 'invalid',
+      },
+    ];
+    h.config(backlinkPolicy);
+    setups.push({
+      config: loadSubmissionConfiguration({ policyPath: h.policyPath }),
+      error: 'InvalidPolicy',
+      availability: 'available',
+      state: 'invalid',
+    });
+    const donors = ['https://donor.test/a', 'https://donor.test/b'];
+    const stale = {
+      quoteFingerprint: 'a'.repeat(64),
+      authorizationFingerprint: 'b'.repeat(64),
+    };
+    for (const setup of setups) {
+      const instance = h.host(setup.config);
+      const preview = await h.backlink(instance, {
+        mode: 'preview',
+        urls: donors,
+        targetDomains: ['target.test'],
+      });
+      expect(preview.status).toBe('preview');
+      expect(preview.quote?.availability).toBe(setup.availability);
+      expect(preview.authorization?.state).toBe(setup.state);
+      expect(preview.authorization?.stateChecked).toBe(false);
+      if (preview.quote?.availability === 'unavailable') {
+        for (const field of ['fingerprint', 'reservation', 'perUrlReservation'])
+          expect(Object.hasOwn(preview.quote, field)).toBe(false);
+        expect(preview.authorization?.fingerprint).toBeUndefined();
+      } else {
+        expect(preview.quote).toMatchObject({
+          basis: 'operator_configured_reservation',
+          providerFeesKnown: false,
+          providerEnforced: false,
+          reservation: { tokens: 8, indexer: 6, checker: 4 },
+        });
+      }
+      const result = await h.backlink(instance, {
+        ...backlinkRequest('admission', donors),
+        acknowledgement: stale,
+      });
+      expect(result.error?.code).toBe(setup.error);
+      expect(result.authorization?.stateChecked).toBe(false);
+    }
+    const invalid = h.config({
+      ...backlinkPolicy,
+      allowBacklinkChecks: false,
+      backlinkCheckReservations: { ...backlinkVector, tokens: 1 },
+    });
+    expect((await h.call(h.host(invalid), request())).error?.code).toBe(
+      'InvalidPolicy',
+    );
+    expect((await h.check(h.host(invalid), checkRequest())).error?.code).toBe(
+      'InvalidPolicy',
+    );
+    const active = h.config(backlinkPolicy);
+    expect(
+      (
+        await h.backlink(
+          h.host(active, { clock: () => NaN }),
+          backlinkRequest(),
+        )
+      ).error?.code,
+    ).toBe('StateUnavailable');
+    const cancelled = new AbortController();
+    cancelled.abort();
+    expect(
+      (await h.backlink(h.host(active), backlinkRequest(), cancelled.signal))
+        .error?.code,
+    ).toBe('Cancelled');
+    expect(
+      (
+        await h.backlink(h.host(active), {
+          ...backlinkRequest(),
+          acknowledgement: { quoteFingerprint: 'BAD' },
+        })
+      ).error?.code,
+    ).toBe('InvalidInput');
+    expect(h.opens).toBe(0);
+    expect(h.attempts).toBe(0);
+    expect(h.records).toEqual([]);
+    expect(existsSync(h.stateDirectory)).toBe(false);
+  });
+});
+
+test('BC02 HOST: admitted backlink snapshot cannot be overridden, inactivated or granted a missing profile by a private preview view', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const config = h.config(backlinkPolicy);
+    if (config.state !== 'configured')
+      throw new Error('Expected synthetic configuration.');
+    const foreign = {
+      state: 'loaded' as const,
+      profile: { tokens: 99, indexer: 99, checker: 99 },
+    };
+    for (const source of [foreign, { state: 'invalid' as const }, undefined]) {
+      const configuration = { ...config };
+      if (source === undefined)
+        delete configuration.backlinkCheckReservationSource;
+      else configuration.backlinkCheckReservationSource = source;
+      const preview = await h.backlink(h.host(configuration), {
+        mode: 'preview',
+        urls: ['https://donor.test/one'],
+        targetDomains: ['target.test'],
+      });
+      expect(preview.quote).toMatchObject({
+        availability: 'available',
+        perUrlReservation: backlinkVector,
+      });
+      expect(preview.authorization?.state).toBe('configured');
+    }
+    const first = await h.backlink(
+      h.host({ ...config, backlinkCheckReservationSource: foreign }),
+      backlinkRequest(),
+    );
+    expect(first.intent?.reservation).toEqual(backlinkVector);
+    const before = events(h, 'backlink-1');
+    for (const [configuration, error] of [
+      [
+        h.config({ ...backlinkPolicy, backlinkCheckReservations: undefined }),
+        'ReservationProfileRequired',
+      ],
+      [
+        h.config({ ...backlinkPolicy, allowBacklinkChecks: false }),
+        'WritesDisabled',
+      ],
+      [h.config(backlinkPolicy, 'wrong-synthetic-key'), 'CredentialMismatch'],
+    ] as const) {
+      const opens = h.opens;
+      const result = await h.backlink(
+        h.host({ ...configuration, backlinkCheckReservationSource: foreign }),
+        backlinkRequest(),
+      );
+      expect(result.error?.code).toBe(error);
+      expect(h.opens).toBe(opens);
+    }
+    // File changes above cannot alter a previously admitted host snapshot.
+    expect((await h.backlink(h.host(config), backlinkRequest())).replayed).toBe(
+      true,
+    );
+    expect(events(h, 'backlink-1')).toEqual(before);
+    expect(storedUnits(h)).toEqual(backlinkVector);
+    expect(h.attempts).toBe(1);
+  });
+});
+
+test.each([
+  {
+    label: 'wrong family ACK',
+    status: 200,
+    body: '{"code":0,"task_id":"wrong-family","type":"google/checker","private":"private-provider-error"}',
+    state: 'unknown',
+    error: 'OutcomeUnknown',
+  },
+  {
+    label: 'malformed JSON',
+    status: 200,
+    body: '{"private":"private-provider-error"',
+    state: 'unknown',
+    error: 'OutcomeUnknown',
+  },
+  {
+    label: 'definite provider rejection',
+    status: 402,
+    body: '{"code":2,"message":"private-provider-error"}',
+    state: 'rejected',
+    error: 'ProviderRejected',
+  },
+] as const)(
+  'BC04 HOST: $label records its durable state, preserves appropriate holds and never retries',
+  async (vector) => {
+    await withHost(async (h) => {
+      h.init();
+      const config = h.config(backlinkPolicy);
+      h.handler = (_record, response) => {
+        response.statusCode = vector.status;
+        response.end(vector.body);
+      };
+      const input = backlinkRequest();
+      const result = await h.backlink(h.host(config), input);
+      expect(result.status).toBe(vector.state);
+      expect(result.error?.code).toBe(vector.error);
+      expect(result.observation?.recorded).toBe(true);
+      expect(result.observation?.kind).toBe(
+        vector.state === 'unknown' ? 'ambiguous' : 'provider_rejection',
+      );
+      expect(h.read(input.requestId)?.state).toBe(vector.state);
+      expect(h.read(input.requestId)?.reservation).toEqual(backlinkVector);
+      const before = events(h, input.requestId);
+      const replay = await h.backlink(h.host(config), input);
+      expect(replay.replayed).toBe(true);
+      expect(replay.status).toBe(vector.state);
+      expect(replay.observation).toBeUndefined();
+      expect(events(h, input.requestId)).toEqual(before);
+      expect(h.attempts).toBe(1);
+      expect(
+        storedUnits(h, "state IN ('prepared','dispatching','unknown')"),
+      ).toEqual(
+        vector.state === 'unknown'
+          ? backlinkVector
+          : { tokens: 0, indexer: 0, checker: 0 },
+      );
+    });
+  },
+);
+
+test.each(['accepted', 'unknown'] as const)(
+  'BC05 HOST: %s backlink identity reopens next UTC day before current ACK without events, capabilities or another POST',
+  async (state) => {
+    await withHost(async (h) => {
+      h.init();
+      const policy = {
+        ...backlinkPolicy,
+        mode: 'caller_acknowledgement' as const,
+      };
+      const config = h.config(policy);
+      const instance = h.host(config);
+      const input = backlinkRequest();
+      const preview = await h.backlink(instance, {
+        mode: 'preview',
+        urls: input.urls,
+        targetDomains: input.targetDomains,
+      });
+      const current = backlinkAck(preview);
+      expect((await h.backlink(instance, input)).error?.code).toBe(
+        'AcknowledgementRequired',
+      );
+      expect(
+        (
+          await h.backlink(instance, {
+            ...input,
+            acknowledgement: {
+              ...current,
+              authorizationFingerprint: 'a'.repeat(64),
+            },
+          })
+        ).error?.code,
+      ).toBe('AcknowledgementMismatch');
+      expect(h.rows('SELECT request_id FROM intents')).toEqual([]);
+      if (state === 'unknown')
+        h.handler = (_receipt, response) =>
+          response.end('{"code":0,"task_id":"held","type":"google/indexer"}');
+      const first = await h.backlink(instance, {
+        ...input,
+        acknowledgement: current,
+      });
+      expect(first.status).toBe(state);
+      const snapshot = () =>
+        ['budget_periods', 'intents', 'intent_urls', 'intent_events'].map(
+          (table) => h.rows(`SELECT * FROM ${table} ORDER BY rowid`),
+        );
+      const before = snapshot();
+      h.now += 86_400_000;
+      let replayPreparations = 0;
+      const restarted = h.host(h.config(policy), {
+        openLedger(options) {
+          const ledger = openLedger(options);
+          return new Proxy(ledger, {
+            get(target, property) {
+              if (property === 'prepareIntent')
+                return (value: PrepareIntentInput) => {
+                  const replay = target.prepareIntent(value);
+                  expect(replay.kind).toBe('replay');
+                  expect('dispatchCapability' in replay).toBe(false);
+                  replayPreparations++;
+                  return replay;
+                };
+              const value = Reflect.get(target, property);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      });
+      for (const acknowledgement of [undefined, current]) {
+        const replay = await h.backlink(restarted, {
+          ...input,
+          ...(acknowledgement ? { acknowledgement } : {}),
+        });
+        expect(replay.status).toBe(state);
+        expect(replay.replayed).toBe(true);
+        expect(replay.observation).toBeUndefined();
+        expect(replay.intent).toEqual(first.intent);
+        expect(replay.intent?.periodId).toBe('utc-day:2026-10-20');
+        expect(replay.authorization?.fingerprint).not.toBe(
+          current.authorizationFingerprint,
+        );
+      }
+      expect(replayPreparations).toBe(2);
+      expect(snapshot()).toEqual(before);
+      const changedTarget = await h.backlink(h.host(h.config(policy)), {
+        ...input,
+        targetDomains: ['other-target.test'],
+      });
+      expect(changedTarget.error?.code).toBe('RequestIdConflict');
+      expect(changedTarget.request?.payloadDigest).not.toBe(
+        first.request?.payloadDigest,
+      );
+      expect(snapshot()).toEqual(before);
+      expect(
+        (
+          await h.backlink(restarted, {
+            ...input,
+            requestId: 'new-day',
+            acknowledgement: current,
+          })
+        ).error?.code,
+      ).toBe('AcknowledgementMismatch');
+      expect(h.attempts).toBe(1);
+    });
+  },
+);
+
+test('BC05 HOST: unresolved exact donor URLs block new targets and other families without storing target pairs or normalizing donor text', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const config = h.config(backlinkPolicy);
+    const donor = 'HTTPS://Donor.TEST/%2f';
+    const input = backlinkRequest(
+      'held-backlink',
+      [donor],
+      ['a.test', 'b.test'],
+    );
+    h.handler = (_receipt, response) =>
+      response.end('{"code":0,"task_id":"held","type":"google/checker"}');
+    expect((await h.backlink(h.host(config), input)).status).toBe('unknown');
+    const before = events(h, input.requestId);
+    expect(
+      (
+        await h.backlink(h.host(config), {
+          ...input,
+          targetDomains: ['b.test', 'a.test'],
+          acknowledgement: {
+            quoteFingerprint: 'a'.repeat(64),
+            authorizationFingerprint: 'b'.repeat(64),
+          },
+        })
+      ).error?.code,
+    ).toBe('RequestIdConflict');
+    expect(
+      (
+        await h.backlink(
+          h.host(config),
+          backlinkRequest('new-target', [donor], ['other.test']),
+        )
+      ).error?.code,
+    ).toBe('UrlOverlap');
+    expect(
+      (await h.call(h.host(config), request('index-overlap', [donor]))).error
+        ?.code,
+    ).toBe('UrlOverlap');
+    expect(
+      (
+        await h.check(
+          h.host(config),
+          checkRequest('check-overlap', 'bing', [donor]),
+        )
+      ).error?.code,
+    ).toBe('UrlOverlap');
+    expect(h.rows('SELECT url_text FROM intent_urls ORDER BY ordinal')).toEqual(
+      [{ url_text: donor }],
+    );
+    expect(h.read(input.requestId)?.reservation).toEqual(backlinkVector);
+    expect(storedUnits(h)).toEqual(backlinkVector);
+    expect(events(h, input.requestId)).toEqual(before);
+    expect(h.attempts).toBe(1);
+    // The V1 ledger deliberately holds exact submitted strings, not parsed URLs.
+    h.handler = (_receipt, response) =>
+      response.end(
+        '{"code":0,"task_id":"distinct-spelling","type":"backlink/checker"}',
+      );
+    expect(
+      (
+        await h.backlink(
+          h.host(config),
+          backlinkRequest('distinct-spelling', ['https://donor.test/%2f']),
+        )
+      ).status,
+    ).toBe('accepted');
+    expect(h.attempts).toBe(2);
+    expect(h.rows('SELECT url_text FROM intent_urls ORDER BY rowid')).toEqual([
+      { url_text: donor },
+      { url_text: 'https://donor.test/%2f' },
+    ]);
+  });
+});
+
+test('BC05 HOST: backlink and indexer consume one shared three-unit cap at the exact cross-family boundary', async () => {
+  await withHost(async (h) => {
+    h.init();
+    const tight = h.config({
+      ...backlinkPolicy,
+      caps: { tokens: 24, indexer: 3, checker: 2 },
+    });
+    const indexing = {
+      ...request('shared-index', ['https://donor.test/indexed']),
+      searchEngine: 'yandex',
+    };
+    expect((await h.call(h.host(tight), indexing)).status).toBe('accepted');
+    const input = backlinkRequest('shared-backlink');
+    const blocked = await h.backlink(h.host(tight), input);
+    expect(blocked.error).toMatchObject({
+      code: 'BudgetExceeded',
+      unit: 'indexer',
+    });
+    expect(h.read(input.requestId)).toBeNull();
+    expect(storedUnits(h)).toEqual({ tokens: 20, indexer: 1, checker: 0 });
+    expect(h.attempts).toBe(1);
+    const fitting = h.config({
+      ...backlinkPolicy,
+      caps: { tokens: 24, indexer: 4, checker: 2 },
+    });
+    expect((await h.backlink(h.host(fitting), input)).status).toBe('accepted');
+    expect(h.read(input.requestId)?.reservation).toEqual(backlinkVector);
+    expect(storedUnits(h)).toEqual({ tokens: 24, indexer: 4, checker: 2 });
+    expect(
+      (
+        await h.call(h.host(fitting), {
+          ...indexing,
+          requestId: 'one-more',
+          urls: ['https://donor.test/extra'],
+        })
+      ).error?.code,
+    ).toBe('BudgetExceeded');
+    expect(h.attempts).toBe(2);
+    expect(h.rows('SELECT request_id FROM intents ORDER BY rowid')).toEqual([
+      { request_id: indexing.requestId },
+      { request_id: input.requestId },
+    ]);
+  });
+});
+
+test.each(['backlink', 'indexer'] as const)(
+  'BC05 HOST: %s-first uses the shared busy fence while exact replay and identity conflicts precede ACK and busy checks',
+  async (firstFamily) => {
+    await withHost(async (h) => {
+      h.init();
+      const instance = h.host(h.config(backlinkPolicy));
+      const fence = h.fence();
+      h.handler = async (receipt, response) => {
+        await fence.promise;
+        response.end(
+          JSON.stringify({
+            code: 0,
+            task_id: 'guard-job',
+            type: receipt.path!.slice('/v2/task/'.length, -'/create'.length),
+          }),
+        );
+      };
+      const indexing = request('guard-index', [
+        'https://donor.test/guard-index',
+      ]);
+      const backlink = backlinkRequest('guard-backlink', [
+        'https://donor.test/guard-backlink',
+      ]);
+      const first =
+        firstFamily === 'backlink'
+          ? h.backlink(instance, backlink)
+          : h.call(instance, indexing);
+      await bounded(h.received.promise);
+      const stale = {
+        quoteFingerprint: 'a'.repeat(64),
+        authorizationFingerprint: 'b'.repeat(64),
+      };
+      const busy =
+        firstFamily === 'backlink'
+          ? await h.call(instance, { ...indexing, acknowledgement: stale })
+          : await h.backlink(instance, { ...backlink, acknowledgement: stale });
+      expect(busy.error?.code).toBe('SubmissionBusy');
+      expect(
+        (
+          await h.check(
+            instance,
+            checkRequest('check-busy', 'google', [
+              'https://donor.test/check-busy',
+            ]),
+          )
+        ).error?.code,
+      ).toBe('SubmissionBusy');
+      const heldId =
+        firstFamily === 'backlink' ? backlink.requestId : indexing.requestId;
+      const before = events(h, heldId);
+      const replay =
+        firstFamily === 'backlink'
+          ? await h.backlink(instance, { ...backlink, acknowledgement: stale })
+          : await h.call(instance, { ...indexing, acknowledgement: stale });
+      expect(replay.replayed).toBe(true);
+      expect(replay.status).toBe('dispatching');
+      const conflict =
+        firstFamily === 'backlink'
+          ? await h.backlink(instance, {
+              ...backlink,
+              targetDomains: ['changed.test'],
+              acknowledgement: stale,
+            })
+          : await h.backlink(instance, {
+              ...backlink,
+              requestId: indexing.requestId,
+              acknowledgement: stale,
+            });
+      expect(conflict.error?.code).toBe('RequestIdConflict');
+      expect(events(h, heldId)).toEqual(before);
+      expect(h.rows('SELECT request_id FROM intents')).toEqual([
+        { request_id: heldId },
+      ]);
+      expect(h.attempts).toBe(1);
+      fence.resolve();
+      expect((await first).status).toBe('accepted');
+      const after =
+        firstFamily === 'backlink'
+          ? await h.call(instance, indexing)
+          : await h.backlink(instance, backlink);
+      expect(after.status).toBe('accepted');
+      expect(storedUnits(h)).toEqual({ tokens: 104, indexer: 3, checker: 2 });
+      expect(h.attempts).toBe(2);
+      expect(h.records).toHaveLength(2);
+    });
+  },
+);
+
+test('BC06 SOURCE SDK: keyless default backlink preview and blocked submit open no state and send no HTTP', async () => {
+  await withHost(async (h) => {
+    const session = await h.sdk(false, [], '');
+    for (const mode of ['preview', 'submit']) {
+      const value = await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: {
+          mode,
+          urls: ['https://donor.test/default'],
+          targetDomains: ['target.test'],
+          ...(mode === 'submit' ? { requestId: 'disabled-backlink' } : {}),
+        },
+      });
+      const parsed = createBacklinkCheckResultSchema.parse(
+        value.structuredContent,
+      );
+      expect(value.content).toEqual([
+        { type: 'text', text: JSON.stringify(parsed) },
+      ]);
+      expect(value.isError).toBe(mode === 'submit');
+      expect(parsed.status).toBe(mode === 'preview' ? 'preview' : 'blocked');
+      expect(parsed.authorization).toEqual({
+        state: 'unconfigured',
+        stateChecked: false,
+      });
+      expect(parsed.quote).toMatchObject({
+        availability: 'unavailable',
+        reason: 'policy_unconfigured',
+        providerFeesKnown: false,
+      });
+      expect(parsed.quote).not.toHaveProperty('reservation');
+      expect(parsed.quote).not.toHaveProperty('fingerprint');
+      if (mode === 'submit') expect(parsed.error?.code).toBe('WritesDisabled');
+      assertNoPrivate(value, h);
+    }
+    expect(existsSync(h.stateDirectory)).toBe(false);
+    expect(h.records).toEqual([]);
+    expect(h.api.requests).toEqual([]);
+    expect(session.stderr()).toBe('');
+  });
+});
+
+test('BC06 SOURCE SDK: current caller ACK accepts backlink once; next-day controlled-clock restart replays without ACK or ledger mutation', async () => {
+  await withHost(async (h) => {
+    h.init();
+    h.config({ ...backlinkPolicy, mode: 'caller_acknowledgement' });
+    const session = await h.sdk(true);
+    await session.phases.wait('READY');
+    const input = backlinkRequest(
+      'sdk-backlink-ack',
+      ['HTTPS://Donor.TEST/%2f'],
+      [' Target.TEST ', ' Target.TEST '],
+    );
+    const application = (value: {
+      structuredContent?: unknown;
+      content: unknown;
+      isError?: boolean | undefined;
+    }) => {
+      const result = createBacklinkCheckResultSchema.parse(
+        value.structuredContent,
+      );
+      expect(value.content).toEqual([
+        { type: 'text', text: JSON.stringify(result) },
+      ]);
+      expect(value.isError).toBe(
+        !['preview', 'accepted'].includes(result.status),
+      );
+      assertNoPrivate(value, h);
+      return result;
+    };
+    const preview = application(
+      await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: {
+          mode: 'preview',
+          urls: input.urls,
+          targetDomains: input.targetDomains,
+        },
+      }),
+    );
+    expect(preview.quote).toMatchObject({
+      availability: 'available',
+      reservation: backlinkVector,
+    });
+    expect(preview.authorization?.stateChecked).toBe(false);
+    const accepted = application(
+      await session.client.callTool({
+        name: 'create_backlink_check',
+        arguments: { ...input, acknowledgement: backlinkAck(preview) },
+      }),
+    );
+    expect(accepted.status).toBe('accepted');
+    expect(accepted.intent).toMatchObject({
+      providerType: 'backlink/checker',
+      reservation: backlinkVector,
+    });
+    expect(accepted.observation).toMatchObject({
+      kind: 'accepted_ack',
+      recorded: true,
+      type: 'backlink/checker',
+    });
+    await session.phases.wait('CLOSED', 1);
+    const snapshot = () =>
+      ['budget_periods', 'intents', 'intent_urls', 'intent_events'].map(
+        (table) => h.rows(`SELECT * FROM ${table} ORDER BY rowid`),
+      );
+    const before = snapshot();
+    await session.close();
+    h.now += 86_400_000;
+    const restarted = await h.sdk(true);
+    await restarted.phases.wait('READY');
+    const replay = application(
+      await restarted.client.callTool({
+        name: 'create_backlink_check',
+        arguments: input,
+      }),
+    );
+    await restarted.phases.wait('CLOSED', 1);
+    expect(replay.replayed).toBe(true);
+    expect(replay.intent).toEqual(accepted.intent);
+    expect(replay.intent?.periodId).toBe('utc-day:2026-10-20');
+    expect(replay.observation).toBeUndefined();
+    expect(replay.authorization?.fingerprint).not.toBe(
+      accepted.authorization?.fingerprint,
+    );
+    expect(snapshot()).toEqual(before);
+    expect(h.records).toHaveLength(1);
+    expect(h.records[0]?.path).toBe('/v2/task/backlink/checker/create');
+    expect(h.records[0]?.body).toBe(
+      '{"urls":["HTTPS://Donor.TEST/%2f"],"target_domains":[" Target.TEST "," Target.TEST "]}',
+    );
+    expect(restarted.phases.messages.some((m) => m.event === 'CLAIM')).toBe(
+      false,
     );
   });
 }, 30_000);
