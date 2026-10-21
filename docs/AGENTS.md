@@ -14,6 +14,8 @@ Describe actual state accurately: four read tools and guarded `create_indexing_t
 
 Backlink documentation must distinguish donor URLs from 1 to 50 safe target strings (8,192 UTF-8 bytes each), preserve target case/order/duplicates without DNS normalization, and explain the 10,000-donor/2 MiB bounds. Full-body identity includes targets; V1 stores donor-wide unresolved holds without raw target lists/pairs. Submission needs enabled configuration plus its own opt-in and complete profile. Describe the dated 2-token local floor using the direct [official English API](https://en.speedyindex.com/api.php#backlink-create); other fees and target-count effects remain unknown. Explicit zero is a local operator choice, not a provider fee. Invalid optional fields block all three creates until corrected and all hosts restart. Both new keys absent preserve legacy identity; present false/profile values bind policy identity. Accepted acknowledges creation, not completed analysis. Select no default or active operator values.
 
+The optional private retry policy is a strict immutable configuration prerequisite only. Document its three exact fields, positive safe-integer attempt bound, conditional digest inclusion and whole-policy invalidation. Its adoption flag is permission for a later bounded workflow, not proof of external ancestry; the field alone adds no verified external admission or public retry tool. Select no values or activation.
+
 ## Work Guidance
 
 Update the roadmap as verified behavior ships. Reconcile this contract and its parent index when documentation ownership changes.

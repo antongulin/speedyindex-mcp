@@ -40,6 +40,11 @@ const indexCheckReservationsSchema = z.strictObject({
 const backlinkCheckReservationsSchema = indexingUnitVectorSchema.refine(
   (v) => v.tokens >= 2,
 );
+const retryPolicySchema = z.strictObject({
+  enabled: z.boolean(),
+  allowUnattributedParents: z.boolean(),
+  maxAttemptsPerSource: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+});
 
 export const submissionPolicySchema = z.strictObject({
   version: z.literal(1),
@@ -54,18 +59,24 @@ export const submissionPolicySchema = z.strictObject({
   indexCheckReservations: indexCheckReservationsSchema.optional(),
   allowBacklinkChecks: z.boolean().optional(),
   backlinkCheckReservations: backlinkCheckReservationsSchema.optional(),
+  retry: retryPolicySchema.optional(),
 });
 export type SubmissionPolicy = z.infer<typeof submissionPolicySchema>;
 type FrozenPolicy = Readonly<
   Omit<
     SubmissionPolicy,
-    'caps' | 'period' | 'indexCheckReservations' | 'backlinkCheckReservations'
+    | 'caps'
+    | 'period'
+    | 'indexCheckReservations'
+    | 'backlinkCheckReservations'
+    | 'retry'
   >
 > & {
   readonly caps: Readonly<IndexingUnitVector>;
   readonly period: Readonly<SubmissionPolicy['period']>;
   readonly indexCheckReservations?: IndexCheckReservationProfiles | undefined;
   readonly backlinkCheckReservations?: Readonly<IndexingUnitVector> | undefined;
+  readonly retry?: Readonly<NonNullable<SubmissionPolicy['retry']>> | undefined;
 };
 export interface LoadedSubmissionPolicy {
   readonly policy: FrozenPolicy;
@@ -257,6 +268,15 @@ export function loadSubmissionPolicy(path: unknown): LoadedSubmissionPolicy {
               tokens: value.backlinkCheckReservations.tokens,
               indexer: value.backlinkCheckReservations.indexer,
               checker: value.backlinkCheckReservations.checker,
+            }),
+          }),
+      ...(value.retry === undefined
+        ? {}
+        : {
+            retry: Object.freeze({
+              enabled: value.retry.enabled,
+              allowUnattributedParents: value.retry.allowUnattributedParents,
+              maxAttemptsPerSource: value.retry.maxAttemptsPerSource,
             }),
           }),
     });
