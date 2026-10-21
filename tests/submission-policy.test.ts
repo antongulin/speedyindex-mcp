@@ -18,7 +18,12 @@ import { join, relative } from 'node:path';
 import {
   CreateIndexingTaskError,
   indexingAuthorizationSchema,
+  createIndexingTaskErrorCodeSchema,
 } from '../src/create-indexing-task';
+import {
+  buildCreateIndexCheckRequest,
+  quoteIndexCheckRequest,
+} from '../src/create-index-check';
 import {
   createSubmissionContext,
   getSubmissionAuthorization,
@@ -784,4 +789,319 @@ test('C16-POLICY-KEY: effective trim, domain and inclusive ASCII byte bound dete
       () => submissionCredentialFingerprint(value),
       'MissingCredentials',
     );
+});
+
+// Explicit synthetic operator declarations only, never provider price fixtures.
+const checkerProfiles = {
+  google: { tokens: 7, indexer: 5, checker: 11 },
+  yandex: { tokens: 2, indexer: 0, checker: 0 },
+  bing: { tokens: 2, indexer: 0, checker: 13 },
+};
+const checkRequest = buildCreateIndexCheckRequest({
+  mode: 'preview',
+  searchEngine: 'google',
+  urls: ['https://example.test/one', 'https://example.test/two'],
+});
+test('IC03 POLICY: absent extensions retain literal legacy bytes; explicit false and empty map bind distinct identities', () => {
+  withFixture((fixture) => {
+    const legacy = loadSubmissionPolicy(fixture.policyPath);
+    expect(legacy.digest).toBe(expectedPolicyDigest());
+    expect(Object.hasOwn(legacy.policy, 'allowIndexChecks')).toBe(false);
+    expect(Object.hasOwn(legacy.policy, 'indexCheckReservations')).toBe(false);
+    const hashes = new Set([legacy.digest]);
+    for (const extension of [
+      { allowIndexChecks: false },
+      { indexCheckReservations: {} },
+      { allowIndexChecks: false, indexCheckReservations: {} },
+      { allowIndexChecks: true },
+    ]) {
+      writePolicy(fixture, { ...policy(), ...extension });
+      const loaded = loadSubmissionPolicy(fixture.policyPath);
+      expect(JSON.stringify(loaded.policy)).toBe(
+        JSON.stringify({ ...policy(), ...extension }),
+      );
+      hashes.add(loaded.digest);
+    }
+    expect(hashes.size).toBe(5);
+    // Checker-only schema growth must not widen either old public enum alias.
+    expect(
+      indexingAuthorizationSchema.safeParse({
+        state: 'reservation_unavailable',
+        stateChecked: false,
+      }).success,
+    ).toBe(false);
+    for (const code of ['ReservationProfileRequired', 'ReservationOverflow'])
+      expect(createIndexingTaskErrorCodeSchema.safeParse(code).success).toBe(
+        false,
+      );
+  });
+});
+test('IC03 POLICY: strict partial profiles require all three safe units and compiled local floors', () => {
+  withFixture((fixture) => {
+    for (const indexCheckReservations of [
+      {},
+      { google: { tokens: 3, indexer: 0, checker: 0 } },
+      { yandex: checkerProfiles.yandex },
+      { bing: checkerProfiles.bing },
+      checkerProfiles,
+    ]) {
+      writePolicy(fixture, { ...policy(), indexCheckReservations });
+      expect(
+        loadSubmissionPolicy(fixture.policyPath).policy.indexCheckReservations,
+      ).toEqual(indexCheckReservations);
+    }
+    const bad: unknown[] = [
+      null,
+      [],
+      { other: checkerProfiles.google },
+      { google: null },
+      { google: { tokens: 3, indexer: 0 } },
+      { google: { tokens: 3, checker: 0 } },
+      { google: { indexer: 0, checker: 0 } },
+      { google: { ...checkerProfiles.google, extra: 0 } },
+      {
+        google: checkerProfiles.google,
+        bing: { tokens: 1, indexer: 0, checker: 0 },
+      },
+    ];
+    for (const [engine, floor] of [
+      ['google', 3],
+      ['yandex', 2],
+      ['bing', 2],
+    ] as const)
+      bad.push({ [engine]: { tokens: floor - 1, indexer: 0, checker: 0 } });
+    for (const unit of ['tokens', 'indexer', 'checker'])
+      for (const value of [
+        -1,
+        0.5,
+        NaN,
+        Infinity,
+        Number.MAX_SAFE_INTEGER + 1,
+        null,
+        '0',
+      ])
+        bad.push({ google: { ...checkerProfiles.google, [unit]: value } });
+    for (const indexCheckReservations of bad) {
+      const value = { ...policy(), indexCheckReservations };
+      expect(submissionPolicySchema.safeParse(value).success).toBe(false);
+      writePolicy(fixture, value);
+      fixedError(
+        () => loadSubmissionPolicy(fixture.policyPath),
+        'InvalidPolicy',
+      );
+      const config = loadSubmissionConfiguration({
+        policyPath: fixture.policyPath,
+      });
+      expect(config.state).toBe('invalid');
+      expect(config.indexCheckReservationSource).toEqual({ state: 'invalid' });
+    }
+    for (const allowIndexChecks of [null, 1, 'true', {}]) {
+      writePolicy(fixture, { ...policy(), allowIndexChecks });
+      fixedError(
+        () => loadSubmissionPolicy(fixture.policyPath),
+        'InvalidPolicy',
+      );
+    }
+    expect(existsSync(fixture.stateDirectory)).toBe(false);
+  });
+});
+test('IC03/IC05 POLICY: canonical profile order and unselected changes bind policy/auth but not selected quote', () => {
+  withFixture((fixture) => {
+    writePolicy(fixture, {
+      indexCheckReservations: {
+        bing: { checker: 13, indexer: 0, tokens: 2 },
+        yandex: checkerProfiles.yandex,
+        google: { checker: 11, tokens: 7, indexer: 5 },
+      },
+      allowIndexChecks: true,
+      ...policy(),
+    });
+    const config = configured(fixture);
+    const canonical =
+      JSON.stringify(policy()).slice(0, -1) +
+      ',"allowIndexChecks":true,"indexCheckReservations":{"google":{"tokens":7,"indexer":5,"checker":11},"yandex":{"tokens":2,"indexer":0,"checker":0},"bing":{"tokens":2,"indexer":0,"checker":13}}}';
+    expect(JSON.stringify(config.snapshot.policy)).toBe(canonical);
+    expect(config.snapshot.digest).toBe(
+      sha('speedyindex-submission-policy-v1\0' + canonical),
+    );
+    expect(config.indexCheckReservationSource.state).toBe('loaded');
+    if (config.indexCheckReservationSource.state !== 'loaded')
+      throw new Error('Expected loaded source.');
+    expect(config.indexCheckReservationSource.profiles).toBe(
+      config.snapshot.policy.indexCheckReservations!,
+    );
+    const quote = quoteIndexCheckRequest(
+      checkRequest,
+      config.indexCheckReservationSource,
+    );
+    if (quote.availability !== 'available')
+      throw new Error('Expected available reservation.');
+    const auth = createSubmissionContext(config, quote.fingerprint, now);
+    for (const extension of [
+      { allowIndexChecks: false, indexCheckReservations: checkerProfiles },
+      {
+        allowIndexChecks: true,
+        indexCheckReservations: {
+          ...checkerProfiles,
+          bing: { ...checkerProfiles.bing, checker: 14 },
+        },
+      },
+    ]) {
+      writePolicy(fixture, { ...policy(), ...extension });
+      const changed = configured(fixture);
+      expect(changed.snapshot.digest).not.toBe(config.snapshot.digest);
+      expect(
+        quoteIndexCheckRequest(
+          checkRequest,
+          changed.indexCheckReservationSource,
+        ),
+      ).toEqual(quote);
+      expect(
+        createSubmissionContext(changed, quote.fingerprint, now).authorization
+          .fingerprint,
+      ).not.toBe(auth.authorization.fingerprint);
+    }
+    const changedDay = createSubmissionContext(
+      config,
+      quote.fingerprint,
+      now + 86_400_000,
+    );
+    expect(changedDay.authorization.fingerprint).not.toBe(
+      auth.authorization.fingerprint,
+    );
+    expect(
+      quoteIndexCheckRequest(checkRequest, config.indexCheckReservationSource),
+    ).toEqual(quote);
+  });
+});
+test('IC03 POLICY: policy-only/inactive startup keeps only frozen profiles and never grants indexing permission or opens state', () => {
+  withFixture((fixture) => {
+    for (const extension of [
+      { allowIndexChecks: true },
+      { allowIndexChecks: false },
+      {},
+      { allowIndexChecks: true, enabled: false },
+    ]) {
+      writePolicy(fixture, {
+        ...policy(),
+        ...extension,
+        indexCheckReservations: checkerProfiles,
+      });
+      for (const options of [
+        { policyPath: fixture.policyPath },
+        { policyPath: fixture.policyPath, stateDirectory: '' },
+        { policyPath: fixture.policyPath, stateDirectory: 'relative' },
+        { ...fixture },
+        { ...fixture, apiKey: 'wrong-synthetic-key' },
+      ]) {
+        const config = loadSubmissionConfiguration(options);
+        expect(config.state).not.toBe('configured');
+        const expected =
+          !options.stateDirectory || options.stateDirectory === 'relative'
+            ? 'invalid'
+            : extension.enabled === false
+              ? 'disabled'
+              : 'apiKey' in options
+                ? 'credential_mismatch'
+                : 'credential_missing';
+        expect(config.state).toBe(expected);
+        expect(getSubmissionAuthorization(config, quote, now)).toEqual({
+          state: expected,
+          stateChecked: false,
+        });
+        expect(Object.keys(config).sort()).toEqual(
+          ['state', 'error', 'indexCheckReservationSource'].sort(),
+        );
+        expect(config.indexCheckReservationSource).toEqual({
+          state: 'loaded',
+          profiles: checkerProfiles,
+        });
+        const serialized = JSON.stringify(config.indexCheckReservationSource);
+        for (const secret of [
+          dummyKey,
+          expectedKeyFingerprint,
+          fixture.policyPath,
+          fixture.stateDirectory,
+          'policyRevision',
+          'budgetScope',
+          'credential',
+          'caps',
+        ])
+          expect(serialized.includes(secret)).toBe(false);
+        expect(
+          quoteIndexCheckRequest(
+            checkRequest,
+            config.indexCheckReservationSource,
+          ),
+        ).toMatchObject({
+          availability: 'available',
+          reservation: { tokens: 14, indexer: 10, checker: 22 },
+        });
+      }
+    }
+    expect(existsSync(fixture.stateDirectory)).toBe(false);
+    expect(
+      loadSubmissionConfiguration({ stateDirectory: fixture.stateDirectory })
+        .indexCheckReservationSource,
+    ).toEqual({ state: 'unconfigured' });
+    expect(loadSubmissionConfiguration().indexCheckReservationSource).toEqual({
+      state: 'unconfigured',
+    });
+    for (const policyPath of [
+      fixture.policyPath + '.missing',
+      'relative/policy',
+    ])
+      expect(
+        loadSubmissionConfiguration({ policyPath }).indexCheckReservationSource,
+      ).toEqual({ state: 'invalid' });
+    chmodSync(fixture.policyPath, 0o644);
+    expect(
+      loadSubmissionConfiguration({ policyPath: fixture.policyPath })
+        .indexCheckReservationSource,
+    ).toEqual({ state: 'invalid' });
+  });
+});
+test('IC03 POLICY: frozen startup profile source survives file change/removal and overflow does not open state', () => {
+  withFixture((fixture) => {
+    writePolicy(fixture, {
+      ...policy(),
+      allowIndexChecks: true,
+      indexCheckReservations: checkerProfiles,
+    });
+    const config = configured(fixture);
+    const source = config.indexCheckReservationSource;
+    if (source.state !== 'loaded') throw new Error('Expected profile source.');
+    const before = quoteIndexCheckRequest(checkRequest, source);
+    expect(() => Object.assign(source, { profiles: {} })).toThrow();
+    expect(() =>
+      Object.assign(source.profiles!, { bing: checkerProfiles.google }),
+    ).toThrow();
+    expect(() =>
+      Object.assign(source.profiles!.google!, { tokens: 0 }),
+    ).toThrow();
+    expect(() =>
+      Object.assign(config.snapshot.policy.indexCheckReservations!.google!, {
+        checker: 0,
+      }),
+    ).toThrow();
+    writePolicy(fixture, {
+      ...policy(),
+      indexCheckReservations: {
+        google: { tokens: Number.MAX_SAFE_INTEGER, indexer: 0, checker: 0 },
+      },
+    });
+    const changed = loadSubmissionConfiguration({
+      policyPath: fixture.policyPath,
+    });
+    expect(
+      quoteIndexCheckRequest(checkRequest, changed.indexCheckReservationSource),
+    ).toMatchObject({
+      availability: 'unavailable',
+      reason: 'reservation_overflow',
+    });
+    expect(quoteIndexCheckRequest(checkRequest, source)).toEqual(before);
+    rmSync(fixture.policyPath);
+    expect(quoteIndexCheckRequest(checkRequest, source)).toEqual(before);
+    expect(existsSync(fixture.stateDirectory)).toBe(false);
+  });
 });

@@ -1,6 +1,6 @@
 # SpeedyIndex MCP
 
-> Unofficial Bun/TypeScript stdio MCP server. Five implemented tools: get_balance, list_tasks, get_task_status, get_task_report, and guarded create_indexing_task. Writes default off; pure previews require no key/state, and submissions need explicit private policy and existing V1 state. Seven tools and one-shot retry automation remain roadmap work. No npm release is published.
+> Unofficial Bun/TypeScript stdio MCP server. Six implemented tools: get_balance, list_tasks, get_task_status, get_task_report, guarded create_indexing_task, and create_index_check. Index-check reservations require an operator-selected profile and are not provider fees. Writes default off; pure previews require no key/state, and submissions need explicit private policy and existing V1 state. Six tools and one-shot retry automation remain roadmap work. No npm release is published.
 
 - [README](https://github.com/antongulin/speedyindex-mcp/blob/main/README.md): Setup and tool contract
 - [Architecture](https://github.com/antongulin/speedyindex-mcp/blob/main/docs/architecture.md): Runtime boundaries

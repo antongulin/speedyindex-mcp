@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
+import identity from './fixtures/indexing-v1-identity.json';
 import {
   buildCreateIndexingRequest,
   CreateIndexingTaskError,
@@ -30,6 +31,33 @@ const title = '  白い "title" \\ 🦊  ';
 function sha(value: string) {
   return createHash('sha256').update(utf8.encode(value)).digest('hex');
 }
+
+test.each(identity.vectors)(
+  'IC01 PURE: portable $label canonical bytes and hashes',
+  (vector) => {
+    const built = buildCreateIndexingRequest(vector.input);
+    const quote = JSON.parse(vector.quoteCanonical);
+    expect(built.body).toBe(vector.bodyCanonical);
+    expect(built.request).toEqual({
+      family: quote.family,
+      providerRoute: quote.providerRoute,
+      urlCount: quote.urlCount,
+      providerBodyBytes: vector.providerBodyBytes,
+      payloadDigest: vector.payloadDigest,
+    });
+    expect(sha(vector.bodyCanonical)).toBe(vector.payloadDigest);
+    expect(sha('speedyindex-create-quote-v1\0' + vector.quoteCanonical)).toBe(
+      vector.quoteFingerprint,
+    );
+    expect(built.quote).toEqual({
+      version: quote.version,
+      fingerprint: vector.quoteFingerprint,
+      maximumExposure: quote.maximumExposure,
+      basis: 'documented_independent_maxima',
+      providerEnforced: false,
+    });
+  },
+);
 
 test.each([
   {

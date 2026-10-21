@@ -3,6 +3,7 @@ import { balanceResultSchema, listTasksResultSchema } from '../src/client';
 import { taskStatusResultSchema } from '../src/task-status';
 import { taskReportOutputSchema } from '../src/task-report';
 import { createIndexingTaskResultSchema } from '../src/create-indexing-task';
+import { createIndexCheckResultSchema } from '../src/create-index-check';
 import {
   account,
   bounded,
@@ -111,6 +112,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       'get_task_status',
       'get_task_report',
       'create_indexing_task',
+      'create_index_check',
     ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
@@ -637,7 +639,7 @@ test('F02: direct stdin EOF after initialize exits successfully', async () => {
   await verifyEof('src/cli.ts');
 });
 
-test('C15 SOURCE SDK: fifth tool has explicit strict input, paid annotations, pure preview and validated disabled results', async () => {
+test('IC10/C15 SOURCE SDK: six tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
   const api = await fixture((_request, response) => response.end('unexpected'));
   let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
@@ -649,7 +651,111 @@ test('C15 SOURCE SDK: fifth tool has explicit strict input, paid annotations, pu
       'get_task_status',
       'get_task_report',
       'create_indexing_task',
+      'create_index_check',
     ]);
+    const checker = tools[5]!;
+    expect(checker.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+    expect(checker.inputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['mode', 'searchEngine', 'urls'],
+      properties: {
+        mode: { type: 'string', enum: ['preview', 'submit'] },
+        searchEngine: { type: 'string', enum: ['google', 'yandex', 'bing'] },
+      },
+    });
+    expect(checker.outputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        quote: {
+          oneOf: expect.arrayContaining([
+            expect.objectContaining({
+              properties: expect.objectContaining({
+                availability: { type: 'string', const: 'available' },
+                reservation: expect.any(Object),
+                fingerprint: expect.any(Object),
+              }),
+            }),
+            expect.objectContaining({
+              properties: expect.objectContaining({
+                availability: { type: 'string', const: 'unavailable' },
+                reason: expect.any(Object),
+              }),
+            }),
+          ]),
+        },
+      },
+    });
+    for (const searchEngine of ['google', 'yandex', 'bing']) {
+      const arguments_ = {
+        mode: 'preview',
+        searchEngine,
+        urls: ['https://example.test/unpriced'],
+      };
+      for (const mode of ['preview', 'submit']) {
+        const value = await session.client.callTool({
+          name: 'create_index_check',
+          arguments: {
+            ...arguments_,
+            mode,
+            ...(mode === 'submit' ? { requestId: 'disabled-check' } : {}),
+          },
+        });
+        const parsed = createIndexCheckResultSchema.parse(
+          value.structuredContent,
+        );
+        expect(value.content).toEqual([
+          { type: 'text', text: JSON.stringify(parsed) },
+        ]);
+        expect(value.isError).toBe(mode === 'submit');
+        expect(parsed.status).toBe(mode === 'preview' ? 'preview' : 'blocked');
+        if (mode === 'preview') {
+          expect(parsed.authorization).toEqual({
+            state: 'unconfigured',
+            stateChecked: false,
+          });
+          expect(parsed.quote).toMatchObject({
+            availability: 'unavailable',
+            providerFeesKnown: false,
+          });
+          expect(parsed.quote).not.toHaveProperty('reservation');
+          expect(parsed.quote).not.toHaveProperty('fingerprint');
+        } else expect(parsed.error?.code).toBe('WritesDisabled');
+      }
+    }
+    for (const arguments_ of [
+      { searchEngine: 'bing', urls: ['https://example.test/a'] },
+      {
+        mode: 'submit',
+        searchEngine: 'bing',
+        urls: ['https://example.test/a'],
+      },
+      {
+        mode: 'preview',
+        searchEngine: 'google',
+        urls: ['https://example.test/a'],
+        payPerIndexed: false,
+      },
+      {
+        mode: 'preview',
+        searchEngine: 'bing',
+        urls: ['https://example.test/a'],
+        indexCheckReservations: {},
+      },
+    ]) {
+      const value = await session.client.callTool({
+        name: 'create_index_check',
+        arguments: arguments_,
+      });
+      expect(value.isError).toBe(true);
+      expect(value.structuredContent).toBeUndefined();
+    }
     const create = tools[4]!;
     expect(create.annotations).toEqual({
       readOnlyHint: false,

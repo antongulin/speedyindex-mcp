@@ -16,8 +16,9 @@ Usage: bun src/cli.ts [--help | --version]
        bun dist/cli.js [--help | --version]
 
 Stdio MCP server exposing get_balance, list_tasks, get_task_status,
-get_task_report, and create_indexing_task. Indexing writes are disabled by default;
-pure previews need no credentials, policy or state.
+get_task_report, create_indexing_task, and create_index_check. Writes are disabled
+by default; pure previews need no credentials or state. Index-check reservations
+require an operator-selected policy profile and are not provider fees.
 Set SPEEDYINDEX_API_KEY in the process environment.
 Provider requests have a 10-second deadline, support cancellation, and never retry.
 

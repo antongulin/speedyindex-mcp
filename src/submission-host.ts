@@ -3,18 +3,29 @@ import {
   buildCreateIndexingRequest,
   createIndexingTaskError,
   createIndexingTaskToolResult,
-  indexingLimits,
   normalizeCreateIndexingOutcome,
-  type CreateIndexingTaskErrorCode,
   type CreateIndexingTaskResult,
-  type IndexingAuthorization,
-  type IndexingFamily,
-  type IndexingObservation,
-  type PreparedCreateIndexingRequest,
 } from './create-indexing-task';
 import {
+  buildCreateIndexCheckRequest,
+  createIndexCheckError,
+  createIndexCheckToolResult,
+  normalizeCreateIndexCheckOutcome,
+  quoteIndexCheckRequest,
+  type CreateIndexCheckResult,
+  type CreateIndexCheckErrorCode,
+  type IndexCheckAuthorization,
+} from './create-index-check';
+import {
+  submissionLimits,
+  type PreparedSubmission,
+  type SubmissionAuthorization,
+  type SubmissionError,
+  type SubmissionErrorCode,
+  type SubmissionObservation,
+} from './submission-contract';
+import {
   createSubmissionContext,
-  getSubmissionAuthorization,
   loadSubmissionConfiguration,
   type ConfiguredSubmission,
   type SubmissionConfiguration,
@@ -31,11 +42,87 @@ import {
   type SubmissionLedger,
 } from './submission-ledger';
 
-type PublicError = NonNullable<CreateIndexingTaskResult['error']>;
-type BaseResult = Pick<
-  CreateIndexingTaskResult,
-  'mode' | 'request' | 'quote' | 'authorization'
->;
+type PublicError = SubmissionError<CreateIndexCheckErrorCode>;
+interface BaseResult {
+  mode: 'preview' | 'submit';
+  request: PreparedSubmission['request'];
+  quote: PreparedSubmission['quote'];
+  authorization: Readonly<SubmissionAuthorization | IndexCheckAuthorization>;
+}
+
+// Internal operation wiring only. Execution ordering, state and transport belong
+// to the one coordinator below; a strategy cannot choose acknowledgement timing.
+interface SubmissionStrategy<Result> {
+  build(
+    value: unknown,
+    configuration: SubmissionConfiguration,
+  ): PreparedSubmission;
+  permitted(configuration: ConfiguredSubmission): boolean;
+  checked(value: unknown): Result;
+  error(code: SubmissionErrorCode): PublicError;
+}
+
+const indexingStrategy: SubmissionStrategy<CreateIndexingTaskResult> =
+  Object.freeze({
+    build(value: unknown) {
+      const prepared = buildCreateIndexingRequest(value);
+      return Object.freeze({
+        ...prepared,
+        reservation: prepared.quote.maximumExposure,
+        normalizeOutcome: (status: number, decoded: unknown) =>
+          normalizeCreateIndexingOutcome(prepared, status, decoded),
+      });
+    },
+    checked,
+    error: createIndexingTaskError,
+    permitted: () => true,
+  });
+
+const checkerStrategy: SubmissionStrategy<CreateIndexCheckResult> =
+  Object.freeze({
+    build(value: unknown, configuration: SubmissionConfiguration) {
+      const prepared = buildCreateIndexCheckRequest(value);
+      // An active host always quotes its admitted policy snapshot. A separate
+      // key-free preview view cannot replace that authority or its profile.
+      const source =
+        configuration.state === 'configured'
+          ? {
+              state: 'loaded' as const,
+              ...(configuration.snapshot.policy.indexCheckReservations ===
+              undefined
+                ? {}
+                : {
+                    profiles:
+                      configuration.snapshot.policy.indexCheckReservations,
+                  }),
+            }
+          : configuration.indexCheckReservationSource;
+      const quote = quoteIndexCheckRequest(prepared, source);
+      return Object.freeze({
+        ...prepared,
+        quote,
+        ...(quote.availability === 'available'
+          ? { reservation: quote.reservation }
+          : {
+              unavailableError: createIndexCheckError(
+                quote.reason === 'reservation_overflow'
+                  ? 'ReservationOverflow'
+                  : quote.reason === 'policy_invalid'
+                    ? 'InvalidPolicy'
+                    : 'ReservationProfileRequired',
+              ),
+            }),
+        normalizeOutcome: (status: number, decoded: unknown) =>
+          normalizeCreateIndexCheckOutcome(prepared, status, decoded),
+      });
+    },
+    permitted: (configuration: ConfiguredSubmission) =>
+      configuration.snapshot.policy.allowIndexChecks === true,
+    checked: (value: unknown) =>
+      createIndexCheckToolResult(value).structuredContent,
+    error: createIndexCheckError,
+  });
+
 export interface SubmissionHostOptions {
   fetchRequest?: typeof fetch;
   clock?: () => number;
@@ -47,7 +134,10 @@ function checked(value: unknown): CreateIndexingTaskResult {
   return createIndexingTaskToolResult(value).structuredContent;
 }
 
-function safeLedgerError(error: unknown): PublicError {
+function safeLedgerError<Result>(
+  strategy: SubmissionStrategy<Result>,
+  error: unknown,
+): PublicError {
   if (error instanceof SubmissionLedgerError) {
     switch (error.code) {
       case 'RequestIdConflict':
@@ -58,19 +148,17 @@ function safeLedgerError(error: unknown): PublicError {
       case 'DispatchClaimLost':
       case 'OutcomePersistenceFailed':
         return {
-          ...createIndexingTaskError(error.code),
+          ...strategy.error(error.code),
           ...(error.code === 'BudgetExceeded' && error.unit
             ? { unit: error.unit }
             : {}),
         };
     }
   }
-  return createIndexingTaskError('StateUnavailable');
+  return strategy.error('StateUnavailable');
 }
 
-function projectIntent(
-  intent: IntentView,
-): NonNullable<CreateIndexingTaskResult['intent']> {
+function projectIntent(intent: IntentView) {
   return {
     requestId: intent.requestId,
     state: intent.state,
@@ -84,13 +172,16 @@ function projectIntent(
     ...(intent.state === 'accepted'
       ? {
           providerTaskId: intent.providerTaskId!,
-          providerType: intent.providerType as IndexingFamily,
+          providerType: intent.providerType!,
         }
       : {}),
   };
 }
 
-function stateError(intent: IntentView): PublicError | undefined {
+function stateError<Result>(
+  strategy: SubmissionStrategy<Result>,
+  intent: IntentView,
+): PublicError | undefined {
   if (intent.state === 'accepted') return undefined;
   const code =
     intent.state === 'cancelled'
@@ -100,23 +191,24 @@ function stateError(intent: IntentView): PublicError | undefined {
         : 'DispatchClaimLost';
   // V1 does not retain the reason for rejected. A replay must not invent a
   // provider rejection when this could have been a local proven no-send.
-  return createIndexingTaskError(code);
+  return strategy.error(code);
 }
 
-function withIntent(
+function withIntent<Result>(
+  strategy: SubmissionStrategy<Result>,
   base: BaseResult,
   intent: IntentView,
   options: {
     error?: PublicError;
-    observation?: IndexingObservation;
+    observation?: SubmissionObservation;
     replayed?: boolean;
   } = {},
 ) {
   const error =
     intent.state === 'accepted'
       ? undefined
-      : (options.error ?? stateError(intent));
-  return checked({
+      : (options.error ?? stateError(strategy, intent));
+  return strategy.checked({
     ...base,
     status: intent.state,
     intent: projectIntent(intent),
@@ -126,11 +218,16 @@ function withIntent(
   });
 }
 
-function blocked(base: BaseResult, error: PublicError) {
-  return checked({ ...base, status: 'blocked', error });
+function blocked<Result>(
+  strategy: SubmissionStrategy<Result>,
+  base: BaseResult,
+  error: PublicError,
+) {
+  return strategy.checked({ ...base, status: 'blocked', error });
 }
 
-function reread(
+function reread<Result>(
+  strategy: SubmissionStrategy<Result>,
   ledger: SubmissionLedger,
   fp: string,
   id: string,
@@ -139,11 +236,11 @@ function reread(
 ) {
   try {
     const intent = ledger.readIntent(fp, id);
-    if (intent) return withIntent(base, intent, { error });
+    if (intent) return withIntent(strategy, base, intent, { error });
   } catch {
     /* No current durable state can be asserted. */
   }
-  return blocked(base, createIndexingTaskError('StateUnavailable'));
+  return blocked(strategy, base, strategy.error('StateUnavailable'));
 }
 
 // Bun's immediate queue precedes I/O polling. A timer followed by an immediate
@@ -172,7 +269,7 @@ async function readCreateResponse(
 ): Promise<unknown> {
   if (!response.body) throw invalidAck;
   const reader = response.body.getReader();
-  const bytes = new Uint8Array(indexingLimits.responseBytes);
+  const bytes = new Uint8Array(submissionLimits.responseBytes);
   let length = 0;
   let complete = false;
   try {
@@ -250,9 +347,24 @@ export class SubmissionHost {
     value: unknown,
     signal?: AbortSignal,
   ): Promise<CreateIndexingTaskResult> {
-    let prepared: PreparedCreateIndexingRequest;
+    return this.execute(indexingStrategy, value, signal);
+  }
+
+  async createIndexCheck(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<CreateIndexCheckResult> {
+    return this.execute(checkerStrategy, value, signal);
+  }
+
+  private async execute<Result>(
+    strategy: SubmissionStrategy<Result>,
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<Result> {
+    let prepared: PreparedSubmission;
     try {
-      prepared = buildCreateIndexingRequest(value);
+      prepared = strategy.build(value, this.configuration);
     } catch {
       let mode: 'preview' | 'submit' | undefined;
       try {
@@ -261,29 +373,41 @@ export class SubmissionHost {
       } catch {
         /* Input rejection never reflects arbitrary input. */
       }
-      return checked({
+      return strategy.checked({
         ...(mode ? { mode } : {}),
         status: 'blocked',
-        error: createIndexingTaskError('InvalidInput'),
+        error: strategy.error('InvalidInput'),
       });
     }
     const config = this.configuration;
     let context: SubmissionContext | undefined;
-    let authorization: IndexingAuthorization;
+    let authorization: Readonly<
+      SubmissionAuthorization | IndexCheckAuthorization
+    >;
+    const permitted =
+      config.state === 'configured' && strategy.permitted(config);
     try {
       if (config.state === 'configured') {
-        context = createSubmissionContext(
-          config,
-          prepared.quote.fingerprint,
-          this.clock(),
-        );
-        authorization = context.authorization;
+        if (!permitted)
+          authorization = { state: 'disabled', stateChecked: false };
+        else if (!prepared.quote.fingerprint || !prepared.reservation)
+          authorization = {
+            state: 'reservation_unavailable',
+            stateChecked: false,
+          };
+        else {
+          context = createSubmissionContext(
+            config,
+            prepared.quote.fingerprint,
+            this.clock(),
+          );
+          authorization = context.authorization;
+        }
       } else {
-        authorization = getSubmissionAuthorization(
-          config,
-          prepared.quote.fingerprint,
-          undefined,
-        );
+        authorization = Object.freeze({
+          state: config.state,
+          stateChecked: false,
+        });
       }
     } catch {
       authorization = { state: 'invalid', stateChecked: false };
@@ -295,12 +419,17 @@ export class SubmissionHost {
       authorization,
     };
     if (prepared.input.mode === 'preview')
-      return checked({ ...base, status: 'preview' });
-    if (config.state !== 'configured') return blocked(base, config.error);
-    if (!context)
-      return blocked(base, createIndexingTaskError('StateUnavailable'));
+      return strategy.checked({ ...base, status: 'preview' });
+    if (config.state !== 'configured')
+      return blocked(strategy, base, strategy.error(config.error.code));
+    if (!permitted)
+      return blocked(strategy, base, strategy.error('WritesDisabled'));
+    if (prepared.unavailableError)
+      return blocked(strategy, base, prepared.unavailableError);
+    if (!context || !prepared.quote.fingerprint || !prepared.reservation)
+      return blocked(strategy, base, strategy.error('StateUnavailable'));
     if (signal?.aborted)
-      return blocked(base, createIndexingTaskError('Cancelled'));
+      return blocked(strategy, base, strategy.error('Cancelled'));
 
     let ledger: SubmissionLedger | undefined;
     let ownsGuard = false;
@@ -315,7 +444,7 @@ export class SubmissionHost {
       submittedUrls: prepared.input.urls,
       quoteVersion: prepared.quote.version,
       quoteFingerprint: prepared.quote.fingerprint,
-      reservation: prepared.quote.maximumExposure,
+      reservation: prepared.reservation,
     };
     try {
       ledger = this.open({ stateDirectory: config.stateDirectory });
@@ -323,17 +452,18 @@ export class SubmissionHost {
       if (ledger.readIntent(fp, id)) {
         const replay = ledger.prepareIntent(input);
         // An observed existing identity never grants a fresh dispatch here.
-        return withIntent(base, replay.intent, { replayed: true });
+        return withIntent(strategy, base, replay.intent, { replayed: true });
       }
       if (this.busy)
-        return blocked(base, createIndexingTaskError('SubmissionBusy'));
+        return blocked(strategy, base, strategy.error('SubmissionBusy'));
       this.busy = true;
       ownsGuard = true;
       const ack = prepared.input.acknowledgement;
       if (!ack && config.snapshot.policy.mode === 'caller_acknowledgement')
         return blocked(
+          strategy,
           base,
-          createIndexingTaskError('AcknowledgementRequired'),
+          strategy.error('AcknowledgementRequired'),
         );
       if (
         ack &&
@@ -341,48 +471,59 @@ export class SubmissionHost {
           ack.authorizationFingerprint !== authorization.fingerprint)
       )
         return blocked(
+          strategy,
           base,
-          createIndexingTaskError('AcknowledgementMismatch'),
+          strategy.error('AcknowledgementMismatch'),
         );
       if (signal?.aborted)
-        return blocked(base, createIndexingTaskError('Cancelled'));
+        return blocked(strategy, base, strategy.error('Cancelled'));
       const result = ledger.prepareIntent(input);
       if (result.kind === 'replay')
-        return withIntent(base, result.intent, { replayed: true });
+        return withIntent(strategy, base, result.intent, { replayed: true });
       await yieldForPendingIO();
       if (signal?.aborted) {
         try {
           const cancelled = ledger.cancelPrepared(fp, id, 0);
           if (cancelled.kind === 'cancelled')
-            return withIntent(base, {
+            return withIntent(strategy, base, {
               ...result.intent,
               state: 'cancelled',
               stateVersion: cancelled.stateVersion,
             });
           return reread(
+            strategy,
             ledger,
             fp,
             id,
             base,
-            createIndexingTaskError('DispatchClaimLost'),
+            strategy.error('DispatchClaimLost'),
           );
         } catch (error) {
-          return reread(ledger, fp, id, base, safeLedgerError(error));
+          return reread(
+            strategy,
+            ledger,
+            fp,
+            id,
+            base,
+            safeLedgerError(strategy, error),
+          );
         }
       }
       try {
         const claim = ledger.claimDispatch(result.dispatchCapability, 0);
         if (claim.kind === 'lost')
           return reread(
+            strategy,
             ledger,
             fp,
             id,
             base,
-            createIndexingTaskError('DispatchClaimLost'),
+            strategy.error('DispatchClaimLost'),
           );
         // A synchronous claim can also leave cancellation queued in I/O.
         await yieldForPendingIO();
         return await this.dispatch(
+          strategy,
           config,
           prepared,
           ledger,
@@ -392,10 +533,17 @@ export class SubmissionHost {
           signal,
         );
       } catch (error) {
-        return reread(ledger, fp, id, base, safeLedgerError(error));
+        return reread(
+          strategy,
+          ledger,
+          fp,
+          id,
+          base,
+          safeLedgerError(strategy, error),
+        );
       }
     } catch (error) {
-      return blocked(base, safeLedgerError(error));
+      return blocked(strategy, base, safeLedgerError(strategy, error));
     } finally {
       try {
         ledger?.close();
@@ -406,9 +554,10 @@ export class SubmissionHost {
     }
   }
 
-  private async dispatch(
+  private async dispatch<Result>(
+    strategy: SubmissionStrategy<Result>,
     config: ConfiguredSubmission,
-    prepared: PreparedCreateIndexingRequest,
+    prepared: PreparedSubmission,
     ledger: SubmissionLedger,
     base: BaseResult,
     outcomeToken: DispatchOutcomeToken,
@@ -420,8 +569,8 @@ export class SubmissionHost {
     let attempted = false;
     let responseStatus: number | undefined;
     let outcome: DispatchOutcome;
-    let observation: IndexingObservation;
-    let errorCode: CreateIndexingTaskErrorCode | undefined;
+    let observation: SubmissionObservation;
+    let errorCode: SubmissionErrorCode | undefined;
     try {
       const headers = new Headers({
         Authorization: config.credential.effectiveKey,
@@ -450,11 +599,7 @@ export class SubmissionHost {
       );
       responseStatus = response.status;
       const decoded = await readCreateResponse(response, combined);
-      const normalized = normalizeCreateIndexingOutcome(
-        prepared,
-        response.status,
-        decoded,
-      );
+      const normalized = prepared.normalizeOutcome(response.status, decoded);
       if (normalized.kind === 'accepted') {
         outcome = {
           kind: 'accepted',
@@ -523,33 +668,33 @@ export class SubmissionHost {
       });
       if (!matchesOutcome(stored, outcome))
         throw new Error('Inconsistent durable submission outcome.');
-      return withIntent(base, stored, {
+      return withIntent(strategy, base, stored, {
         observation: { ...observation, recorded: true },
-        ...(errorCode ? { error: createIndexingTaskError(errorCode) } : {}),
+        ...(errorCode ? { error: strategy.error(errorCode) } : {}),
       });
     } catch {
       // Exactly one write attempt; a read may confirm an uncertain commit.
       try {
         const current = ledger.readIntent(fp, id);
         if (current && matchesOutcome(current, outcome))
-          return withIntent(base, current, {
+          return withIntent(strategy, base, current, {
             observation: { ...observation, recorded: true },
-            ...(errorCode ? { error: createIndexingTaskError(errorCode) } : {}),
+            ...(errorCode ? { error: strategy.error(errorCode) } : {}),
           });
         if (current?.state === 'dispatching')
-          return withIntent(base, current, {
+          return withIntent(strategy, base, current, {
             observation,
-            error: createIndexingTaskError('OutcomePersistenceFailed'),
+            error: strategy.error('OutcomePersistenceFailed'),
           });
       } catch {
         /* Preserve the last observed claim, without asserting current state. */
       }
-      return checked({
+      return strategy.checked({
         ...base,
         status: 'blocked',
         observation,
         error: {
-          ...createIndexingTaskError('StateUnavailable'),
+          ...strategy.error('StateUnavailable'),
           lastObservedState: 'dispatching',
         },
       });

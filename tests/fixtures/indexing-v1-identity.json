@@ -1,0 +1,54 @@
+{
+  "provenance": "Independently authored UTF-8 canonical strings and Python hashlib SHA-256; positively checked against unchanged production base 1d0dfc066a2e3d91c6ccf13ea51c16ee5bce711f before extraction. Synthetic data only.",
+  "syntheticKey": "synthetic-host-key-only",
+  "credentialFingerprint": "2c1974e09144d5748655dd22e0af7386714d708c14738943f8ce7382d6eb319c",
+  "policyCanonical": "{\"version\":1,\"enabled\":true,\"mode\":\"caller_acknowledgement\",\"policyRevision\":\"ic01-legacy-v1\",\"budgetScope\":\"ic01-legacy-scope\",\"credentialFingerprint\":\"2c1974e09144d5748655dd22e0af7386714d708c14738943f8ce7382d6eb319c\",\"period\":{\"kind\":\"utc_day\"},\"caps\":{\"tokens\":2000000,\"indexer\":20000,\"checker\":0}}",
+  "policyDigest": "9ad20a971566a52cf76bcee1869c825a52fccd7f6e9bcd7aa3616deb7bbc1bfa",
+  "nowMs": 1792497600000,
+  "replayNowMs": 1792540800000,
+  "vectors": [
+    {
+      "label": "google legacy accepted",
+      "input": {
+        "mode": "submit",
+        "searchEngine": "google",
+        "requestId": "ic01-legacy-google",
+        "urls": [
+          "HTTPS://Example.TEST/%2f?b=2&a=1#fragment",
+          "https://example.test/白🦊/"
+        ],
+        "title": "  白 \"legacy\"  "
+      },
+      "bodyCanonical": "{\"title\":\"  白 \\\"legacy\\\"  \",\"urls\":[\"HTTPS://Example.TEST/%2f?b=2&a=1#fragment\",\"https://example.test/白🦊/\"],\"pay_per_indexed\":true,\"drip_feed\":false}",
+      "payloadDigest": "24f77cdbb73a5767c14f084ed82f6c5342c75c9b9e4f71414aaf1781a04a35eb",
+      "providerBodyBytes": 156,
+      "quoteCanonical": "{\"version\":\"speedyindex-indexing-batch-2026-10-20-v1\",\"family\":\"google/indexer\",\"providerRoute\":\"/v2/task/google/indexer/create\",\"payloadDigest\":\"24f77cdbb73a5767c14f084ed82f6c5342c75c9b9e4f71414aaf1781a04a35eb\",\"urlCount\":2,\"maximumExposure\":{\"tokens\":200,\"indexer\":0,\"checker\":0}}",
+      "quoteFingerprint": "4711e012df8a058581ac538f09dcbfa21cc3f16c8042751d4e259da01097d664",
+      "authorizationCanonical": "{\"quoteFingerprint\":\"4711e012df8a058581ac538f09dcbfa21cc3f16c8042751d4e259da01097d664\",\"policyDigest\":\"9ad20a971566a52cf76bcee1869c825a52fccd7f6e9bcd7aa3616deb7bbc1bfa\",\"credentialFingerprint\":\"2c1974e09144d5748655dd22e0af7386714d708c14738943f8ce7382d6eb319c\",\"budgetScope\":\"ic01-legacy-scope\",\"periodId\":\"utc-day:2026-10-20\",\"periodStartMs\":1792454400000}",
+      "authorizationFingerprint": "ef441f65a583b3dd8d30a708a3a3311ea0203cf8856a936dde3d4a5314d16b0e",
+      "storedState": "accepted",
+      "providerTaskId": "  opaque /白🦊?%2f  "
+    },
+    {
+      "label": "yandex legacy unknown",
+      "input": {
+        "mode": "submit",
+        "searchEngine": "yandex",
+        "requestId": "ic01-legacy-yandex",
+        "urls": [
+          "https://example.test/yandex/",
+          "http://example.test/%2F?q=2&q=1"
+        ]
+      },
+      "bodyCanonical": "{\"urls\":[\"https://example.test/yandex/\",\"http://example.test/%2F?q=2&q=1\"]}",
+      "payloadDigest": "2e3e323c5a3fab53a3c7f1c55447c4ba64eacb637de2e43afbc74a4d89b98e57",
+      "providerBodyBytes": 75,
+      "quoteCanonical": "{\"version\":\"speedyindex-indexing-batch-2026-10-20-v1\",\"family\":\"yandex/indexer\",\"providerRoute\":\"/v2/task/yandex/indexer/create\",\"payloadDigest\":\"2e3e323c5a3fab53a3c7f1c55447c4ba64eacb637de2e43afbc74a4d89b98e57\",\"urlCount\":2,\"maximumExposure\":{\"tokens\":40,\"indexer\":2,\"checker\":0}}",
+      "quoteFingerprint": "b882d8c2f7bdfa4d4239fbccff3cf0ca189ea692af6746ba73336b617e9d91af",
+      "authorizationCanonical": "{\"quoteFingerprint\":\"b882d8c2f7bdfa4d4239fbccff3cf0ca189ea692af6746ba73336b617e9d91af\",\"policyDigest\":\"9ad20a971566a52cf76bcee1869c825a52fccd7f6e9bcd7aa3616deb7bbc1bfa\",\"credentialFingerprint\":\"2c1974e09144d5748655dd22e0af7386714d708c14738943f8ce7382d6eb319c\",\"budgetScope\":\"ic01-legacy-scope\",\"periodId\":\"utc-day:2026-10-20\",\"periodStartMs\":1792454400000}",
+      "authorizationFingerprint": "555050d905fbe497aa921cc27913a48694f64b21dfd88b3df3af97d1d64a510a",
+      "storedState": "unknown",
+      "providerTaskId": null
+    }
+  ]
+}

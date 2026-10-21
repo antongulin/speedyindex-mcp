@@ -1,6 +1,6 @@
 # Implementation plan
 
-The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_task_status`, `get_task_report`, and guarded `create_indexing_task`. The other seven tools remain planned and unimplemented. No package or release is published.
+The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_task_status`, `get_task_report`, `create_indexing_task`, and guarded `create_index_check`. The other six tools remain planned and unimplemented. No package or release is published.
 
 | Order       | Planned tool            | Intended scope                                       |
 | ----------- | ----------------------- | ---------------------------------------------------- |
@@ -9,7 +9,7 @@ The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_tas
 | Implemented | `get_task_status`       | Read existing task status by family and task ID      |
 | Implemented | `get_task_report`       | Read one report; one bounded backlink page           |
 | Implemented | `create_indexing_task`  | Pure preview; explicitly configured guarded indexing |
-| Later       | `create_index_check`    | Submit an index-status check                         |
+| Implemented | `create_index_check`    | Reservation preview; explicitly opted-in index check |
 | Later       | `create_backlink_check` | Submit a backlink check                              |
 | Later       | `plan_retry`            | Prepare a retry proposal without submitting it       |
 | Later       | `submit_retry`          | Submit an explicitly approved retry                  |
@@ -17,7 +17,9 @@ The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_tas
 | Later       | `summarize_campaigns`   | Summarize related task outcomes                      |
 | Later       | `get_retry_history`     | Inspect recorded retry activity                      |
 
-The current runtime exposes all five implemented tools. Writes are disabled by default. Operators explicitly choose private policy/state paths, expected key binding and finite independent token/indexer/checker caps; no active configuration is selected here. Startup/preview never open state, and only the local new-only init command creates it. See [README.md](../README.md) for setup and [architecture](architecture.md) for validation, cancellation and persistence boundaries. Synthetic HTTP, real SQLite/process tests and SDK source/built journeys exercise these contracts without live provider calls.
+The current runtime exposes all six implemented tools. Writes are disabled by default. Operators explicitly choose private policy/state paths, expected key binding and finite independent token/indexer/checker caps; no active configuration is selected here. Startup/preview never open state, and only the local new-only init command creates it. See [README.md](../README.md) for setup and [architecture](architecture.md) for validation, cancellation and persistence boundaries. Synthetic HTTP, real SQLite/process tests and SDK source/built journeys exercise these contracts without live provider calls.
+
+Index checks additionally require explicit permission and a private per-engine three-unit reservation profile. Missing profiles produce unpriced previews and block submission. Operator reservations are not provider fees; no actual prices, caps or activation values are selected here. Both create tools share the same host guard and V1 store.
 
 Standalone create uses immutable policy snapshots, UTC reservation periods, local request replay and retained uncertain holds. It does not supply provider idempotency, human authentication or campaign/parent lineage. Later tools need their own action boundaries and source/eligibility proof. An additive V2 relation table and explicit offline migration must preserve all V1 records, events, holds and dispatch ownership, leave unattributed legacy rows unknown, and insert new relations with preparation atomically. No V2 schema, migration or retry API is implemented; never reset V1 state to add lineage.
 

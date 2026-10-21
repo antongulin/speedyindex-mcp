@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { balanceResultSchema, listTasksResultSchema } from '../src/client';
 import { createIndexingTaskResultSchema } from '../src/create-indexing-task';
+import { createIndexCheckResultSchema } from '../src/create-index-check';
 import { taskStatusResultSchema } from '../src/task-status';
 import { taskReportOutputSchema } from '../src/task-report';
 import { account, bounded, connect, dummyKey, fixture } from './helpers';
@@ -81,6 +82,7 @@ test('LT-08: built CLI registers and calls all four read-only tools', async () =
       'get_task_status',
       'get_task_report',
       'create_indexing_task',
+      'create_index_check',
     ]);
     const result = await session.client.callTool({
       name: 'get_balance',
@@ -205,14 +207,19 @@ async function withBuiltSubmission(
             ? {
                 code: 0,
                 task_id: ' opaque built provider ID /? ',
-                type: 'google/indexer',
-                pay_per_indexed: true,
-                drip_feed: false,
+                type: req.url?.includes('/checker/')
+                  ? 'bing/checker'
+                  : 'google/indexer',
+                ...(req.url?.includes('/checker/')
+                  ? {}
+                  : { pay_per_indexed: true, drip_feed: false }),
               }
             : {
                 code: 0,
                 result: { task_id: 'nested-id-is-not-an-ack' },
-                type: 'google/indexer',
+                type: req.url?.includes('/checker/')
+                  ? 'bing/checker'
+                  : 'google/indexer',
                 message: 'private-provider-diagnostic',
               },
         ),
@@ -306,7 +313,7 @@ async function withBuiltSubmission(
   if (failures.length) throw failures[0];
 }
 
-test('C15 BUILT: five-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
+test('C15 BUILT: six-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
   await withBuiltSubmission(async (h) => {
     const session = await h.open([], '');
     const { tools } = await bounded(session.client.listTools());
@@ -316,7 +323,111 @@ test('C15 BUILT: five-tool schemas, paid annotations, no-key preview, disabled s
       'get_task_status',
       'get_task_report',
       'create_indexing_task',
+      'create_index_check',
     ]);
+    const checker = tools[5]!;
+    expect(checker.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+    expect(checker.inputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['mode', 'searchEngine', 'urls'],
+      properties: {
+        mode: { type: 'string', enum: ['preview', 'submit'] },
+        searchEngine: { type: 'string', enum: ['google', 'yandex', 'bing'] },
+      },
+    });
+    expect(checker.outputSchema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        quote: {
+          oneOf: expect.arrayContaining([
+            expect.objectContaining({
+              properties: expect.objectContaining({
+                availability: { type: 'string', const: 'available' },
+                reservation: expect.any(Object),
+                fingerprint: expect.any(Object),
+              }),
+            }),
+            expect.objectContaining({
+              properties: expect.objectContaining({
+                availability: { type: 'string', const: 'unavailable' },
+                reason: expect.any(Object),
+              }),
+            }),
+          ]),
+        },
+      },
+    });
+    for (const searchEngine of ['google', 'yandex', 'bing']) {
+      const arguments_ = {
+        mode: 'preview',
+        searchEngine,
+        urls: ['https://example.test/unpriced'],
+      };
+      for (const mode of ['preview', 'submit']) {
+        const value = await session.client.callTool({
+          name: 'create_index_check',
+          arguments: {
+            ...arguments_,
+            mode,
+            ...(mode === 'submit' ? { requestId: 'disabled-check' } : {}),
+          },
+        });
+        const parsed = createIndexCheckResultSchema.parse(
+          value.structuredContent,
+        );
+        expect(value.content).toEqual([
+          { type: 'text', text: JSON.stringify(parsed) },
+        ]);
+        expect(value.isError).toBe(mode === 'submit');
+        expect(parsed.status).toBe(mode === 'preview' ? 'preview' : 'blocked');
+        if (mode === 'preview') {
+          expect(parsed.authorization).toEqual({
+            state: 'unconfigured',
+            stateChecked: false,
+          });
+          expect(parsed.quote).toMatchObject({
+            availability: 'unavailable',
+            providerFeesKnown: false,
+          });
+          expect(parsed.quote).not.toHaveProperty('reservation');
+          expect(parsed.quote).not.toHaveProperty('fingerprint');
+        } else expect(parsed.error?.code).toBe('WritesDisabled');
+      }
+    }
+    for (const arguments_ of [
+      { searchEngine: 'bing', urls: ['https://example.test/a'] },
+      {
+        mode: 'submit',
+        searchEngine: 'bing',
+        urls: ['https://example.test/a'],
+      },
+      {
+        mode: 'preview',
+        searchEngine: 'google',
+        urls: ['https://example.test/a'],
+        payPerIndexed: false,
+      },
+      {
+        mode: 'preview',
+        searchEngine: 'bing',
+        urls: ['https://example.test/a'],
+        indexCheckReservations: {},
+      },
+    ]) {
+      const value = await session.client.callTool({
+        name: 'create_index_check',
+        arguments: arguments_,
+      });
+      expect(value.isError).toBe(true);
+      expect(value.structuredContent).toBeUndefined();
+    }
     const create = tools[4]!;
     expect(create.annotations).toEqual({
       readOnlyHint: false,
@@ -377,7 +488,7 @@ test('C15 BUILT: five-tool schemas, paid annotations, no-key preview, disabled s
     expect(blocked.isError).toBe(true);
     expect(parsedBlocked.status).toBe('blocked');
     expect(parsedBlocked.error).toEqual({
-      code: 'WritesDisabled',
+      code: 'WritesDisabled' as const,
       message: 'Indexing submissions are disabled.',
     });
     expect(blocked.content).toEqual([
@@ -436,7 +547,7 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
       JSON.stringify({
         version: 1,
         enabled: true,
-        mode: 'caller_acknowledgement',
+        mode: 'operator_policy',
         policyRevision: 'synthetic-built-v1',
         budgetScope: 'synthetic-built-scope',
         credentialFingerprint: expectedFingerprint,
@@ -452,7 +563,7 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
       state,
     ];
     let session = await h.open(args);
-    expect((await bounded(session.client.listTools())).tools).toHaveLength(5);
+    expect((await bounded(session.client.listTools())).tools).toHaveLength(6);
     async function call(input: Record<string, unknown>) {
       const result = await bounded(
         session.client.callTool({
@@ -491,18 +602,13 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
     const preview = await call({ ...input, mode: 'preview' });
     expect(preview.authorization).toMatchObject({
       state: 'configured',
-      mode: 'caller_acknowledgement',
+      mode: 'operator_policy',
       stateChecked: false,
     });
-    const acknowledgement = {
-      quoteFingerprint: preview.quote!.fingerprint,
-      authorizationFingerprint: preview.authorization!.fingerprint!,
-    };
     const submit = {
       ...input,
       mode: 'submit',
       requestId: 'built-accepted',
-      acknowledgement,
     };
     const accepted = await call(submit);
     expect(accepted.status).toBe('accepted');
@@ -557,15 +663,10 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
       searchEngine: 'google',
       urls: ['https://built.test/malformed-ack'],
     };
-    const malformedPreview = await call({ ...malformedInput, mode: 'preview' });
     const malformedSubmit = {
       ...malformedInput,
       mode: 'submit',
       requestId: 'built-malformed-ack',
-      acknowledgement: {
-        quoteFingerprint: malformedPreview.quote!.fingerprint,
-        authorizationFingerprint: malformedPreview.authorization!.fingerprint!,
-      },
     };
     const malformed = await call(malformedSubmit);
     expect(malformed.status).toBe('unknown');
@@ -655,5 +756,218 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
     console.log(
       'C15 BUILT evidence: accepted v2, fresh replay, bad ack absent, malformed ACK unknown v2, six durable events, two exact POSTs; overlap/replays sent nothing.',
     );
+  });
+}, 30_000);
+
+test('IC10 BUILT: Bing reservation preview, one POST, no-ACK restart replay, malformed hold and private policy gates', async () => {
+  await withBuiltSubmission(async (h) => {
+    const state = join(h.root, 'checker-state');
+    expect((await h.local(['--init-submission-state', state])).code).toBe(0);
+    const fingerprint = createHash('sha256')
+      .update(`speedyindex-credential-v1\0${dummyKey}`)
+      .digest('hex');
+    const vector = { tokens: 7, indexer: 5, checker: 11 }; // Synthetic reservation, not fees.
+    const policyPath = join(h.root, 'checker-policy.json');
+    const policy = {
+      version: 1,
+      enabled: true,
+      mode: 'operator_policy',
+      policyRevision: 'synthetic-built-checker',
+      budgetScope: 'synthetic-built-checker',
+      credentialFingerprint: fingerprint,
+      period: { kind: 'utc_day' },
+      caps: { tokens: 1000, indexer: 1000, checker: 1000 },
+      allowIndexChecks: true,
+      indexCheckReservations: { bing: vector },
+    };
+    const writePolicy = (value: unknown) =>
+      writeFileSync(policyPath, JSON.stringify(value), { mode: 0o600 });
+    writePolicy(policy);
+    const args = [
+      '--submission-policy',
+      policyPath,
+      '--submission-state',
+      state,
+    ];
+    let session = await h.open(args);
+    const call = async (arguments_: Record<string, unknown>) => {
+      const result = await bounded(
+        session.client.callTool({
+          name: 'create_index_check',
+          arguments: arguments_,
+        }),
+      );
+      const parsed = createIndexCheckResultSchema.parse(
+        result.structuredContent,
+      );
+      expect(result.content).toEqual([
+        { type: 'text', text: JSON.stringify(parsed) },
+      ]);
+      expect(result.isError).toBe(
+        !['preview', 'accepted'].includes(parsed.status),
+      );
+      for (const secret of [
+        dummyKey,
+        fingerprint,
+        h.root,
+        'private-provider-diagnostic',
+        'nested-id-is-not-an-ack',
+      ])
+        expect(JSON.stringify(result)).not.toContain(secret);
+      return parsed;
+    };
+    const input = {
+      searchEngine: 'bing',
+      urls: ['HTTPS://Built.TEST/%2f?b=2&a=1#Part'],
+      title: '  synthetic Bing  ',
+    };
+    const preview = await call({ ...input, mode: 'preview' });
+    expect(preview.quote).toMatchObject({
+      availability: 'available',
+      basis: 'operator_configured_reservation',
+      providerEnforced: false,
+      providerFeesKnown: false,
+      perUrlReservation: vector,
+      reservation: vector,
+    });
+    expect(h.receipts).toEqual([]);
+    const submit = {
+      ...input,
+      mode: 'submit',
+      requestId: 'built-checker-accepted',
+    };
+    // Real CLI clock: operator policy deliberately omits acknowledgement on new work and replay.
+    const accepted = await call(submit);
+    expect(accepted.status).toBe('accepted');
+    expect(accepted.intent).toMatchObject({
+      state: 'accepted',
+      stateVersion: 2,
+      providerType: 'bing/checker',
+      reservation: vector,
+    });
+    expect(accepted.observation).toEqual({
+      kind: 'accepted_ack',
+      recorded: true,
+      taskId: ' opaque built provider ID /? ',
+      type: 'bing/checker',
+    });
+    expect(h.receipts).toEqual([
+      {
+        body: '{"title":"  synthetic Bing  ","urls":["HTTPS://Built.TEST/%2f?b=2&a=1#Part"]}',
+        contentType: 'application/json',
+        accept: 'application/json',
+      },
+    ]);
+    expect(session.stderr()).toBe('');
+    await session.close();
+    session = await h.open(args);
+    const replay = await call(submit);
+    expect(replay.replayed).toBe(true);
+    expect(replay.intent).toEqual(accepted.intent);
+    expect(replay.observation).toBeUndefined();
+    expect(h.receipts).toHaveLength(1);
+    const malformedInput = {
+      mode: 'submit',
+      searchEngine: 'bing',
+      requestId: 'built-checker-unknown',
+      urls: ['https://built.test/checker-unknown'],
+    };
+    const unknown = await call(malformedInput);
+    expect(unknown.status).toBe('unknown');
+    expect(unknown.observation).toEqual({
+      kind: 'ambiguous',
+      cause: 'invalid_ack',
+      recorded: true,
+    });
+    expect(unknown.intent?.reservation).toEqual(vector);
+    expect((await call(malformedInput)).replayed).toBe(true);
+    expect(
+      (await call({ ...malformedInput, requestId: 'built-checker-overlap' }))
+        .error?.code,
+    ).toBe('UrlOverlap');
+    expect(session.stderr()).toBe('');
+    await session.close();
+    for (const variant of [
+      {
+        policy: { ...policy, indexCheckReservations: {} },
+        code: 'ReservationProfileRequired' as const,
+      },
+      {
+        policy: { ...policy, allowIndexChecks: false },
+        code: 'WritesDisabled' as const,
+      },
+    ]) {
+      writePolicy(variant.policy);
+      session = await h.open(args);
+      const blocked = await call({
+        ...malformedInput,
+        requestId: 'built-policy-gate',
+        urls: ['https://built.test/policy-gate'],
+      });
+      expect(blocked.error?.code).toBe(variant.code);
+      expect(blocked.intent).toBeUndefined();
+      expect(session.stderr()).toBe('');
+      await session.close();
+    }
+    expect(h.receipts).toHaveLength(2);
+    expect(h.api.requests).toEqual(
+      Array.from({ length: 2 }, () => ({
+        method: 'POST',
+        path: '/v2/task/bing/checker/create',
+        auth: dummyKey,
+        agent: 'speedyindex-mcp/0.1.0',
+      })),
+    );
+    const db = new Database(
+      join(state, 'ledger.sqlite'),
+      constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_NOFOLLOW,
+    );
+    try {
+      expect(db.query('PRAGMA user_version').get()).toEqual({
+        user_version: 1,
+      });
+      expect(
+        db
+          .query(
+            'SELECT request_id,state,reserved_tokens,reserved_indexer,reserved_checker FROM intents ORDER BY request_id',
+          )
+          .all(),
+      ).toEqual([
+        {
+          request_id: 'built-checker-accepted',
+          state: 'accepted',
+          reserved_tokens: 7,
+          reserved_indexer: 5,
+          reserved_checker: 11,
+        },
+        {
+          request_id: 'built-checker-unknown',
+          state: 'unknown',
+          reserved_tokens: 7,
+          reserved_indexer: 5,
+          reserved_checker: 11,
+        },
+      ]);
+      expect(
+        db
+          .query(
+            'SELECT request_id,event_kind,state_version FROM intent_events ORDER BY request_id,state_version',
+          )
+          .all(),
+      ).toEqual(
+        ['built-checker-accepted', 'built-checker-unknown'].flatMap(
+          (request_id, i) =>
+            ['prepared', 'dispatching', i === 0 ? 'accepted' : 'unknown'].map(
+              (event_kind, state_version) => ({
+                request_id,
+                event_kind,
+                state_version,
+              }),
+            ),
+        ),
+      );
+    } finally {
+      db.close();
+    }
   });
 }, 30_000);
