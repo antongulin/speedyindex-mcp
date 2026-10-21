@@ -3300,9 +3300,61 @@ for (const fault of [
         case 'missing':
           value.parent.taskId = ' External-only ';
           break;
-        case 'cross-engine':
-          value.parent.family = 'yandex/indexer';
+        case 'cross-engine': {
+          const parentId = ' Opposite-engine-é ';
+          seedRetryParent(
+            ordinary,
+            'opposite-engine-parent',
+            parentId,
+            parentUrls,
+            'yandex/indexer',
+          );
+          expect(
+            ordinary.readIntent(binding, 'opposite-engine-parent'),
+          ).toMatchObject({
+            state: 'accepted',
+            taskFamily: 'yandex/indexer',
+            providerType: 'yandex/indexer',
+            providerTaskId: parentId,
+          });
+          const current = availableSnapshot(state);
+          const parent = current.acceptedManifests.find(
+            (row) =>
+              row.taskFamily === 'yandex/indexer' &&
+              row.providerTaskId === parentId,
+          );
+          expect(parent).toBeDefined();
+          if (!parent)
+            throw new Error('Expected accepted opposite-engine parent.');
+          expect(parent.requestId).toBe('opposite-engine-parent');
+          expect(parent.provenance).toBe('durable_local_intent_ack');
+          expect(parent.originKind).toBe('standalone');
+          expect(parent.submittedUrls).toEqual(parentUrls);
+          expect(parent.manifestDigest).toBe(
+            hash(
+              'speedyindex-intent-url-manifest-v1\0' +
+                JSON.stringify(['yandex/indexer', parentUrls]),
+            ),
+          );
+          expect(current.ambiguousProviderRefs).toEqual([]);
+          expect(current.retryChildren).toEqual([]);
+          expect(current.holds).toEqual([]);
+          value.parent = { family: 'yandex/indexer', taskId: parentId };
+          value.sourceManifestDigest = parent.manifestDigest;
+          value.intent.submittedUrls = parent.submittedUrls.slice(0, 2);
+          expect(value.intent.submittedUrls).toEqual(parentUrls.slice(0, 2));
+          expect(
+            value.intent.submittedUrls.every((url) =>
+              parent.submittedUrls.includes(url),
+            ),
+          ).toBe(true);
+          expect(value.intent.taskFamily).toBe('google/indexer');
+          expect(value.intent.providerRoute).toBe(
+            '/v2/task/google/indexer/create',
+          );
+          value.expectedRevision = current.revision;
           break;
+        }
         case 'digest':
           value.sourceManifestDigest = hash('supplied-external-digest');
           break;
