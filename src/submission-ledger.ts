@@ -28,6 +28,8 @@ import {
   snapshotLimits,
   SnapshotReadError,
   type RetrySnapshot,
+  type AvailableRetrySnapshot,
+  type SnapshotLimits,
   type SnapshotReadHooks,
   type SnapshotUnavailableReason,
 } from './retry-ledger-snapshot';
@@ -489,6 +491,17 @@ function validateStateVersion(value: unknown): asserts value is number {
     fail('InvalidLedgerInput');
 }
 
+function validateRetryParent(
+  value: unknown,
+): asserts value is PrepareRetryIntentInput['parent'] {
+  requireKeys(value, ['family', 'taskId']);
+  if (
+    (value.family !== 'google/indexer' && value.family !== 'yandex/indexer') ||
+    !providerTaskIdSchema.safeParse(value.taskId).success
+  )
+    fail('InvalidLedgerInput');
+}
+
 function validateRetryInput(
   value: unknown,
 ): asserts value is PrepareRetryIntentInput {
@@ -505,13 +518,7 @@ function validateRetryInput(
     value.intent.taskFamily !== 'yandex/indexer'
   )
     fail('InvalidLedgerInput');
-  requireKeys(value.parent, ['family', 'taskId']);
-  if (
-    (value.parent.family !== 'google/indexer' &&
-      value.parent.family !== 'yandex/indexer') ||
-    !providerTaskIdSchema.safeParse(value.parent.taskId).success
-  )
-    fail('InvalidLedgerInput');
+  validateRetryParent(value.parent);
   requireDigest(value.sourceManifestDigest);
   requireDigest(value.planFingerprint);
   requireDigest(value.expectedRevision);
@@ -1028,11 +1035,7 @@ interface PeriodIdRow {
   period_id: string;
 }
 
-function validateAndRecordPeriod(
-  database: Database,
-  budget: TrustedBudgetContext,
-  now: number,
-) {
+function validatePeriod(database: Database, budget: TrustedBudgetContext) {
   const existingId = database
     .query(
       `SELECT CAST(period_start_ms AS TEXT) AS period_start_text
@@ -1091,7 +1094,15 @@ function validateAndRecordPeriod(
     fail('StalePeriodContext');
   }
 
-  if (existingId === null) {
+  return existingId === null;
+}
+
+function validateAndRecordPeriod(
+  database: Database,
+  budget: TrustedBudgetContext,
+  now: number,
+) {
+  if (validatePeriod(database, budget)) {
     database
       .query(
         `INSERT INTO budget_periods
@@ -1270,6 +1281,41 @@ function isExactReplay(
   );
 }
 
+interface IntentContextRow {
+  origin_kind: string;
+  parent_family: string | null;
+  parent_task_id: string | null;
+  source_manifest_digest: string | null;
+  plan_fingerprint: string | null;
+}
+function selectIntentContext(
+  database: Database,
+  binding: string,
+  requestId: string,
+) {
+  const context = database
+    .query(
+      `SELECT origin_kind, parent_family, parent_task_id,
+    source_manifest_digest, plan_fingerprint FROM intent_context
+    WHERE credential_fp = ? AND request_id = ?`,
+    )
+    .get(binding, requestId) as IntentContextRow | null;
+  if (!context) fail('LedgerUnavailable');
+  return context;
+}
+function isExactRetryContext(
+  context: IntentContextRow,
+  retry: RetryReplayIdentity,
+): boolean {
+  return (
+    context.origin_kind === 'retry' &&
+    context.parent_family === retry.parent.family &&
+    context.parent_task_id === retry.parent.taskId &&
+    context.source_manifest_digest === retry.sourceManifestDigest &&
+    context.plan_fingerprint === retry.planFingerprint
+  );
+}
+
 interface UsageRow {
   tokens_text: string;
   indexer_text: string;
@@ -1404,27 +1450,13 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
         );
         if (existing) {
           if (this.openedSchema.version === 2) {
-            const context = this.database
-              .query(
-                `SELECT origin_kind, parent_family, parent_task_id, source_manifest_digest, plan_fingerprint FROM intent_context
-              WHERE credential_fp = ? AND request_id = ?`,
-              )
-              .get(input.budget.credentialFingerprint, input.requestId) as {
-              origin_kind: string;
-              parent_family: string | null;
-              parent_task_id: string | null;
-              source_manifest_digest: string | null;
-              plan_fingerprint: string | null;
-            } | null;
-            if (!context) fail('LedgerUnavailable');
+            const context = selectIntentContext(
+              this.database,
+              input.budget.credentialFingerprint,
+              input.requestId,
+            );
             if (retry) {
-              if (
-                context.origin_kind !== 'retry' ||
-                context.parent_family !== retry.parent.family ||
-                context.parent_task_id !== retry.parent.taskId ||
-                context.source_manifest_digest !== retry.sourceManifestDigest ||
-                context.plan_fingerprint !== retry.planFingerprint
-              )
+              if (!isExactRetryContext(context, retry))
                 fail('RequestIdConflict');
             } else if (context.origin_kind === 'retry')
               fail('RequestIdConflict');
@@ -2039,15 +2071,271 @@ function openLocalLedger(
   }
 }
 
-// Trusted internal semantic reader. SQLite may update physical WAL bookkeeping;
-// query_only and a single read transaction prohibit logical ledger mutation.
+export type RetryReadUnavailable = Readonly<{
+  availability: 'unavailable';
+  reason: SnapshotUnavailableReason;
+}>;
+export interface RetryPlanningInput {
+  intent: PrepareIntentInput;
+  parent: { family: RetryFamily; taskId: string };
+  maxAttemptsPerSource: number;
+}
+export interface RetryPlanningReadHooks extends SnapshotReadHooks {
+  // Trusted fixture clock only; no CLI, environment or MCP clock selector.
+  now?: () => number;
+}
+export interface RetryPlanningState {
+  readonly availability: 'available';
+  readonly snapshot: AvailableRetrySnapshot;
+  readonly decision: {
+    readonly periodCompatible: boolean;
+    readonly usage: Readonly<Record<Unit, string>>;
+    readonly withinCaps: Readonly<Record<Unit, boolean>>;
+    readonly attempts: Readonly<{
+      count: number;
+      limit: number;
+      canCreate: boolean;
+    }>;
+  };
+}
+// Original V1 identity and stored retry context are comparison data only.
+// Current revision, caps and period are intentionally not replay preconditions.
+export type RetryReplayIdentity = Omit<
+  PrepareRetryIntentInput,
+  'expectedRevision'
+>;
+export type RetryReplayResult =
+  | RetryReadUnavailable
+  | Readonly<{
+      availability: 'available';
+      kind: 'missing' | 'conflict';
+    }>
+  | Readonly<{
+      availability: 'available';
+      kind: 'replay';
+      intent: Omit<IntentView, 'credentialFingerprint'>;
+    }>;
+
 export function readRetrySnapshot(
   options: LedgerPathOptions,
   credentialFingerprint: string,
   hooks: SnapshotReadHooks = {},
 ): RetrySnapshot {
+  return guardedRetryRead(
+    options,
+    credentialFingerprint,
+    hooks,
+    (database, ledgerId, limits) => {
+      checkSnapshotBounds(database, credentialFingerprint, limits);
+      verifyV2Data(database, credentialFingerprint);
+      signalSnapshotPhase(hooks, 'before_projection');
+      return projectRetrySnapshot(
+        database,
+        credentialFingerprint,
+        ledgerId,
+        limits,
+      );
+    },
+  );
+}
+
+function currentRetryPeriod(
+  budget: TrustedBudgetContext,
+  now: number,
+): boolean {
+  if (!Number.isSafeInteger(now) || !Number.isFinite(new Date(now).getTime()))
+    throw new SnapshotReadError('ReadFailure');
+  const start = Math.floor(now / 86400000) * 86400000;
+  return (
+    budget.periodStartMs === start &&
+    budget.periodId === `utc-day:${new Date(start).toISOString().split('T')[0]}`
+  );
+}
+
+function readPlanningUsage(database: Database, budget: TrustedBudgetContext) {
+  const usage = { tokens: 0n, indexer: 0n, checker: 0n };
+  // Never SUM reservations in SQLite or decode their aggregate as a JS Number.
+  // Accepted current-period exposure plus all-period unresolved, same scope/key.
+  const rows = database.query<UsageRow, [string, string, string]>(`SELECT
+    CAST(reserved_tokens AS TEXT) AS tokens_text,
+    CAST(reserved_indexer AS TEXT) AS indexer_text,
+    CAST(reserved_checker AS TEXT) AS checker_text FROM intents
+    WHERE credential_fp = ? AND budget_scope = ? AND
+      (state IN ('prepared', 'dispatching', 'unknown') OR (state = 'accepted' AND period_id = ?))`);
+  for (const row of rows.iterate(
+    budget.credentialFingerprint,
+    budget.budgetScope,
+    budget.periodId,
+  )) {
+    for (const unit of units) {
+      const text = row[`${unit}_text`];
+      if (typeof text !== 'string' || !/^\d+$/.test(text))
+        throw new SnapshotReadError('InvalidState');
+      usage[unit] += BigInt(text);
+    }
+  }
+  return usage;
+}
+
+export function readRetryPlanningState(
+  options: LedgerPathOptions,
+  credentialFingerprint: string,
+  value: RetryPlanningInput,
+  hooks: RetryPlanningReadHooks = {},
+): RetryPlanningState | RetryReadUnavailable {
+  const now = hooks.now ?? Date.now;
+  return guardedRetryRead<RetryPlanningState>(
+    options,
+    credentialFingerprint,
+    hooks,
+    (database, ledgerId, limits) => {
+      requireKeys(value, ['intent', 'parent', 'maxAttemptsPerSource']);
+      validatePrepareInput(value.intent);
+      validateRetryParent(value.parent);
+      if (
+        value.intent.budget.credentialFingerprint !== credentialFingerprint ||
+        value.parent.family !== value.intent.taskFamily ||
+        !Number.isSafeInteger(value.maxAttemptsPerSource) ||
+        value.maxAttemptsPerSource <= 0
+      )
+        fail('InvalidLedgerInput');
+      checkSnapshotBounds(database, credentialFingerprint, limits);
+      verifyV2Data(database, credentialFingerprint);
+      signalSnapshotPhase(hooks, 'before_projection');
+      const snapshot = projectRetrySnapshot(
+        database,
+        credentialFingerprint,
+        ledgerId,
+        limits,
+      );
+      let periodCompatible = true;
+      try {
+        validatePeriod(database, value.intent.budget);
+      } catch (error) {
+        if (
+          !(error instanceof SubmissionLedgerError) ||
+          error.code !== 'StalePeriodContext'
+        )
+          throw error;
+        periodCompatible = false;
+      }
+      const usage = readPlanningUsage(database, value.intent.budget);
+      const countRow = database
+        .query<{ count: string }, [string, string, string]>(
+          `SELECT CAST(COUNT(*) AS TEXT) AS count
+      FROM intent_context WHERE credential_fp = ? AND origin_kind = 'retry'
+      AND parent_family = ? AND parent_task_id = ?`,
+        )
+        .get(credentialFingerprint, value.parent.family, value.parent.taskId);
+      if (!countRow) throw new SnapshotReadError('InvalidState');
+      const count = safeIntegerFromText(countRow.count);
+      if (count < 0 || count > limits.intents)
+        throw new SnapshotReadError('InvalidState');
+      const withinCaps = { tokens: false, indexer: false, checker: false };
+      for (const unit of units)
+        withinCaps[unit] =
+          usage[unit] + BigInt(value.intent.reservation[unit]) <=
+          BigInt(value.intent.budget.caps[unit]);
+      // Check the trusted wall clock after SQL, then again after close/identity checks.
+      const current = currentRetryPeriod(value.intent.budget, now());
+      return {
+        availability: 'available',
+        snapshot,
+        decision: {
+          periodCompatible: periodCompatible && current,
+          usage: {
+            tokens: usage.tokens.toString(),
+            indexer: usage.indexer.toString(),
+            checker: usage.checker.toString(),
+          },
+          withinCaps,
+          attempts: {
+            count,
+            limit: value.maxAttemptsPerSource,
+            canCreate: count < value.maxAttemptsPerSource,
+          },
+        },
+      };
+    },
+    (result) => {
+      const current = currentRetryPeriod(value.intent.budget, now());
+      return {
+        ...result,
+        decision: {
+          ...result.decision,
+          periodCompatible: result.decision.periodCompatible && current,
+        },
+      };
+    },
+  );
+}
+
+export function readRetryReplay(
+  options: LedgerPathOptions,
+  credentialFingerprint: string,
+  identity: RetryReplayIdentity,
+  hooks: SnapshotReadHooks = {},
+): RetryReplayResult {
+  return guardedRetryRead<Exclude<RetryReplayResult, RetryReadUnavailable>>(
+    options,
+    credentialFingerprint,
+    hooks,
+    (database) => {
+      requireKeys(identity, [
+        'intent',
+        'parent',
+        'sourceManifestDigest',
+        'planFingerprint',
+      ]);
+      validatePrepareInput(identity.intent);
+      validateRetryParent(identity.parent);
+      requireDigest(identity.sourceManifestDigest);
+      requireDigest(identity.planFingerprint);
+      if (
+        identity.intent.budget.credentialFingerprint !== credentialFingerprint
+      )
+        fail('InvalidLedgerInput');
+      // Audit history without allocating the bounded complete snapshot. In particular,
+      // unrelated large history cannot make an exact durable retry disappear.
+      verifyV2Data(database, credentialFingerprint);
+      const row = selectIntent(
+        database,
+        credentialFingerprint,
+        identity.intent.requestId,
+      );
+      if (!row) return { availability: 'available', kind: 'missing' };
+      if (
+        !isExactRetryContext(
+          selectIntentContext(
+            database,
+            credentialFingerprint,
+            identity.intent.requestId,
+          ),
+          identity,
+        ) ||
+        !isExactReplay(database, row, identity.intent)
+      )
+        return { availability: 'available', kind: 'conflict' };
+      const { credentialFingerprint: storedBinding, ...intent } =
+        rowToIntentView(row);
+      if (storedBinding !== credentialFingerprint)
+        throw new SnapshotReadError('InvalidState');
+      return { availability: 'available', kind: 'replay', intent };
+    },
+  );
+}
+
+// Trusted internal semantic reader. SQLite may update physical WAL bookkeeping;
+// query_only and a single read transaction prohibit logical ledger mutation.
+function guardedRetryRead<T>(
+  options: LedgerPathOptions,
+  credentialFingerprint: string,
+  hooks: SnapshotReadHooks,
+  read: (database: Database, ledgerId: string, limits: SnapshotLimits) => T,
+  atReturn: (result: T) => T = (result) => result,
+): T | RetryReadUnavailable {
   let database: Database | undefined;
-  let result: RetrySnapshot;
+  let result: T | RetryReadUnavailable;
   try {
     validatePathInput(options);
     requireDigest(credentialFingerprint);
@@ -2073,7 +2361,7 @@ export function readRetrySnapshot(
       directoryIdentity,
     );
     result = database
-      .transaction((): RetrySnapshot => {
+      .transaction((): T => {
         // This schema SELECT, rather than BEGIN alone, pins the read snapshot.
         const schemaBytes = database!
           .query<{ n: number }, []>(
@@ -2090,15 +2378,7 @@ export function readRetrySnapshot(
         const schema = verifySchemaShape(database!);
         if (schema.version === 1)
           throw new SnapshotReadError('UpgradeRequired');
-        checkSnapshotBounds(database!, credentialFingerprint, limits);
-        verifyV2Data(database!, credentialFingerprint);
-        signalSnapshotPhase(hooks, 'before_projection');
-        return projectRetrySnapshot(
-          database!,
-          credentialFingerprint,
-          schema.ledgerId!,
-          limits,
-        );
+        return read(database!, schema.ledgerId!, limits);
       })
       .deferred();
     assertStorageIdentity(
@@ -2116,6 +2396,7 @@ export function readRetrySnapshot(
       identity,
       directoryIdentity,
     );
+    result = atReturn(result);
   } catch (error) {
     const reason =
       error instanceof SnapshotReadError
