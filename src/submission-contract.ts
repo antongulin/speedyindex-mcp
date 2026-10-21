@@ -19,7 +19,7 @@ export const safeInteger = z
   .min(Number.MIN_SAFE_INTEGER)
   .max(Number.MAX_SAFE_INTEGER);
 export const safeNonnegativeInteger = safeInteger.nonnegative();
-function validText(value: string, maxBytes: number) {
+export function validText(value: string, maxBytes: number) {
   if (Buffer.byteLength(value, 'utf8') > maxBytes) return false;
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
@@ -92,6 +92,13 @@ export type IndexCheckReservationSource =
   | {
       readonly state: 'loaded';
       readonly profiles?: IndexCheckReservationProfiles;
+    };
+export type BacklinkCheckReservationSource =
+  | { readonly state: 'unconfigured' }
+  | { readonly state: 'invalid' }
+  | {
+      readonly state: 'loaded';
+      readonly profile?: Readonly<SubmissionUnitVector>;
     };
 
 export const submissionErrorCodeSchema = z.enum([

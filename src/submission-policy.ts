@@ -12,6 +12,7 @@ import {
 import { posix } from 'node:path';
 import { z } from 'zod';
 import type {
+  BacklinkCheckReservationSource,
   IndexCheckReservationProfiles,
   IndexCheckReservationSource,
 } from './submission-contract';
@@ -36,6 +37,9 @@ const indexCheckReservationsSchema = z.strictObject({
   yandex: indexingUnitVectorSchema.refine((v) => v.tokens >= 2).optional(),
   bing: indexingUnitVectorSchema.refine((v) => v.tokens >= 2).optional(),
 });
+const backlinkCheckReservationsSchema = indexingUnitVectorSchema.refine(
+  (v) => v.tokens >= 2,
+);
 
 export const submissionPolicySchema = z.strictObject({
   version: z.literal(1),
@@ -48,14 +52,20 @@ export const submissionPolicySchema = z.strictObject({
   caps: indexingUnitVectorSchema,
   allowIndexChecks: z.boolean().optional(),
   indexCheckReservations: indexCheckReservationsSchema.optional(),
+  allowBacklinkChecks: z.boolean().optional(),
+  backlinkCheckReservations: backlinkCheckReservationsSchema.optional(),
 });
 export type SubmissionPolicy = z.infer<typeof submissionPolicySchema>;
 type FrozenPolicy = Readonly<
-  Omit<SubmissionPolicy, 'caps' | 'period' | 'indexCheckReservations'>
+  Omit<
+    SubmissionPolicy,
+    'caps' | 'period' | 'indexCheckReservations' | 'backlinkCheckReservations'
+  >
 > & {
   readonly caps: Readonly<IndexingUnitVector>;
   readonly period: Readonly<SubmissionPolicy['period']>;
   readonly indexCheckReservations?: IndexCheckReservationProfiles | undefined;
+  readonly backlinkCheckReservations?: Readonly<IndexingUnitVector> | undefined;
 };
 export interface LoadedSubmissionPolicy {
   readonly policy: FrozenPolicy;
@@ -237,6 +247,18 @@ export function loadSubmissionPolicy(path: unknown): LoadedSubmissionPolicy {
               ),
             ),
           }),
+      ...(value.allowBacklinkChecks === undefined
+        ? {}
+        : { allowBacklinkChecks: value.allowBacklinkChecks }),
+      ...(value.backlinkCheckReservations === undefined
+        ? {}
+        : {
+            backlinkCheckReservations: Object.freeze({
+              tokens: value.backlinkCheckReservations.tokens,
+              indexer: value.backlinkCheckReservations.indexer,
+              checker: value.backlinkCheckReservations.checker,
+            }),
+          }),
     });
     return Object.freeze({
       policy,
@@ -276,6 +298,7 @@ interface InactiveConfiguration {
   readonly state: InactiveState;
   readonly error: Readonly<ReturnType<typeof createIndexingTaskError>>;
   readonly indexCheckReservationSource: IndexCheckReservationSource;
+  readonly backlinkCheckReservationSource?: BacklinkCheckReservationSource;
 }
 export interface ConfiguredSubmission {
   readonly state: 'configured';
@@ -283,6 +306,7 @@ export interface ConfiguredSubmission {
   readonly credential: Readonly<{ effectiveKey: string; fingerprint: string }>;
   readonly stateDirectory: string;
   readonly indexCheckReservationSource: IndexCheckReservationSource;
+  readonly backlinkCheckReservationSource?: BacklinkCheckReservationSource;
 }
 export type SubmissionConfiguration =
   InactiveConfiguration | ConfiguredSubmission;
@@ -296,11 +320,13 @@ function inactive(
   state: InactiveState,
   code: CreateIndexingTaskErrorCode,
   indexCheckReservationSource: IndexCheckReservationSource,
+  backlinkCheckReservationSource: BacklinkCheckReservationSource,
 ): InactiveConfiguration {
   return Object.freeze({
     state,
     error: Object.freeze(createIndexingTaskError(code)),
     indexCheckReservationSource,
+    backlinkCheckReservationSource,
   });
 }
 
@@ -313,6 +339,9 @@ export function loadSubmissionConfiguration(
   let source: IndexCheckReservationSource = Object.freeze({
     state: 'unconfigured',
   });
+  let backlinkSource: BacklinkCheckReservationSource = Object.freeze({
+    state: 'unconfigured',
+  });
   if (options.policyPath !== undefined) {
     try {
       snapshot = loadSubmissionPolicy(options.policyPath);
@@ -322,34 +351,53 @@ export function loadSubmissionConfiguration(
           ? {}
           : { profiles: snapshot.policy.indexCheckReservations }),
       });
+      backlinkSource = Object.freeze({
+        state: 'loaded',
+        ...(snapshot.policy.backlinkCheckReservations === undefined
+          ? {}
+          : { profile: snapshot.policy.backlinkCheckReservations }),
+      });
     } catch {
       source = Object.freeze({ state: 'invalid' });
+      backlinkSource = Object.freeze({ state: 'invalid' });
     }
   }
   if (options.policyPath === undefined && options.stateDirectory === undefined)
-    return inactive('unconfigured', 'WritesDisabled', source);
+    return inactive('unconfigured', 'WritesDisabled', source, backlinkSource);
   if (
     !canonicalPath(options.policyPath) ||
     !canonicalPath(options.stateDirectory)
   )
-    return inactive('invalid', 'InvalidPolicy', source);
-  if (!snapshot) return inactive('invalid', 'InvalidPolicy', source);
+    return inactive('invalid', 'InvalidPolicy', source, backlinkSource);
+  if (!snapshot)
+    return inactive('invalid', 'InvalidPolicy', source, backlinkSource);
   if (!snapshot.policy.enabled)
-    return inactive('disabled', 'WritesDisabled', source);
+    return inactive('disabled', 'WritesDisabled', source, backlinkSource);
   let credential: ConfiguredSubmission['credential'];
   try {
     credential = normalizeCredential(options.apiKey);
   } catch {
-    return inactive('credential_missing', 'MissingCredentials', source);
+    return inactive(
+      'credential_missing',
+      'MissingCredentials',
+      source,
+      backlinkSource,
+    );
   }
   if (credential.fingerprint !== snapshot.policy.credentialFingerprint)
-    return inactive('credential_mismatch', 'CredentialMismatch', source);
+    return inactive(
+      'credential_mismatch',
+      'CredentialMismatch',
+      source,
+      backlinkSource,
+    );
   return Object.freeze({
     state: 'configured',
     snapshot,
     credential,
     stateDirectory: options.stateDirectory,
     indexCheckReservationSource: source,
+    backlinkCheckReservationSource: backlinkSource,
   });
 }
 
