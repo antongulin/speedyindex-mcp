@@ -217,6 +217,8 @@ See [architecture](docs/architecture.md), [dependency decisions](docs/dependenci
 
 The other five tools remain in the [roadmap](docs/implementation-plan.md). Retry planning/submission, report comparison, campaign summaries, retry history, and deterministic one-shot orchestration or scheduling remain unimplemented. The internal V2 prerequisite provides explicit new-state initialization, offline V1 migration, coherent bounded local snapshots and guarded atomic retry admission. Snapshots cover the selected key’s local history across scopes/families, with explicit legacy gaps and ambiguous provider references. Internal admission requires a current revision and an exact unambiguous local same-engine indexer parent/manifest/subset; it supplies no provider finality, external adoption or paid authority. It adds no public tool or automatic retry. Legacy ancestry stays unknown; the full retry workflow remains separate work.
 
+Internal V2 planning inspection now reads coherent period/cap/lifetime decisions without reservations or period inserts. A separate exact replay matcher compares original stored intent and retry context without requiring a full snapshot projection or issuing a capability. These reads do not provide verified external admission, public planning/submission or one-shot activation.
+
 The optional private retry policy is a prerequisite field only. It does not deliver verified external admission, `plan_retry`, or `submit_retry`; the public runtime remains at seven tools.
 
 Licensed under [MIT](LICENSE). Documentation framework attribution is in [provenance](docs/provenance.md).

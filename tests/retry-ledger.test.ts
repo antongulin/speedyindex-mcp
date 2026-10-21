@@ -25,6 +25,11 @@ import {
   openRetryLedgerV2,
   RetryLedgerError,
   readRetrySnapshot,
+  readRetryPlanningState,
+  readRetryReplay,
+  type RetryPlanningInput,
+  type RetryReplayIdentity,
+  type IntentView,
   SubmissionLedgerError,
   type PrepareIntentInput,
   type SubmissionLedger,
@@ -2934,7 +2939,7 @@ for (const status of [
   'unknown',
   'cancelled',
 ] as const) {
-  test(`V2-07 exact retry replay in ${status} survives stale revision and reopen without minting ownership or rows`, () =>
+  test(`V2-07 P0-05 exact retry replay in ${status} survives stale revision and reopen without minting ownership or rows`, () =>
     snapshotCase((f) => {
       const { state, writer, db } = retryFixture(f);
       const value = retryInput(state);
@@ -3002,9 +3007,73 @@ for (const status of [
           expect('dispatchCapability' in replay).toBe(false);
         });
       }
+      assertNoRetryWrite(db, () => {
+        // Historical policy and budget are comparison data, independent of today's
+        // selected policy, period, caps, lifetime allowance and complete projection.
+        const identity = replayIdentity(value);
+        expect(
+          readRetryPlanningState(
+            { stateDirectory: state },
+            binding,
+            planningInput(),
+            { limits: { intents: 0 }, now: () => planningNow },
+          ),
+        ).toEqual({ availability: 'unavailable', reason: 'LimitExceeded' });
+        const replay = readRetryReplay(
+          { stateDirectory: state },
+          binding,
+          identity,
+          {
+            limits: { intents: 0 },
+          },
+        );
+        expect(replay).toEqual({
+          availability: 'available',
+          kind: 'replay',
+          intent: replayView(
+            writer.readIntent(binding, value.intent.requestId)!,
+          ),
+        });
+        const historicalBudget = structuredClone(identity);
+        historicalBudget.intent.budget.caps = {
+          tokens: 0,
+          indexer: 0,
+          checker: 0,
+        };
+        historicalBudget.intent.budget.periodId = 'expired-comparison-only';
+        historicalBudget.intent.budget.periodStartMs = 0;
+        expect(
+          readRetryReplay({ stateDirectory: state }, binding, historicalBudget),
+        ).toEqual(replay);
+        assertDeepFrozen(replay);
+        expect('dispatchCapability' in replay).toBe(false);
+        expect('outcomeToken' in replay).toBe(false);
+        const changedPolicy = structuredClone(identity);
+        changedPolicy.intent.budget.policyDigest = hash('today-policy');
+        changedPolicy.intent.budget.policyRevision = 'today';
+        expect(
+          readRetryReplay({ stateDirectory: state }, binding, changedPolicy),
+        ).toEqual({
+          availability: 'available',
+          kind: 'conflict',
+        });
+      });
       writer.close();
       const reopened = f.track(openRetryLedgerV2({ stateDirectory: state }));
       assertNoRetryWrite(db, () => {
+        const identity = replayIdentity(value);
+        const historical = readRetryReplay(
+          { stateDirectory: state },
+          binding,
+          identity,
+        );
+        expect(historical.availability).toBe('available');
+        if (
+          historical.availability !== 'available' ||
+          historical.kind !== 'replay'
+        )
+          throw new Error('Expected reopened historical replay.');
+        expect(historical.intent.state).toBe(status);
         expect(reopened.prepareRetryIntent(value).kind).toBe('replay');
         expectLedgerError(
           () => reopened.prepareIntent(value.intent),
@@ -3158,24 +3227,31 @@ const retryIdentityChanges: [
   ],
 ];
 for (const [name, change] of retryIdentityChanges) {
-  test(`V2-07 stored retry ${name} mutation is RequestIdConflict before revision or admission`, () =>
+  test(`V2-07 P0-05 stored retry ${name} mutation is RequestIdConflict before revision or admission`, () =>
     snapshotCase((f) => {
       const { state, writer, db } = retryFixture(f);
       const value = retryInput(state);
       createRetry(writer, value);
       const changed = structuredClone(value);
       change(changed);
-      assertNoRetryWrite(db, () =>
+      assertNoRetryWrite(db, () => {
         expectLedgerError(
           () => writer.prepareRetryIntent(changed),
           'RequestIdConflict',
-        ),
-      );
+        );
+        const identity = replayIdentity(changed);
+        expect(
+          readRetryReplay({ stateDirectory: state }, binding, identity),
+        ).toEqual({
+          availability: 'available',
+          kind: 'conflict',
+        });
+      });
     }));
 }
 
 for (const origin of ['standalone', 'legacy_unattributed'] as const) {
-  test(`V2-07 ${origin} request cannot acquire lineage; exact ordinary replay leaves attribution intact`, () =>
+  test(`V2-07 P0-05 ${origin} request cannot acquire lineage; exact ordinary replay leaves attribution intact`, () =>
     snapshotCase((f) => {
       const state = join(f.root, 'state');
       const ordinary = f.init(state, origin === 'standalone' ? 2 : 1);
@@ -3200,6 +3276,10 @@ for (const origin of ['standalone', 'legacy_unattributed'] as const) {
           () => writer.prepareRetryIntent(retry),
           'RequestIdConflict',
         );
+        const identity = replayIdentity(retry);
+        expect(
+          readRetryReplay({ stateDirectory: state }, binding, identity),
+        ).toEqual({ availability: 'available', kind: 'conflict' });
         expect(writer.prepareIntent(manual).kind).toBe('replay');
       });
       expect(
@@ -5066,4 +5146,435 @@ test('V2-09 process prepared cancel versus claim race has one durable winner and
           durableState: relation.state,
         }),
     );
+  }));
+
+function replayIdentity(value: PrepareRetryIntentInput): RetryReplayIdentity {
+  return {
+    intent: value.intent,
+    parent: value.parent,
+    sourceManifestDigest: value.sourceManifestDigest,
+    planFingerprint: value.planFingerprint,
+  };
+}
+function replayView(value: IntentView) {
+  const { credentialFingerprint, ...view } = value;
+  expect(credentialFingerprint).toBe(binding);
+  return view;
+}
+
+const planningNow = Date.UTC(2026, 9, 21, 12);
+function planningInput(requestId = 'planning'): RetryPlanningInput {
+  const intent = input(requestId);
+  intent.budget = {
+    ...intent.budget,
+    periodId: 'utc-day:2026-10-21',
+    periodStartMs: Date.UTC(2026, 9, 21),
+  };
+  return {
+    intent,
+    parent: { family: 'google/indexer', taskId: ' Parent-é ' },
+    maxAttemptsPerSource: 6,
+  };
+}
+function planningRead(state: string, value = planningInput(), hooks = {}) {
+  const result = readRetryPlanningState(
+    { stateDirectory: state },
+    binding,
+    value,
+    {
+      now: () => planningNow,
+      ...hooks,
+    },
+  );
+  expect(result.availability).toBe('available');
+  if (result.availability !== 'available')
+    throw new Error('Expected planning inspection.');
+  return result;
+}
+
+test('P0-03 coherent all-state lifetime counts ignore scope/policy/period but separate binding and exact parent family/ID', () =>
+  snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ordinary = f.init(state);
+    const urls = Array.from(
+      { length: 8 },
+      (_, i) => `https://example.test/read-parent/${i}`,
+    );
+    seedRetryParent(ordinary, 'read-parent', ' Parent-é ', urls);
+    const writer = f.track(openRetryLedgerV2({ stateDirectory: state }));
+    const states = [
+      'prepared',
+      'cancelled',
+      'accepted',
+      'rejected',
+      'dispatching',
+      'unknown',
+    ] as const;
+    const prepared = states.map((status, i) => {
+      const value = retryInput(state, `read-${status}`);
+      value.intent.submittedUrls = [urls[i]!];
+      value.intent.budget = {
+        ...value.intent.budget,
+        budgetScope: `scope-${i}`,
+        policyRevision: `policy-${i}`,
+        periodId: `period-${i}`,
+        periodStartMs: i,
+      };
+      return { status, value, result: createRetry(writer, value) };
+    });
+    for (const { status, value, result } of prepared) {
+      if (status === 'prepared') continue;
+      if (status === 'cancelled') {
+        writer.cancelPrepared(binding, value.intent.requestId, 0);
+        continue;
+      }
+      const claim = claimRetry(writer, result);
+      if (status !== 'dispatching')
+        writer.recordDispatchOutcome({
+          credentialFingerprint: binding,
+          requestId: value.intent.requestId,
+          expectedStateVersion: 1,
+          outcomeToken: claim.outcomeToken,
+          outcome:
+            status === 'accepted'
+              ? {
+                  kind: status,
+                  providerTaskId: 'read-child',
+                  providerType: value.intent.taskFamily,
+                }
+              : { kind: status },
+        });
+    }
+    // Controls use real independent local-parent preparation before changing
+    // their state; no fabricated external parent or provenance is introduced.
+    const db = f.raw(state);
+    // Existing unknown retry dispatch intentionally blocks fresh local preparation.
+    // Count controls therefore use distinct bindings, where that barrier is absent.
+    const otherBinding = 'b'.repeat(64);
+    seedRetryParent(
+      ordinary,
+      'other-binding-parent',
+      ' Parent-é ',
+      ['https://example.test/other-binding'],
+      'google/indexer',
+      otherBinding,
+    );
+    const otherSnapshot = availableSnapshot(state, {}, otherBinding);
+    const other = {
+      ...retryInput(state, 'other-binding-retry'),
+      expectedRevision: otherSnapshot.revision,
+      sourceManifestDigest: otherSnapshot.acceptedManifests[0]!.manifestDigest,
+    };
+    other.intent = {
+      ...other.intent,
+      submittedUrls: ['https://example.test/other-binding'],
+      budget: { ...other.intent.budget, credentialFingerprint: otherBinding },
+    };
+    createRetry(writer, other);
+    const before = snapshot(db);
+    const result = planningRead(state);
+    expect(result.snapshot.retryChildren).toHaveLength(6);
+    expect(result.decision.attempts).toEqual({
+      count: 6,
+      limit: 6,
+      canCreate: false,
+    });
+    expect(result.snapshot.holds.map((row) => row.requestId).sort()).toEqual([
+      'read-dispatching',
+      'read-prepared',
+      'read-unknown',
+    ]);
+    for (const parent of [
+      { family: 'google/indexer' as const, taskId: 'Parent-é' },
+      { family: 'yandex/indexer' as const, taskId: ' Parent-é ' },
+    ]) {
+      const value = planningInput();
+      value.parent = parent;
+      value.intent.taskFamily = parent.family;
+      value.intent.providerRoute = `/v2/task/${parent.family}/create`;
+      expect(planningRead(state, value).decision.attempts.count).toBe(0);
+    }
+    const lower = planningInput();
+    lower.maxAttemptsPerSource = 5;
+    expect(planningRead(state, lower).decision.attempts.canCreate).toBe(false);
+    const greater = planningInput();
+    greater.maxAttemptsPerSource = 7;
+    expect(planningRead(state, greater).decision.attempts.canCreate).toBe(true);
+    assertDeepFrozen(result);
+    expect(JSON.stringify(result)).not.toContain(binding);
+    expect(snapshot(db)).toEqual(before);
+  }));
+
+test('P0-03 exact three-unit usage includes current accepted and all-period unresolved in selected scope only', () =>
+  snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    const db = f.raw(state);
+    for (const [id, status, current, scope, selected] of [
+      ['old-hold', 'unknown', false, 'synthetic', binding],
+      ['old-accepted', 'accepted', false, 'synthetic', binding],
+      ['current-accepted', 'accepted', true, 'synthetic', binding],
+      ['released', 'rejected', true, 'synthetic', binding],
+      ['other-scope', 'prepared', true, 'other', binding],
+      ['other-key', 'prepared', true, 'synthetic', 'b'.repeat(64)],
+    ] as const) {
+      const value = planningInput(id).intent;
+      value.submittedUrls = [`https://example.test/${id}`];
+      value.budget.budgetScope = scope;
+      value.budget.credentialFingerprint = selected;
+      if (!current) {
+        value.budget.periodId = 'old';
+        value.budget.periodStartMs = 1000;
+      }
+      // Seed old rows before current ones, preserving monotonic stored periods.
+      seedSnapshotState(ledger, value, status, `ack-${id}`);
+    }
+    const before = snapshot(db);
+    const value = planningInput();
+    value.intent.budget.caps = { tokens: 9, indexer: 6, checker: 3 };
+    const result = planningRead(state, value);
+    expect(result.decision.usage).toEqual({
+      tokens: '6',
+      indexer: '4',
+      checker: '2',
+    });
+    expect(result.decision.withinCaps).toEqual({
+      tokens: true,
+      indexer: true,
+      checker: true,
+    });
+    for (const unit of ['tokens', 'indexer', 'checker'] as const) {
+      const lower = structuredClone(value);
+      lower.intent.budget.caps = {
+        ...value.intent.budget.caps,
+        [unit]: value.intent.budget.caps[unit] - 1,
+      };
+      expect(planningRead(state, lower).decision.withinCaps[unit]).toBe(false);
+    }
+    expect(snapshot(db)).toEqual(before);
+    // 1,025 individually safe rows exceed even SQLite's signed INTEGER SUM.
+    // Initial zero holds are legitimate local intents, never HTTP/provider calls.
+    for (let i = 0; i < 1023; i++) {
+      const extra = planningInput(`aggregate-${i}`).intent;
+      extra.submittedUrls = [`https://example.test/aggregate/${i}`];
+      extra.reservation = { tokens: 0, indexer: 0, checker: 0 };
+      extra.budget.caps = {
+        tokens: Number.MAX_SAFE_INTEGER,
+        indexer: Number.MAX_SAFE_INTEGER,
+        checker: Number.MAX_SAFE_INTEGER,
+      };
+      seedSnapshotState(ledger, extra, 'prepared');
+    }
+    db.query(
+      "UPDATE intents SET reserved_tokens=9007199254740991, reserved_indexer=9007199254740991, reserved_checker=9007199254740991 WHERE request_id IN ('old-hold','current-accepted') OR request_id LIKE 'aggregate-%'",
+    ).run();
+    const exactBefore = exactCoreRows(db);
+    expect(planningRead(state).decision.usage).toEqual({
+      tokens: '9232379236109515775',
+      indexer: '9232379236109515775',
+      checker: '9232379236109515775',
+    });
+    expect(planningRead(state).decision.withinCaps).toEqual({
+      tokens: false,
+      indexer: false,
+      checker: false,
+    });
+    expect(exactCoreRows(db)).toEqual(exactBefore);
+  }));
+
+test('P0-03 snapshot barrier commits cannot tear revision, caps or lifetime; next read sees new data', () =>
+  snapshotCase((f) => {
+    const { state, writer, db } = retryFixture(f);
+    const child = retryInput(state);
+    child.intent.budget = { ...planningInput().intent.budget };
+    const before = planningRead(state);
+    let committed = false;
+    const pinned = planningRead(state, planningInput(), {
+      onPhase(phase: string) {
+        if (phase === 'snapshot_fixed') {
+          createRetry(writer, child);
+          committed = true;
+        }
+      },
+    });
+    expect(committed).toBe(true);
+    expect(pinned.decision).toEqual(before.decision);
+    expect({
+      ...pinned.snapshot,
+      capturedAt: before.snapshot.capturedAt,
+    }).toEqual(before.snapshot);
+    const afterCommit = snapshot(db);
+    const fresh = planningRead(state);
+    expect(fresh.snapshot.revision).not.toBe(before.snapshot.revision);
+    expect(fresh.decision.attempts.count).toBe(1);
+    expect(fresh.decision.usage).toEqual({
+      tokens: '3',
+      indexer: '2',
+      checker: '1',
+    });
+    expect(snapshot(db)).toEqual(afterCommit);
+  }));
+
+test('P0-03 current UTC and stored period checks are nonmutating, including rollover before return', () =>
+  snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    const db = f.raw(state);
+    const value = planningInput();
+    const empty = snapshot(db);
+    expect(planningRead(state, value).decision.periodCompatible).toBe(true);
+    expect(snapshot(db)).toEqual(empty); // No INSERT of an unseen period.
+    const row = planningInput('stored').intent;
+    row.budget.periodId = 'wrong-stored-id';
+    seedSnapshotState(ledger, row, 'cancelled');
+    assertNoRetryWrite(db, () => {
+      expect(planningRead(state, value).decision.periodCompatible).toBe(false);
+    });
+    const clean = join(f.root, 'clean');
+    f.init(clean);
+    let now = planningNow;
+    const rollover = planningRead(clean, value, {
+      now: () => now,
+      onPhase(phase: string) {
+        if (phase === 'before_close') now += 86400000;
+      },
+    });
+    expect(rollover.decision.periodCompatible).toBe(false);
+    const stale = planningInput();
+    stale.intent.budget.periodStartMs -= 86400000;
+    stale.intent.budget.periodId = 'utc-day:2026-10-20';
+    expect(planningRead(clean, stale).decision.periodCompatible).toBe(false);
+    const future = planningInput('future').intent;
+    future.budget.periodId = 'utc-day:2026-10-22';
+    future.budget.periodStartMs += 86400000;
+    seedSnapshotState(f.open(clean), future, 'cancelled');
+    assertNoRetryWrite(f.raw(clean), () => {
+      expect(planningRead(clean).decision.periodCompatible).toBe(false);
+    });
+  }));
+
+test('P0-03/P0-05 guarded readers reject missing/V1/tampered/limited state without partial results or initialization', () =>
+  snapshotCase((f) => {
+    const missing = join(f.root, 'missing');
+    const identity = {
+      ...planningInput(),
+      sourceManifestDigest: hash('manifest'),
+      planFingerprint: hash('plan'),
+    };
+    // Replay accepts only its narrow identity, never an attempt allowance.
+    const replayIdentity = {
+      intent: identity.intent,
+      parent: identity.parent,
+      sourceManifestDigest: identity.sourceManifestDigest,
+      planFingerprint: identity.planFingerprint,
+    };
+    for (const read of [
+      (state: string) =>
+        readRetryPlanningState(
+          { stateDirectory: state },
+          binding,
+          planningInput(),
+          { now: () => planningNow },
+        ),
+      (state: string) =>
+        readRetryReplay({ stateDirectory: state }, binding, replayIdentity),
+    ]) {
+      expect(read(missing)).toEqual({
+        availability: 'unavailable',
+        reason: 'MissingState',
+      });
+      expect(existsSync(missing)).toBe(false);
+    }
+    const v1 = join(f.root, 'v1');
+    f.init(v1, 1);
+    expect(
+      readRetryPlanningState({ stateDirectory: v1 }, binding, planningInput()),
+    ).toEqual({ availability: 'unavailable', reason: 'UpgradeRequired' });
+    expect(
+      readRetryReplay({ stateDirectory: v1 }, binding, replayIdentity),
+    ).toEqual({ availability: 'unavailable', reason: 'UpgradeRequired' });
+    const state = join(f.root, 'state');
+    const ledger = f.init(state);
+    const db = f.raw(state);
+    newIntent(ledger);
+    expect(
+      readRetryPlanningState(
+        { stateDirectory: state },
+        binding,
+        planningInput(),
+        { limits: { intents: 0 } },
+      ),
+    ).toEqual({ availability: 'unavailable', reason: 'LimitExceeded' });
+    expect(
+      readRetryReplay({ stateDirectory: state }, binding, replayIdentity, {
+        limits: { intents: 0 },
+      }),
+    ).toEqual({ availability: 'available', kind: 'missing' });
+    db.run('CREATE TABLE unexpected (id INTEGER)');
+    expect(
+      readRetryPlanningState(
+        { stateDirectory: state },
+        binding,
+        planningInput(),
+      ),
+    ).toEqual({ availability: 'unavailable', reason: 'InvalidState' });
+    expect(
+      readRetryReplay({ stateDirectory: state }, binding, replayIdentity),
+    ).toEqual({ availability: 'unavailable', reason: 'InvalidState' });
+  }));
+
+test('P0-03 trusted inspection rejects mismatched binding, invalid attempt allowance and unsafe parent without writes', () =>
+  snapshotCase((f) => {
+    const state = join(f.root, 'state');
+    f.init(state);
+    const db = f.raw(state);
+    for (const change of [
+      (v: RetryPlanningInput) => {
+        v.intent.budget.credentialFingerprint = 'b'.repeat(64);
+      },
+      (v: RetryPlanningInput) => {
+        v.maxAttemptsPerSource = 0;
+      },
+      (v: RetryPlanningInput) => {
+        v.maxAttemptsPerSource = Number.MAX_SAFE_INTEGER + 1;
+      },
+      (v: RetryPlanningInput) => {
+        v.parent.family = 'yandex/indexer';
+      },
+      (v: RetryPlanningInput) => {
+        v.parent.taskId = 'bad\nparent';
+      },
+    ]) {
+      const value = planningInput();
+      change(value);
+      assertNoRetryWrite(db, () => {
+        expect(
+          readRetryPlanningState({ stateDirectory: state }, binding, value, {
+            now: () => planningNow,
+          }),
+        ).toEqual({ availability: 'unavailable', reason: 'InvalidState' });
+      });
+    }
+    assertNoRetryWrite(db, () => {
+      expect(
+        readRetryPlanningState(
+          { stateDirectory: state },
+          binding,
+          planningInput(),
+          { now: () => NaN },
+        ),
+      ).toEqual({ availability: 'unavailable', reason: 'ReadFailure' });
+    });
+    const otherBinding = 'b'.repeat(64);
+    const identity = {
+      intent: planningInput().intent,
+      parent: planningInput().parent,
+      sourceManifestDigest: hash('manifest'),
+      planFingerprint: hash('plan'),
+    };
+    assertNoRetryWrite(db, () => {
+      expect(
+        readRetryReplay({ stateDirectory: state }, otherBinding, identity),
+      ).toEqual({ availability: 'unavailable', reason: 'InvalidState' });
+    });
   }));
