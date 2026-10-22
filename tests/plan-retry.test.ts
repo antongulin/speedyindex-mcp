@@ -853,6 +853,186 @@ test('P1B-08 ordered partition and exact regular quote have independent body and
   expect('proof' in identity).toBe(false);
 });
 
+test('P1B-08 R3-9049-PURITY1 caller can revise an unindexed URL without changing an earlier comparison', () => {
+  const source = projectRetryFact(family, fields());
+  const selected = report(source);
+  const urls = selected[6] as string[];
+  urls.push(C);
+  expect(urls.pop()).toBe(C);
+  expect(urls).toEqual([A, B]);
+  const data = pass([source], selected);
+  const config = configuration();
+  const snapshot = local();
+  const first = proposal(data, snapshot, config.snapshot.policy);
+  const identity = buildRetrySemanticIdentity(
+    first,
+    final(snapshot),
+    createSubmissionContext(config, first.request.quote.fingerprint, utc),
+    snapshot,
+  );
+  expect(identity.status).toBe('comparison');
+  if (identity.status !== 'comparison') throw new Error('Comparison missing.');
+  expect(first.preimages.observation).toEqual(data);
+  expect(first.preimages.partition).toEqual([[A, B], [A, B], [], [0, null]]);
+  expect(first.partitionDigest).toBe(
+    H('speedyindex-retry-partition-v1', [[A, B], [A, B], [], [0, null]]),
+  );
+  const original = structuredClone([first, identity]);
+  const replacement = 'https://example.test/replacement';
+  urls[0] = replacement;
+  expect(urls).toEqual([replacement, B]);
+  const next = proposal(data, snapshot, config.snapshot.policy);
+  const nextIdentity = buildRetrySemanticIdentity(
+    next,
+    final(snapshot),
+    createSubmissionContext(config, next.request.quote.fingerprint, utc),
+    snapshot,
+  );
+  expect(nextIdentity.status).toBe('comparison');
+  if (nextIdentity.status !== 'comparison')
+    throw new Error('Revised comparison missing.');
+  expect(next.eligibleUrls).toEqual([replacement, B]);
+  expect(next.preimages.partition).toEqual([
+    [replacement, B],
+    [replacement, B],
+    [],
+    [0, null],
+  ]);
+  expect(JSON.parse(next.request.body).urls).toEqual([replacement, B]);
+  expect(next.request.body).not.toBe(first.request.body);
+  expect(next.partitionDigest).not.toBe(first.partitionDigest);
+  expect(next.request.quote.fingerprint).not.toBe(
+    first.request.quote.fingerprint,
+  );
+  expect(nextIdentity.fingerprint).not.toBe(identity.fingerprint);
+  expect(nextIdentity.fingerprint).toBe(
+    computeRetryPlanFingerprint(nextIdentity.preimage),
+  );
+  expect(() =>
+    (first.preimages.observation[3]![6] as string[]).push(C),
+  ).toThrow();
+  expect(() => (first.eligibleUrls as string[]).push(C)).toThrow();
+  expect([first, identity]).toEqual(original);
+});
+
+test('P1B-08 R3-9049-PURITY1 rich caller observations remain mutable while proposal data stays immutable', () => {
+  type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+  const childFields = fields('child', { size: 2, processedCount: 2 });
+  const source = projectRetryFact(
+    family,
+    fields('parent', { childTaskIds: ['child'], children: [childFields] }),
+  ) as Mutable<RetryFact>;
+  const child = projectRetryFact(family, childFields);
+  const childReport = report(child, [A], [B]);
+  const data = pass([source, child], report(source), [childReport]);
+  const roots = data[0][0]![3][0]![1] as [RetryFamily, string][];
+  const indexed = data[4][0]![5] as string[];
+  const snapshot = local({
+    acceptedManifests: [manifest('child', [A, B], family, 'retry')],
+    retryChildren: [
+      {
+        requestId: 'local-child',
+        taskFamily: family,
+        parentFamily: family,
+        parentTaskId: 'parent',
+        sourceManifestDigest: digest,
+        planFingerprint: digest,
+        state: 'accepted',
+        stateVersion: '2',
+        providerTaskId: 'child',
+      },
+    ],
+  }) as Mutable<AvailableRetrySnapshot>;
+  const config = configuration();
+  const policy = config.snapshot.policy as Mutable<SubmissionPolicy>;
+  const before = structuredClone(data);
+  source[3] = 2;
+  expect(source[3]).toBe(2);
+  source[3] = 3;
+  roots.push([family, 'temporary']);
+  expect(roots.pop()).toEqual([family, 'temporary']);
+  indexed.push(C);
+  expect(indexed.pop()).toBe(C);
+  expect(data).toEqual(before);
+  const value = proposal(data, snapshot, policy);
+  const identity = buildRetrySemanticIdentity(
+    value,
+    final(snapshot),
+    createSubmissionContext(config, value.request.quote.fingerprint, utc),
+    snapshot,
+  );
+  expect(identity.status).toBe('comparison');
+  if (identity.status !== 'comparison') throw new Error('Comparison missing.');
+  expect(value.eligibleUrls).toEqual([B]);
+  expect(value.excluded).toEqual([
+    { url: A, reasons: ['PriorRetryIndexed'], references: [[family, 'child']] },
+  ]);
+  expect(value.counts).toEqual({
+    indexed: 1,
+    unindexed: 2,
+    eligible: 1,
+    excluded: 1,
+    unknown: 0,
+  });
+  expect(value.request.body).toBe(
+    '{"urls":["https://example.test/A/?b=1&a=2"],"pay_per_indexed":true,"drip_feed":false}',
+  );
+  expect(value.request.quote.maximumExposure).toEqual({
+    tokens: 100,
+    indexer: 0,
+    checker: 0,
+  });
+  expect(value.preimages.observation).toEqual(before);
+  expect(value.safetyEvidenceDigests[0]).toBe(
+    H('speedyindex-retry-observation-safety-v1', before),
+  );
+  const original = structuredClone([value, identity]);
+  roots.push([family, 'later']);
+  source[3] = 0;
+  (source[7] as [number, string])[1] = '123';
+  (source[15] as string[]).push('later-child');
+  (source[16]![0]! as { 3: number | null })[3] = 0;
+  (data[2][0]![1] as [RetryFamily, string])[1] = 'later-child';
+  (data[3]![5] as string[])[0] = B;
+  (data[3]![6] as string[])[0] = C;
+  indexed[0] = C;
+  (data[4][0]![7] as Mutable<RetryFact>)[3] = 0;
+  (snapshot.acceptedManifests[0]!.submittedUrls as string[]).push(C);
+  policy.caps.tokens = 10001;
+  expect(roots.at(-1)).toEqual([family, 'later']);
+  expect(source[3]).toBe(0);
+  expect(source[7]![1]).toBe('123');
+  expect(source[15]).toEqual(['child', 'later-child']);
+  expect(source[16]![0]![3]).toBe(0);
+  expect(data[2][0]![1]).toEqual([family, 'later-child']);
+  expect(data[3]![5]).toEqual([B]);
+  expect(data[3]![6]).toEqual([C, B]);
+  expect(data[4][0]![5]).toEqual([C]);
+  expect(data[4][0]![7][3]).toBe(0);
+  expect(snapshot.acceptedManifests[0]!.submittedUrls).toEqual([A, B, C]);
+  expect(policy.caps.tokens).toBe(10001);
+  const returnedRoots = value.preimages.observation[0][0]![3][0]![1] as [
+    RetryFamily,
+    string,
+  ][];
+  const returnedIndexed = value.preimages.observation[4][0]![5] as string[];
+  expect(() => returnedRoots.push([family, 'tampered'])).toThrow();
+  expect(() => {
+    returnedIndexed[0] = C;
+  }).toThrow();
+  expect(() => {
+    (
+      identity.preimage.reservation as Mutable<
+        typeof identity.preimage.reservation
+      >
+    ).tokens = 0;
+  }).toThrow();
+  expect([value, identity]).toEqual(original);
+  expect(identity.fingerprint).toBe(
+    computeRetryPlanFingerprint(identity.preimage),
+  );
+});
+
 test('P1B-08 blocked identity remains immutable under caller mutations', () => {
   const value = proposal(),
     context = createSubmissionContext(

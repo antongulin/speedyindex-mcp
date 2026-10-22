@@ -897,7 +897,7 @@ export function assessRetryObservations(
       maxAttemptsPerSource: policy.retry.maxAttemptsPerSource,
     };
     assertRetryCombinedBytes(local, pass, proposal, limit);
-    return freezeSnapshot(proposal);
+    return freezeSnapshot(structuredClone(proposal));
   } catch (error) {
     if (error instanceof RetrySemanticError) return blocked(error.code);
     throw error;
