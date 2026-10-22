@@ -59,6 +59,7 @@ import {
   retryFixtureBinding,
 } from './fixtures/retry-verifier';
 import type { SubmissionPolicy } from '../src/submission-policy';
+import { submittedUrlSchema } from '../src/submission-contract';
 
 const binding = 'a'.repeat(64);
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -6234,6 +6235,165 @@ test('P0-02 R2 collect/writer mutually exclude in both directions at arrival/rel
     recovered.close();
   }));
 
+for (const failure of [
+  'abort-name',
+  'retry-typed',
+  'submission-typed',
+] as const)
+  for (const cancel of [true, false])
+    test(`P0-02-CANCEL-REJECT-SETTLEMENT-1 ${failure}, caller abort=${cancel}`, () =>
+      retryProcessCase(async (f) => {
+        const h = verifiedFixture(f);
+        const before = verifiedLogical(h.db);
+        const barrier = () => {
+          let resolve!: () => void;
+          const promise = new Promise<void>((done) => (resolve = done));
+          return { promise, resolve };
+        };
+        const arrived = barrier();
+        const abortObserved = barrier();
+        const release = barrier();
+        const settled = barrier();
+        const events: string[] = [];
+        let verifierSettled = false;
+        let outerSettled = false;
+        let mode: 'reject' | 'ok' = 'reject';
+        const composition = composeVerifiedRetryAdmission({
+          configuration: h.configuration,
+          clock: h.clock,
+          verifier: {
+            async collectAndVerify(_parent, _local, signal) {
+              if (mode === 'ok') return h.evidence;
+              const onAbort = () => {
+                events.push('abort-observed');
+                abortObserved.resolve();
+              };
+              signal!.addEventListener('abort', onAbort, { once: true });
+              try {
+                events.push('arrived');
+                arrived.resolve();
+                await release.promise;
+                events.push('reject');
+                if (failure === 'retry-typed')
+                  throw new RetryLedgerError('SnapshotConflict');
+                if (failure === 'submission-typed')
+                  throw new SubmissionLedgerError('InvalidLedgerInput');
+                const error = new Error('SENTINEL-private-verifier-failure');
+                error.name = 'AbortError';
+                throw error;
+              } finally {
+                signal!.removeEventListener('abort', onAbort);
+                verifierSettled = true;
+                events.push('verifier-settled');
+                settled.resolve();
+              }
+            },
+          },
+        });
+        const controller = new AbortController();
+        const pending = composition
+          .collect(h.selection, controller.signal)
+          .then((result) => {
+            outerSettled = true;
+            events.push('outer-settled');
+            return result;
+          });
+        try {
+          await retryProcessDeadline(arrived.promise);
+          const expectBusy = async () => {
+            expect(verifierSettled).toBe(false);
+            expect(outerSettled).toBe(false);
+            expectLedgerError(() => f.track(composition.open()), 'LedgerBusy');
+            expect(await composition.collect(h.selection)).toStrictEqual({
+              kind: 'blocked',
+              code: 'LedgerBusy',
+            });
+            expect(verifierSettled).toBe(false);
+            expect(outerSettled).toBe(false);
+          };
+          await expectBusy();
+          if (cancel) {
+            controller.abort();
+            await retryProcessDeadline(abortObserved.promise);
+            expect(controller.signal.aborted).toBe(true);
+            await expectBusy();
+          } else expect(controller.signal.aborted).toBe(false);
+          events.push('release');
+          release.resolve();
+          await retryProcessDeadline(settled.promise);
+          const result = await retryProcessDeadline(pending);
+          expect(events).toEqual([
+            'arrived',
+            ...(cancel ? ['abort-observed'] : []),
+            'release',
+            'reject',
+            'verifier-settled',
+            'outer-settled',
+          ]);
+          expect(verifierSettled).toBe(true);
+          expect(outerSettled).toBe(true);
+          expect(JSON.stringify(result)).not.toContain('SENTINEL');
+          expect(JSON.stringify(result)).not.toContain('AbortError');
+          expect(verifiedLogical(h.db)).toEqual(before);
+          mode = 'ok';
+          candidate(await composition.collect(h.selection));
+          const writer = f.track(composition.open());
+          writer.close();
+          candidate(await composition.collect(h.selection));
+          expect(verifiedLogical(h.db)).toEqual(before);
+          expect(result).toStrictEqual({
+            kind: 'blocked',
+            code: cancel
+              ? 'RetryCancelled'
+              : failure === 'retry-typed'
+                ? 'SnapshotConflict'
+                : failure === 'submission-typed'
+                  ? 'InvalidLedgerInput'
+                  : 'RetryObservationInvalid',
+          });
+        } finally {
+          release.resolve();
+          await retryProcessDeadline(pending);
+        }
+      }));
+
+for (const permission of ['absent', 'disabled'] as const)
+  test(`P0-02-CANCEL-REJECT-SETTLEMENT-1 pre-aborted ${permission} permission never invokes verifier`, () =>
+    retryProcessCase(async (f) => {
+      const h = verifiedFixture(f, {
+        retry:
+          permission === 'absent'
+            ? undefined
+            : {
+                enabled: false,
+                allowUnattributedParents: true,
+                maxAttemptsPerSource: 3,
+              },
+      });
+      let calls = 0;
+      const composition = composeVerifiedRetryAdmission({
+        configuration: h.configuration,
+        clock: h.clock,
+        verifier: {
+          async collectAndVerify() {
+            calls++;
+            throw new Error('SENTINEL-verifier-must-not-run');
+          },
+        },
+      });
+      const before = verifiedLogical(h.db);
+      const controller = new AbortController();
+      controller.abort();
+      expect(
+        await composition.collect(h.selection, controller.signal),
+      ).toStrictEqual({
+        kind: 'blocked',
+        code: 'RetryPermissionDenied',
+      });
+      expect(calls).toBe(0);
+      expect(verifiedLogical(h.db)).toEqual(before);
+    }));
+
 const reportInvalidVariants = [
   'category-order',
   'membership',
@@ -6252,7 +6412,6 @@ const reportInvalidVariants = [
   'digest-prefix',
   'partition-prefix',
   'body-limit',
-  'semantic-limit',
 ] as const;
 for (const variant of reportInvalidVariants)
   test(
@@ -6293,26 +6452,18 @@ for (const variant of reportInvalidVariants)
           e.safetyEvidenceDigests = [hash('one') + 'extra'];
         if (variant === 'partition-prefix')
           e.partitionDigest = hash('one') + 'extra';
-        if (variant === 'body-limit' || variant === 'semantic-limit') {
-          const length = variant === 'body-limit' ? 2150 : 3000;
-          const width = variant === 'body-limit' ? 1000 : 1500;
+        if (variant === 'body-limit') {
           const urls = Array.from(
-            { length },
-            (_, i) => 'https://example.test/' + i + 'x'.repeat(width),
+            { length: 2150 },
+            (_, i) => 'https://example.test/' + i + 'x'.repeat(1000),
           );
           for (const r of e.reports) {
-            r.indexedUrls = variant === 'semantic-limit' ? urls : [];
-            r.unindexedUrls =
-              variant === 'semantic-limit'
-                ? ['https://example.test/proposal']
-                : urls;
+            r.indexedUrls = [];
+            r.unindexedUrls = urls;
             r.size = r.indexedUrls.length + r.unindexedUrls.length;
             r.processedCount = r.size;
           }
-          e.eligibleUrls =
-            variant === 'semantic-limit'
-              ? ['https://example.test/proposal']
-              : urls;
+          e.eligibleUrls = urls;
         }
         const before = verifiedLogical(h.db);
         const result = await h.composition.collect(h.selection);
@@ -6322,98 +6473,191 @@ for (const variant of reportInvalidVariants)
       }),
   );
 
+// Independent whole-list byte oracle for the two near-boundary fixtures below.
+function measureRetryByteFixture(
+  evidence: ReturnType<typeof fixtureRetryEvidence>,
+) {
+  const lists = [
+    ...evidence.reports.flatMap((r) => [r.indexedUrls, r.unindexedUrls]),
+    evidence.eligibleUrls,
+  ];
+  for (const list of lists) {
+    expect(list.length).toBeLessThanOrEqual(10000);
+    expect(list.every((url) => submittedUrlSchema.safeParse(url).success)).toBe(
+      true,
+    );
+    expect(
+      list.every(
+        (url) =>
+          url.length <= 8192 && Buffer.byteLength(url, 'utf8') === url.length,
+      ),
+    ).toBe(true);
+  }
+  const normalizedReports = evidence.reports.map((report) => {
+    expect(
+      report.indexedUrls.length + report.unindexedUrls.length,
+    ).toBeLessThanOrEqual(10000);
+    const indexedUrls = [...new Set(report.indexedUrls)];
+    const unindexedUrls = [...new Set(report.unindexedUrls)];
+    expect(report.size).toBe(indexedUrls.length + unindexedUrls.length);
+    expect(report.processedCount).toBe(report.size);
+    expect(unindexedUrls.every((url) => !indexedUrls.includes(url))).toBe(true);
+    return { ...report, indexedUrls, unindexedUrls };
+  });
+  expect(normalizedReports[0]).toEqual(normalizedReports[1]);
+  expect(evidence.eligibleUrls.length).toBeGreaterThan(0);
+  expect(new Set(evidence.eligibleUrls).size).toBe(
+    evidence.eligibleUrls.length,
+  );
+  expect(
+    normalizedReports[1]!.unindexedUrls.filter((url) =>
+      evidence.eligibleUrls.includes(url),
+    ),
+  ).toEqual(evidence.eligibleUrls);
+  expect(evidence.safetyEvidenceDigests.length).toBeGreaterThanOrEqual(1);
+  expect(evidence.safetyEvidenceDigests.length).toBeLessThanOrEqual(64);
+  expect(
+    [...evidence.safetyEvidenceDigests, evidence.partitionDigest].every(
+      (digest) => /^[a-f0-9]{64}$/.test(digest),
+    ),
+  ).toBe(true);
+  const semanticBytes = (reports: unknown) =>
+    Buffer.byteLength(
+      JSON.stringify([
+        reports,
+        evidence.safetyEvidenceDigests,
+        evidence.partitionDigest,
+      ]),
+      'utf8',
+    );
+  const body = JSON.stringify({
+    urls: evidence.eligibleUrls,
+    pay_per_indexed: true,
+    drip_feed: false,
+  });
+  return {
+    // A nonempty serialized array has one extra framing byte beyond its raw charges.
+    raw: lists.reduce(
+      (sum, list) =>
+        sum +
+        (list.length ? Buffer.byteLength(JSON.stringify(list), 'utf8') - 1 : 0),
+      0,
+    ),
+    visits: lists.reduce((sum, list) => sum + list.length, 0),
+    semantic: semanticBytes(evidence.reports),
+    normalized: semanticBytes(normalizedReports),
+    body,
+    bodyBytes: Buffer.byteLength(body, 'utf8'),
+  };
+}
+
 test('P0-02-COMBINED-EVIDENCE-BODY-8M-1 isolates the shared serialized evidence and create-body ceiling', () =>
   retryProcessCase(async (f) => {
-    const eligibleUrls = Array.from(
-      { length: 200 },
-      (_, i) => 'https://example.test/eligible/' + i + '/' + 'y'.repeat(7800),
-    );
-    const makeEvidence = (indexedCount: number) => {
-      const indexedUrls = Array.from(
-        { length: indexedCount },
-        (_, i) => 'https://example.test/indexed/' + i + '/' + 'x'.repeat(7800),
-      );
+    const makeEvidence = (lastLength: number) => {
       const evidence = fixtureRetryEvidence([
-        'https://example.test/indexed/seed',
-        ...eligibleUrls,
+        'https://example.test/seed',
+        'https://example.test/proposal',
       ]);
+      const indexedUrls = Array.from({ length: 512 }, (_, i) =>
+        ('https://example.test/i/' + String(i).padStart(3, '0') + '/').padEnd(
+          i === 511 ? lastLength : 8190,
+          'x',
+        ),
+      );
       for (const report of evidence.reports) {
         report.indexedUrls = [...indexedUrls];
-        report.unindexedUrls = [...eligibleUrls];
-        report.size = indexedUrls.length + eligibleUrls.length;
-        report.processedCount = report.size;
+        report.size = report.processedCount = 513;
       }
       return evidence;
     };
-    const evidence = makeEvidence(200);
-    const h = verifiedFixture(
-      f,
-      { caps: { tokens: 100000, indexer: 1000, checker: 1000 } },
-      evidence,
-    );
+    const evidence = makeEvidence(7388);
+    const h = verifiedFixture(f, {}, evidence);
+    const before = verifiedLogical(h.db);
     const limit = 8 * 1024 * 1024;
-    const bodyLimit = 2 * 1024 * 1024;
-    const byteCounts = () => {
-      const reportEvidenceBytes = Buffer.byteLength(
-        JSON.stringify([
-          evidence.reports,
-          evidence.safetyEvidenceDigests,
-          evidence.partitionDigest,
-        ]),
-        'utf8',
-      );
-      const body = JSON.stringify({
-        urls: evidence.eligibleUrls,
-        pay_per_indexed: true,
-        drip_feed: false,
-      });
-      return {
-        reportEvidenceBytes,
-        body,
-        bodyBytes: Buffer.byteLength(body, 'utf8'),
-      };
-    };
+    for (const over of [false, true]) {
+      if (over) Object.assign(evidence, makeEvidence(7488));
+      const bytes = measureRetryByteFixture(evidence);
+      expect(
+        evidence.reports.every(
+          (r) =>
+            new Set(r.indexedUrls).size === 512 && r.unindexedUrls.length === 1,
+        ),
+      ).toBe(true);
+      expect(bytes.visits).toBe(1027);
+      expect(bytes.raw).toBe(over ? 8388324 : 8388124);
+      expect(bytes.semantic).toBe(over ? 8388567 : 8388367);
+      expect(bytes.bodyBytes).toBe(83);
+      expect(bytes.semantic + bytes.bodyBytes).toBe(over ? 8388650 : 8388450);
+      expect(bytes.raw).toBeLessThanOrEqual(limit);
+      expect(bytes.semantic).toBeLessThanOrEqual(limit);
+      expect(bytes.bodyBytes).toBeLessThanOrEqual(2 * 1024 * 1024);
+      if (over) {
+        expect(bytes.semantic + bytes.bodyBytes).toBeGreaterThan(limit);
+        expect(await h.composition.collect(h.selection)).toStrictEqual({
+          kind: 'blocked',
+          code: 'RetryObservationInvalid',
+        });
+      } else {
+        expect(bytes.semantic + bytes.bodyBytes).toBeLessThanOrEqual(limit);
+        const control = candidate(await h.composition.collect(h.selection));
+        expect(control.request.body).toBe(bytes.body);
+        expect(control.request.request.providerBodyBytes).toBe(bytes.bodyBytes);
+      }
+      expect(verifiedLogical(h.db)).toEqual(before);
+    }
+  }));
 
-    const controlBytes = byteCounts();
-    expect(
-      evidence.reports.every(
-        (report) =>
-          report.indexedUrls.length + report.unindexedUrls.length < 10000,
-      ),
-    ).toBe(true);
-    expect(controlBytes.reportEvidenceBytes).toBeLessThanOrEqual(limit);
-    expect(controlBytes.bodyBytes).toBeLessThanOrEqual(bodyLimit);
-    expect(
-      controlBytes.reportEvidenceBytes + controlBytes.bodyBytes,
-    ).toBeLessThanOrEqual(limit);
-    const beforeControl = verifiedLogical(h.db);
-    const control = candidate(await h.composition.collect(h.selection));
-    expect(control.request.body).toBe(controlBytes.body);
-    expect(control.request.request.providerBodyBytes).toBe(
-      controlBytes.bodyBytes,
-    );
-    expect(verifiedLogical(h.db)).toEqual(beforeControl);
-
-    Object.assign(evidence, makeEvidence(280));
-    const overBytes = byteCounts();
-    expect(
-      evidence.reports.every(
-        (report) =>
-          report.indexedUrls.length + report.unindexedUrls.length < 10000,
-      ),
-    ).toBe(true);
-    expect(overBytes.reportEvidenceBytes).toBeLessThanOrEqual(limit);
-    expect(overBytes.bodyBytes).toBeLessThanOrEqual(bodyLimit);
-    expect(overBytes.reportEvidenceBytes + overBytes.bodyBytes).toBeGreaterThan(
-      limit,
-    );
-    expect(overBytes.body).toBe(controlBytes.body);
-    const beforeRejectedCollection = verifiedLogical(h.db);
-    expect(await h.composition.collect(h.selection)).toStrictEqual({
-      kind: 'blocked',
-      code: 'RetryObservationInvalid',
-    });
-    expect(verifiedLogical(h.db)).toEqual(beforeRejectedCollection);
+test('P0-02-SEMANTIC-ORIGINAL-EVIDENCE-8M-1 charges repeated original reports before normalization', () =>
+  retryProcessCase(async (f) => {
+    const indexed = 'https://example.test/i/000/'.padEnd(8187, 'x');
+    const evidence = fixtureRetryEvidence([
+      indexed,
+      'https://example.test/proposal',
+    ]);
+    for (const report of evidence.reports)
+      report.indexedUrls = Array(512).fill(indexed);
+    const h = verifiedFixture(f, {}, evidence);
+    const before = verifiedLogical(h.db);
+    const limit = 8 * 1024 * 1024;
+    for (const over of [false, true]) {
+      if (over)
+        evidence.safetyEvidenceDigests = Array.from({ length: 64 }, (_, i) =>
+          hash('synthetic-fence-' + i),
+        );
+      const bytes = measureRetryByteFixture(evidence);
+      expect(
+        evidence.reports.every(
+          (r) =>
+            r.indexedUrls.length === 512 &&
+            new Set(r.indexedUrls).size === 1 &&
+            r.size === 2,
+        ),
+      ).toBe(true);
+      expect(evidence.safetyEvidenceDigests).toHaveLength(over ? 64 : 1);
+      expect(bytes.visits).toBe(1027);
+      expect(bytes.raw).toBe(8386656);
+      expect(bytes.semantic).toBe(over ? 8391112 : 8386891);
+      expect(bytes.normalized).toBe(over ? 20932 : 16711);
+      expect(bytes.bodyBytes).toBe(83);
+      expect(bytes.semantic + bytes.bodyBytes).toBe(over ? 8391195 : 8386974);
+      expect(bytes.raw).toBeLessThanOrEqual(limit);
+      expect(bytes.bodyBytes).toBeLessThanOrEqual(2 * 1024 * 1024);
+      expect(bytes.normalized + bytes.bodyBytes).toBeLessThanOrEqual(limit);
+      if (over) {
+        expect(bytes.semantic).toBeGreaterThan(limit);
+        // The semantic and aggregate bounds overlap; this catches normalized-only accounting.
+        expect(await h.composition.collect(h.selection)).toStrictEqual({
+          kind: 'blocked',
+          code: 'RetryObservationInvalid',
+        });
+      } else {
+        expect(bytes.semantic + bytes.bodyBytes).toBeLessThanOrEqual(limit);
+        const control = candidate(await h.composition.collect(h.selection));
+        expect(control.request.body).toBe(bytes.body);
+        expect(control.request.request.providerBodyBytes).toBe(bytes.bodyBytes);
+      }
+      expect(verifiedLogical(h.db)).toEqual(before);
+    }
   }));
 
 test('P0-02 matching first-unique reports retain exact category order and proposal; constructor captures mutable trusted config', () =>

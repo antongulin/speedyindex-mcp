@@ -785,7 +785,13 @@ export function composeVerifiedRetryAdmission(
           throw new RetryLedgerError('SnapshotUnavailable');
         checkTime(horizon);
         // Reader has CLOSED. There is no owned database handle across this await.
-        const raw = await verify(selection.parent, local, signal);
+        let raw: TrustedRetryEvidence;
+        try {
+          raw = await verify(selection.parent, local, signal);
+        } catch (error) {
+          if (signal?.aborted) throw new RetryLedgerError('RetryCancelled');
+          throw error;
+        }
         checkTime(horizon);
         const { evidence, semanticBytes } = copyRetryEvidence(raw);
         const source = classifyRetrySource(
