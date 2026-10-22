@@ -431,6 +431,7 @@ export interface SubmissionBudgetContext {
   readonly caps: Readonly<IndexingUnitVector>;
 }
 export interface SubmissionContext {
+  readonly quoteFingerprint: string;
   readonly budget: SubmissionBudgetContext;
   readonly authorization: Readonly<IndexingAuthorization>;
 }
@@ -492,7 +493,7 @@ export function createSubmissionContext(
   });
   if (!indexingAuthorizationSchema.safeParse(authorization).success)
     throw new CreateIndexingTaskError('StateUnavailable');
-  return Object.freeze({ budget, authorization });
+  return Object.freeze({ quoteFingerprint, budget, authorization });
 }
 
 /** Only whitelisted public fields; keys, credential fingerprints and paths stay
