@@ -6322,6 +6322,100 @@ for (const variant of reportInvalidVariants)
       }),
   );
 
+test('P0-02-COMBINED-EVIDENCE-BODY-8M-1 isolates the shared serialized evidence and create-body ceiling', () =>
+  retryProcessCase(async (f) => {
+    const eligibleUrls = Array.from(
+      { length: 200 },
+      (_, i) => 'https://example.test/eligible/' + i + '/' + 'y'.repeat(7800),
+    );
+    const makeEvidence = (indexedCount: number) => {
+      const indexedUrls = Array.from(
+        { length: indexedCount },
+        (_, i) => 'https://example.test/indexed/' + i + '/' + 'x'.repeat(7800),
+      );
+      const evidence = fixtureRetryEvidence([
+        'https://example.test/indexed/seed',
+        ...eligibleUrls,
+      ]);
+      for (const report of evidence.reports) {
+        report.indexedUrls = [...indexedUrls];
+        report.unindexedUrls = [...eligibleUrls];
+        report.size = indexedUrls.length + eligibleUrls.length;
+        report.processedCount = report.size;
+      }
+      return evidence;
+    };
+    const evidence = makeEvidence(200);
+    const h = verifiedFixture(
+      f,
+      { caps: { tokens: 100000, indexer: 1000, checker: 1000 } },
+      evidence,
+    );
+    const limit = 8 * 1024 * 1024;
+    const bodyLimit = 2 * 1024 * 1024;
+    const byteCounts = () => {
+      const reportEvidenceBytes = Buffer.byteLength(
+        JSON.stringify([
+          evidence.reports,
+          evidence.safetyEvidenceDigests,
+          evidence.partitionDigest,
+        ]),
+        'utf8',
+      );
+      const body = JSON.stringify({
+        urls: evidence.eligibleUrls,
+        pay_per_indexed: true,
+        drip_feed: false,
+      });
+      return {
+        reportEvidenceBytes,
+        body,
+        bodyBytes: Buffer.byteLength(body, 'utf8'),
+      };
+    };
+
+    const controlBytes = byteCounts();
+    expect(
+      evidence.reports.every(
+        (report) =>
+          report.indexedUrls.length + report.unindexedUrls.length < 10000,
+      ),
+    ).toBe(true);
+    expect(controlBytes.reportEvidenceBytes).toBeLessThanOrEqual(limit);
+    expect(controlBytes.bodyBytes).toBeLessThanOrEqual(bodyLimit);
+    expect(
+      controlBytes.reportEvidenceBytes + controlBytes.bodyBytes,
+    ).toBeLessThanOrEqual(limit);
+    const beforeControl = verifiedLogical(h.db);
+    const control = candidate(await h.composition.collect(h.selection));
+    expect(control.request.body).toBe(controlBytes.body);
+    expect(control.request.request.providerBodyBytes).toBe(
+      controlBytes.bodyBytes,
+    );
+    expect(verifiedLogical(h.db)).toEqual(beforeControl);
+
+    Object.assign(evidence, makeEvidence(280));
+    const overBytes = byteCounts();
+    expect(
+      evidence.reports.every(
+        (report) =>
+          report.indexedUrls.length + report.unindexedUrls.length < 10000,
+      ),
+    ).toBe(true);
+    expect(overBytes.reportEvidenceBytes).toBeLessThanOrEqual(limit);
+    expect(overBytes.bodyBytes).toBeLessThanOrEqual(bodyLimit);
+    expect(overBytes.reportEvidenceBytes + overBytes.bodyBytes).toBeGreaterThan(
+      limit,
+    );
+    expect(overBytes.body).toBe(controlBytes.body);
+    const beforeRejectedCollection = verifiedLogical(h.db);
+    expect(await h.composition.collect(h.selection)).toStrictEqual({
+      kind: 'blocked',
+      code: 'RetryObservationInvalid',
+    });
+    expect(verifiedLogical(h.db)).toEqual(beforeRejectedCollection);
+  }));
+
 test('P0-02 matching first-unique reports retain exact category order and proposal; constructor captures mutable trusted config', () =>
   retryProcessCase(async (f) => {
     const h = verifiedFixture(f);
@@ -6346,6 +6440,95 @@ test('P0-02 matching first-unique reports retain exact category order and propos
     expect(writer.prepareVerifiedRetryIntent(c.input, c.proof).kind).toBe(
       'created',
     );
+  }));
+
+test('P0-02-VERIFIED-TITLE-PROOF-1 binds Unicode titles through body identity and native proofs', () =>
+  retryProcessCase(async (f) => {
+    const h = verifiedFixture(f);
+    const firstTitle = 'München — 東京 🚀 A';
+    const secondTitle = 'München — 東京 🚀 B';
+    const first = candidate(
+      await h.composition.collect({ ...h.selection, title: firstTitle }),
+    );
+    const second = candidate(
+      await h.composition.collect({ ...h.selection, title: secondTitle }),
+    );
+    const bodyFor = (title: string) =>
+      JSON.stringify({
+        title,
+        urls: h.evidence.eligibleUrls,
+        pay_per_indexed: true,
+        drip_feed: false,
+      });
+    for (const [value, title] of [
+      [first, firstTitle],
+      [second, secondTitle],
+    ] as const) {
+      const body = bodyFor(title);
+      const digest = hash(body);
+      expect(value.request.input.title).toBe(title);
+      expect(value.request.body).toBe(body);
+      expect(value.request.request.payloadDigest).toBe(digest);
+      expect(value.request.request.providerBodyBytes).toBe(
+        Buffer.byteLength(body, 'utf8'),
+      );
+      expect(value.input.intent.payloadDigest).toBe(digest);
+      expect(value.input.intent.quoteFingerprint).toBe(
+        value.request.quote.fingerprint,
+      );
+    }
+    expect(first.input.intent.requestId).toBe(second.input.intent.requestId);
+    expect(first.input.parent).toEqual(second.input.parent);
+    expect(first.input.expectedRevision).toBe(second.input.expectedRevision);
+    expect(first.input.sourceManifestDigest).toBe(
+      second.input.sourceManifestDigest,
+    );
+    expect(first.request.request.payloadDigest).not.toBe(
+      second.request.request.payloadDigest,
+    );
+    expect(first.input.planFingerprint).not.toBe(second.input.planFingerprint);
+    expect(first.request.quote.maximumExposure).toEqual(
+      second.request.quote.maximumExposure,
+    );
+    // The builder's quote fingerprint includes payloadDigest, so the title changes it.
+    expect(first.request.quote.fingerprint).not.toBe(
+      second.request.quote.fingerprint,
+    );
+
+    const writer = verifiedWriter(f, h);
+    const beforeCrossPair = verifiedLogical(h.db);
+    expectRetryError(
+      () => writer.prepareVerifiedRetryIntent(second.input, first.proof),
+      'RetryProofInvalid',
+    );
+    expect(verifiedLogical(h.db)).toEqual(beforeCrossPair);
+
+    const prepared = writer.prepareVerifiedRetryIntent(
+      second.input,
+      second.proof,
+    );
+    expect(prepared.kind).toBe('created');
+    if (prepared.kind !== 'created') throw new Error('Missing creator.');
+    const after = verifiedLogical(h.db);
+    expect(after.intents).toHaveLength(1);
+    expect(after.contexts).toHaveLength(1);
+    expect(after.urls).toEqual(
+      h.evidence.eligibleUrls.map((url, ordinal) => ({
+        credential_fp: retryFixtureBinding,
+        request_id: h.selection.requestId,
+        ordinal,
+        url_text: url,
+      })),
+    );
+    expect(after.intents[0]).toMatchObject({
+      request_id: h.selection.requestId,
+      payload_digest: hash(bodyFor(secondTitle)),
+      quote_fingerprint: second.request.quote.fingerprint,
+    });
+    expect(after.contexts[0]).toMatchObject({
+      request_id: h.selection.requestId,
+      plan_fingerprint: second.input.planFingerprint,
+    });
   }));
 
 test('P0-02 R3 FP-INVALID-TUPLE-1 pure public tuple has a canonical oracle and rejects semantic boundary mutations', () =>
