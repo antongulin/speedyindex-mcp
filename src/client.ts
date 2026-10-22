@@ -484,6 +484,11 @@ function readJson<T>(
   return requestJson(fetchRequest, key, endpoint, options).then(normalize);
 }
 
+/** Trusted internal raw-entry hook; only budgeted indexer reports use it. */
+export interface RetryRawReportMeter {
+  chargeRawEntries(count: number): void;
+}
+
 /** One read request, no redirects or retries. The fetch seam supports tests. */
 export class SpeedyIndexClient {
   constructor(
@@ -652,10 +657,27 @@ export class SpeedyIndexClient {
     input: unknown,
     signal?: AbortSignal,
     budget?: InvocationReadBudget,
+    reportMeter?: RetryRawReportMeter,
   ) {
     const parsedInput = taskReportInputSchema.safeParse(input);
     if (!parsedInput.success) throw new TaskReportError('input');
     const args = parsedInput.data;
+    let chargeRawEntries: ((count: number) => void) | undefined;
+    if (reportMeter !== undefined) {
+      try {
+        if (
+          !budget ||
+          typeof budget.checkpoint !== 'function' ||
+          (args.family !== 'google/indexer' && args.family !== 'yandex/indexer')
+        )
+          throw new RangeError();
+        const charge = reportMeter.chargeRawEntries;
+        if (typeof charge !== 'function') throw new RangeError();
+        chargeRawEntries = charge.bind(reportMeter);
+      } catch {
+        throw new RangeError('Invalid raw report meter construction.');
+      }
+    }
     const key = this.apiKey?.trim();
     if (!key) throw new TaskReportError('credentials');
 
@@ -677,7 +699,30 @@ export class SpeedyIndexClient {
           body: JSON.stringify(requestBody),
         },
         budget,
-        (response) => normalizeTaskReport(args, response),
+        (response) => {
+          if (chargeRawEntries) {
+            const result =
+              response && typeof response === 'object'
+                ? (response as { result?: unknown }).result
+                : undefined;
+            const arrays =
+              result && typeof result === 'object'
+                ? (result as {
+                    indexed_links?: unknown;
+                    unindexed_links?: unknown;
+                  })
+                : undefined;
+            chargeRawEntries(
+              (Array.isArray(arrays?.indexed_links)
+                ? arrays.indexed_links.length
+                : 0) +
+                (Array.isArray(arrays?.unindexed_links)
+                  ? arrays.unindexed_links.length
+                  : 0),
+            );
+          }
+          return normalizeTaskReport(args, response);
+        },
       );
     } catch (error) {
       if (budget) {
