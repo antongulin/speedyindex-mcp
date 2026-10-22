@@ -9,6 +9,15 @@ import { join } from 'node:path';
 import { expect, test } from 'bun:test';
 import { SpeedyIndexClient } from '../src/client';
 import {
+  SubmissionHost,
+  type SubmissionHostOptions,
+} from '../src/submission-host';
+import type {
+  RetryPlanReady,
+  RetryProof,
+  RetryPlanFingerprintInput,
+} from '../src/submission-ledger';
+import {
   createInvocationReadBudget,
   ReadBudgetError,
   type InvocationReadBudget,
@@ -2355,4 +2364,819 @@ test('P1B-12 expiry after the first report settlement prevents any fence dispatc
       });
     },
   );
+});
+
+async function withProductionReceiver(
+  handler: Handler,
+  run: (api: Api) => Promise<void>,
+) {
+  const api = await receiver(handler);
+  let passed = false,
+    settled = false;
+  try {
+    await run(api);
+    passed = true;
+  } finally {
+    try {
+      await api.close(false);
+      settled = true;
+    } finally {
+      writeFileSync(
+        join(api.root, 'p1c-wires.json'),
+        JSON.stringify(
+          api.wires.map(({ path, method, body, ids }) => ({
+            path,
+            method,
+            body,
+            ids,
+          })),
+        ),
+      );
+      writeFileSync(
+        join(api.root, 'p1c-resource-status.json'),
+        JSON.stringify({ passed, settled, pid: process.pid }),
+      );
+      console.error(
+        'P1C_FIXTURE ' + JSON.stringify({ root: api.root, passed, settled }),
+      );
+    }
+  }
+}
+
+function p1cProjection(api: Api, config: ConfiguredSubmission, label: string) {
+  const state = logicalProjection(config);
+  writeFileSync(
+    join(api.root, `p1c-logical-${label}.json`),
+    JSON.stringify(state),
+  );
+  return state;
+}
+
+// P1C oracles spell out the synthetic wire facts and canonical hash tuple. They
+// do not call the proposal/comparison/fingerprint builders being integrated.
+function productionOracle(
+  config: ConfiguredSubmission,
+  engine: 'google' | 'yandex',
+) {
+  const family = `${engine}/indexer` as RetryFamily;
+  const local = localSnapshot(config);
+  const provenance =
+    engine === 'google' ? 'local_standalone' : 'external_unattributed';
+  const originalManifestKnown = engine === 'google';
+  const manifestProvenance = originalManifestKnown
+    ? 'durable_local_intent_ack'
+    : 'provider_report_observed_corpus';
+  const manifestDigest = originalManifestKnown
+    ? H('speedyindex-intent-url-manifest-v1', [family, [A, B, C]])
+    : H('speedyindex-provider-report-url-manifest-v1', [
+        family,
+        'parent',
+        [C, A, B],
+      ]);
+  const fact: RetryPass[1][number] = [
+    family,
+    'parent',
+    3,
+    3,
+    1,
+    true,
+    'completed',
+    [Date.parse('2026-10-01T00:00:00Z'), ''],
+    engine === 'google' ? true : null,
+    [Date.parse('2026-10-08T00:00:00Z'), ''],
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  ];
+  const pass: RetryPass = [
+    [
+      [
+        'google/indexer',
+        'regular',
+        0,
+        [[0, engine === 'google' ? [[family, 'parent']] : []]],
+      ],
+      ['google/indexer', 'drip', 0, [[0, []]]],
+      [
+        'yandex/indexer',
+        'regular',
+        0,
+        [[0, engine === 'yandex' ? [[family, 'parent']] : []]],
+      ],
+    ],
+    [fact],
+    [],
+    [family, 'parent', 3, 3, 1, [C], [A, B], fact],
+    [],
+  ];
+  const safetyEvidenceDigests = [
+    H('speedyindex-retry-observation-safety-v1', pass),
+    H('speedyindex-retry-local-safety-v1', [
+      local.revision,
+      family,
+      'parent',
+      provenance,
+      manifestDigest,
+    ]),
+  ];
+  const partitionDigest = H('speedyindex-retry-partition-v1', [
+    [A, B],
+    [A, B],
+    [],
+    [0, originalManifestKnown ? [] : null],
+  ]);
+  const body =
+    engine === 'google'
+      ? '{"urls":["https://example.test/A?b=1&a=2","https://example.test/A/?b=1&a=2"],"pay_per_indexed":true,"drip_feed":false}'
+      : '{"urls":["https://example.test/A?b=1&a=2","https://example.test/A/?b=1&a=2"]}';
+  const payloadDigest = createHash('sha256').update(body, 'utf8').digest('hex');
+  const quoteVersion = 'speedyindex-indexing-batch-2026-10-20-v1';
+  const providerRoute = `/v2/task/${family}/create` as const;
+  const reservation =
+    engine === 'google'
+      ? { tokens: 200, indexer: 0, checker: 0 }
+      : { tokens: 40, indexer: 2, checker: 0 };
+  const quoteFingerprint = H('speedyindex-create-quote-v1', {
+    version: quoteVersion,
+    family,
+    providerRoute,
+    payloadDigest,
+    urlCount: 2,
+    maximumExposure: reservation,
+  });
+  const period = {
+    id: 'utc-day:2026-10-21',
+    startMs: Date.parse('2026-10-21T00:00:00Z'),
+    endMs: Date.parse('2026-10-22T00:00:00Z'),
+  };
+  const authorizationFingerprint = H(
+    'speedyindex-submission-authorization-v1',
+    {
+      quoteFingerprint,
+      policyDigest: config.snapshot.digest,
+      credentialFingerprint: fingerprint,
+      budgetScope: config.snapshot.policy.budgetScope,
+      periodId: period.id,
+      periodStartMs: period.startMs,
+    },
+  );
+  const preimage: RetryPlanFingerprintInput = {
+    parent: { family, taskId: 'parent' },
+    provenance,
+    originalManifestKnown,
+    manifestProvenance,
+    sourceManifestDigest: manifestDigest,
+    safetyEvidenceDigests,
+    partitionDigest,
+    revision: local.revision,
+    policyDigest: config.snapshot.digest,
+    authorizationFingerprint,
+    payloadDigest,
+    quoteVersion,
+    quoteFingerprint,
+    period,
+    providerRoute,
+    urlCount: 2,
+    providerBodyBytes: Buffer.byteLength(body, 'utf8'),
+    reservation,
+  };
+  const planFingerprint = H('speedyindex-retry-plan-v1', [
+    family,
+    'parent',
+    provenance,
+    originalManifestKnown,
+    manifestProvenance,
+    manifestDigest,
+    safetyEvidenceDigests,
+    partitionDigest,
+    local.revision,
+    config.snapshot.digest,
+    authorizationFingerprint,
+    payloadDigest,
+    quoteVersion,
+    quoteFingerprint,
+    [period.id, period.startMs, period.endMs],
+    providerRoute,
+    2,
+    Buffer.byteLength(body, 'utf8'),
+    [reservation.tokens, reservation.indexer, reservation.checker],
+  ]);
+  const source: RetryPlanReady['source'] = {
+    reference: [family, 'parent'],
+    provenance,
+    originalManifestKnown,
+    manifestProvenance,
+    manifestDigest,
+  };
+  return { body, preimage, planFingerprint, source };
+}
+function expectProductionReady(
+  view: RetryPlanReady,
+  oracle: ReturnType<typeof productionOracle>,
+  config: ConfiguredSubmission,
+) {
+  expect(view.source).toEqual(oracle.source);
+  expect(view.eligibleUrls).toEqual([A, B]);
+  expect(view.excluded).toEqual([]);
+  expect(view.counts).toEqual({
+    indexed: 1,
+    unindexed: 2,
+    eligible: 2,
+    excluded: 0,
+    unknown: 0,
+  });
+  expect(view.request).toEqual({
+    family: oracle.preimage.parent.family,
+    providerRoute: `/v2/task/${oracle.preimage.parent.family}/create`,
+    payloadDigest: oracle.preimage.payloadDigest,
+    urlCount: 2,
+    providerBodyBytes: Buffer.byteLength(oracle.body),
+  });
+  expect(view.quote).toEqual({
+    version: 'speedyindex-indexing-batch-2026-10-20-v1',
+    fingerprint: oracle.preimage.quoteFingerprint,
+    maximumExposure: oracle.preimage.reservation,
+    basis: 'documented_independent_maxima',
+    providerEnforced: false,
+  });
+  expect(view.authorization).toEqual({
+    state: 'configured',
+    stateChecked: true,
+    mode: config.snapshot.policy.mode,
+    policyRevision: config.snapshot.policy.policyRevision,
+    policyDigest: config.snapshot.digest,
+    budgetScope: config.snapshot.policy.budgetScope,
+    caps: config.snapshot.policy.caps,
+    period: oracle.preimage.period,
+    fingerprint: oracle.preimage.authorizationFingerprint,
+  });
+  expect(view.identity).toEqual({
+    status: 'comparison',
+    preimage: oracle.preimage,
+    fingerprint: oracle.planFingerprint,
+  });
+  const inspect = (value: unknown) => {
+    if (!value || typeof value !== 'object') return;
+    expect(Object.isFrozen(value)).toBe(true);
+    for (const [key, item] of Object.entries(value)) {
+      expect([
+        'proof',
+        'input',
+        'body',
+        'ledgerId',
+        'stateDirectory',
+        'credential',
+        'binding',
+        'callback',
+        'preimages',
+        'observations',
+        'requestId',
+        'inspectionId',
+      ]).not.toContain(key);
+      expect(typeof item).not.toBe('function');
+      inspect(item);
+    }
+  };
+  inspect(view);
+  expect(Object.keys(view).sort()).toEqual([
+    'authorization',
+    'counts',
+    'eligibleUrls',
+    'excluded',
+    'identity',
+    'quote',
+    'request',
+    'source',
+    'status',
+  ]);
+  for (const privateValue of [
+    fixtureKey,
+    fingerprint,
+    config.stateDirectory,
+    localSnapshot(config).ledgerId,
+    'retry-read-only-inspection',
+  ])
+    expect(JSON.stringify(view)).not.toContain(privateValue);
+}
+function retryHost(
+  api: Api,
+  config: ConfiguredSubmission,
+  clock = new Clock(),
+) {
+  return new SubmissionHost(config, {
+    fetchRequest: api.fetch,
+    clock: () => clock.utcMs(),
+    retry: { monotonicMs: () => clock.monotonicMs(), runtime: clock },
+  });
+}
+function productionComposition(
+  api: Api,
+  config: ConfiguredSubmission,
+  clock = new Clock(),
+) {
+  return composeVerifiedRetryAdmission({
+    configuration: config,
+    transport: { fetch: api.fetch },
+    clock,
+    owner: { runtime: clock },
+  });
+}
+function expectProductionWires(api: Api, engine: 'google' | 'yandex') {
+  const pass = [
+    { path: '/v2/task/google/indexer/list/0', method: 'GET', body: '' },
+    {
+      path: '/v2/task/google/indexer/list/0?filter=drip_feed',
+      method: 'GET',
+      body: '',
+    },
+    { path: '/v2/task/yandex/indexer/list/0', method: 'GET', body: '' },
+    {
+      path: `/v2/task/${engine}/indexer/status`,
+      method: 'POST',
+      body: '{"task_ids":["parent"]}',
+    },
+    {
+      path: `/v2/task/${engine}/indexer/report`,
+      method: 'POST',
+      body: '{"task_id":"parent"}',
+    },
+  ];
+  expect(
+    api.wires.map(({ path, method, body }) => ({ path, method, body })),
+  ).toEqual([...pass, ...pass]);
+}
+for (const engine of ['google', 'yandex'] as const)
+  test(`P1C-01 actual host ${engine === 'google' ? 'local Google' : 'permitted external Yandex'} ready is frozen, independently identified and logically read-only`, async () => {
+    await withProductionReceiver(script(singleSource(engine)), async (api) => {
+      const config = fixtureConfiguration(api, {
+        retry: {
+          enabled: true,
+          allowUnattributedParents: engine === 'yandex',
+          maxAttemptsPerSource: 3,
+        },
+      });
+      if (engine === 'google') seedStandalone(config, 'parent', [A, B, C]);
+      const before = p1cProjection(api, config, 'before'),
+        oracle = productionOracle(config, engine);
+      const host = retryHost(api, config);
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before); // Constructor opened no state.
+      expect(api.wires).toHaveLength(0);
+      const operation = host.planRetry({ searchEngine: engine });
+      api.operations.push(operation);
+      const result = await bounded(operation);
+      expect(result.status).toBe('ready');
+      if (result.status !== 'ready')
+        throw new Error(
+          'Expected production host ready: ' + JSON.stringify(result),
+        );
+      expectProductionReady(result, oracle, config);
+      expectProductionWires(api, engine);
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+      expect(localSnapshot(config).retryChildren).toEqual([]);
+      if (engine === 'yandex')
+        expect(localSnapshot(config).acceptedManifests).toEqual([]);
+    });
+  });
+
+test('P1C-02 strict authority/preabort/inactive/binding/mixed construction reject before SQL or HTTP and retain preview', async () => {
+  await withProductionReceiver(script(singleSource()), async (api) => {
+    const config = fixtureConfiguration(api);
+    const before = p1cProjection(api, config, 'before'),
+      phases: string[] = [];
+    let opens = 0;
+    const options: SubmissionHostOptions = {
+      fetchRequest: api.fetch,
+      clock: () => utc,
+      openLedger(value) {
+        opens++;
+        return openLedger(value);
+      },
+      retry: {
+        monotonicMs: () => 100,
+        hooks: {
+          onOwnerPhase(phase) {
+            phases.push(phase);
+          },
+        },
+      },
+    };
+    const host = new SubmissionHost(config, options);
+    expect(await host.planRetry({ proof: {} })).toEqual({
+      status: 'error',
+      code: 'InvalidInput',
+    });
+    const abort = new AbortController();
+    abort.abort();
+    expect(await host.planRetry({}, abort.signal)).toEqual({
+      status: 'error',
+      code: 'Cancelled',
+    });
+    const inactive = new SubmissionHost(
+      loadSubmissionConfiguration({ apiKey: '' }),
+      options,
+    );
+    expect(await inactive.planRetry({})).toEqual({
+      status: 'blocked',
+      blockers: ['StateUnavailable'],
+    });
+    expect(
+      await inactive.createIndexingTask({
+        mode: 'preview',
+        searchEngine: 'google',
+        urls: [A],
+      }),
+    ).toMatchObject({
+      status: 'preview',
+      authorization: { state: 'unconfigured', stateChecked: false },
+    });
+    // Use the actual loader's mismatched-key result as well as a malformed trusted binding.
+    const mismatch = loadSubmissionConfiguration({
+      apiKey: 'different-synthetic-key',
+      policyPath: join(api.root, 'policy.json'),
+      stateDirectory: config.stateDirectory,
+    });
+    expect(mismatch.state).toBe('credential_mismatch');
+    expect(await new SubmissionHost(mismatch, options).planRetry({})).toEqual({
+      status: 'blocked',
+      blockers: ['StateUnavailable'],
+    });
+    const malformed = structuredClone(config);
+    (malformed.credential as { fingerprint: string }).fingerprint = '0'.repeat(
+      64,
+    );
+    expect(await new SubmissionHost(malformed, options).planRetry({})).toEqual({
+      status: 'error',
+      code: 'InternalError',
+    });
+    const mixed = {
+      configuration: config,
+      transport: { fetch: api.fetch },
+      verifier: fixtureRetryVerifier(fixtureRetryEvidence([C, A, B])),
+      clock: new Clock(),
+    };
+    expect(() => composeVerifiedRetryAdmission(mixed as never)).toThrow(
+      'Invalid submission ledger input.',
+    );
+    const composition = productionComposition(api, config);
+    expect(
+      await composition.collectLatest(
+        { binding: fingerprint },
+        'synthetic-invalid',
+      ),
+    ).toEqual({ status: 'error', code: 'InvalidInput' });
+    expect(
+      await composition.collectLatest({}, 'synthetic-preabort', abort.signal),
+    ).toEqual({ status: 'error', code: 'Cancelled' });
+    expect(phases).toEqual([]);
+    expect(opens).toBe(0);
+    expect(api.wires).toEqual([]);
+    expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+  });
+});
+for (const retry of [
+  undefined,
+  { enabled: false, allowUnattributedParents: false, maxAttemptsPerSource: 3 },
+])
+  test(`P1C-02 ${retry ? 'disabled' : 'absent'} retry preserves ordinary configured construction and preview`, async () => {
+    await withProductionReceiver(script(), async (api) => {
+      const config = fixtureConfiguration(api, { retry });
+      const before = p1cProjection(api, config, 'before'),
+        host = retryHost(api, config);
+      expect(await host.planRetry({})).toEqual({
+        status: 'blocked',
+        blockers: ['RetryPolicyRequired'],
+      });
+      expect(
+        await host.createIndexingTask({
+          mode: 'preview',
+          searchEngine: 'google',
+          urls: [A],
+        }),
+      ).toMatchObject({
+        status: 'preview',
+        authorization: { state: 'configured', stateChecked: false },
+      });
+      expect(api.wires).toEqual([]);
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+    });
+  });
+
+for (const route of ['host', 'composition'] as const)
+  test(`P1C-02 immutable ${route} capture keeps original methods, receivers, key, state and policy before and during real HTTP`, async () => {
+    const arrived = deferred(),
+      release = deferred();
+    const normal = script(singleSource('yandex'));
+    let once = false;
+    await withProductionReceiver(
+      async (wire, req, res) => {
+        if (!once) {
+          once = true;
+          arrived.resolve();
+          await release.promise;
+        }
+        return normal(wire, req, res);
+      },
+      async (api) => {
+        api.releases.push(() => release.resolve());
+        const original = fixtureConfiguration(api),
+          config = structuredClone(original),
+          clock = new Clock();
+        const before = p1cProjection(api, original, 'before'),
+          oracle = productionOracle(original, 'yandex');
+        const runtime = {
+          setTimeout(callback: () => void, delay: number) {
+            expect(this).toBe(runtime);
+            return clock.setTimeout(callback, delay);
+          },
+          clearTimeout(handle: unknown) {
+            expect(this).toBe(runtime);
+            clock.clearTimeout(handle);
+          },
+        };
+        const retry = {
+          monotonicMs() {
+            expect(this).toBe(retry);
+            return clock.mono;
+          },
+          runtime,
+        };
+        const options = {
+          fetchRequest(input: RequestInfo | URL, init?: RequestInit) {
+            expect(this).toBe(options);
+            return api.fetch(input, init);
+          },
+          clock() {
+            expect(this).toBe(options);
+            return clock.wall;
+          },
+          retry,
+        };
+        const transport = {
+          fetch(input: RequestInfo | URL, init?: RequestInit) {
+            expect(this).toBe(transport);
+            return api.fetch(input, init);
+          },
+        };
+        const ownerClock = {
+          utcMs() {
+            expect(this).toBe(ownerClock);
+            return clock.wall;
+          },
+          monotonicMs() {
+            expect(this).toBe(ownerClock);
+            return clock.mono;
+          },
+        };
+        const owner =
+          route === 'host'
+            ? new SubmissionHost(config, options as SubmissionHostOptions)
+            : composeVerifiedRetryAdmission({
+                configuration: config,
+                transport: transport as { fetch: typeof fetch },
+                clock: ownerClock,
+                owner: { runtime },
+              });
+        const failMutation = () => {
+          throw new Error('MUTATED_PRIVATE_DEPENDENCY');
+        };
+        const mutate = () => {
+          transport.fetch = failMutation;
+          ownerClock.utcMs = failMutation;
+          ownerClock.monotonicMs = failMutation;
+          options.fetchRequest = failMutation;
+          options.clock = failMutation;
+          retry.monotonicMs = failMutation;
+          runtime.setTimeout = failMutation;
+          runtime.clearTimeout = failMutation;
+          (config as { stateDirectory: string }).stateDirectory = join(
+            api.root,
+            'missing-mutated-state',
+          );
+          (config.credential as { effectiveKey: string }).effectiveKey =
+            'mutated-synthetic-key';
+          (config.snapshot.policy.caps as { tokens: number }).tokens = 1;
+          (config.snapshot.policy.retry as { enabled: boolean }).enabled =
+            false;
+        };
+        mutate();
+        const operation =
+          owner instanceof SubmissionHost
+            ? owner.planRetry({ searchEngine: 'yandex' })
+            : owner.planLatest({ searchEngine: 'yandex' });
+        api.operations.push(operation);
+        await bounded(arrived.promise);
+        mutate();
+        release.resolve();
+        const result = await bounded(operation);
+        expect(result.status).toBe('ready');
+        if (result.status !== 'ready')
+          throw new Error(
+            'Expected captured production ready: ' + JSON.stringify(result),
+          );
+        expectProductionReady(result, oracle, original);
+        expectProductionWires(api, 'yandex');
+        expect(p1cProjection(api, original, 'unchanged')).toEqual(before);
+      },
+    );
+  });
+
+for (const engine of ['google', 'yandex'] as const)
+  test(`P1C-07 actual ${engine} production candidate is consumed only by its owning writer after measured no-write`, async () => {
+    await withProductionReceiver(script(singleSource(engine)), async (api) => {
+      const config = fixtureConfiguration(api, {
+        retry: {
+          enabled: true,
+          allowUnattributedParents: engine === 'yandex',
+          maxAttemptsPerSource: 3,
+        },
+      });
+      if (engine === 'google') seedStandalone(config, 'parent', [A, B, C]);
+      const clock = new Clock(),
+        oracle = productionOracle(config, engine),
+        before = p1cProjection(api, config, 'before');
+      const composition = productionComposition(api, config, clock);
+      const operation = composition.collectLatest(
+        { searchEngine: engine },
+        'synthetic-retry',
+      );
+      api.operations.push(operation);
+      const candidate = await bounded(operation);
+      expect('kind' in candidate && candidate.kind).toBe('candidate');
+      if (!('kind' in candidate))
+        throw new Error(
+          'Expected real production candidate: ' + JSON.stringify(candidate),
+        );
+      expectProductionReady(candidate.view, oracle, config);
+      expect(candidate.request.body).toBe(oracle.body);
+      expect(candidate.input.intent.submittedUrls).toEqual([A, B]);
+      expect(candidate.input.planFingerprint).toBe(oracle.planFingerprint);
+      expect(candidate.input.sourceManifestDigest).toBe(
+        oracle.source.manifestDigest,
+      );
+      expectProductionWires(api, engine);
+      expect(
+        p1cProjection(api, config, 'after-collection-before-prepare'),
+      ).toEqual(before); // BEFORE any explicit synthetic prepare.
+      const foreign = productionComposition(api, config, clock).open();
+      try {
+        expect(() =>
+          foreign.prepareVerifiedRetryIntent(candidate.input, candidate.proof),
+        ).toThrow('Retry admission proof is unavailable or mismatched.');
+      } finally {
+        foreign.close();
+      }
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+      const writer = composition.open();
+      try {
+        const impostor = JSON.parse(
+          JSON.stringify(candidate.proof),
+        ) as RetryProof;
+        expect(() =>
+          writer.prepareVerifiedRetryIntent(candidate.input, impostor),
+        ).toThrow('Retry admission proof is unavailable or mismatched.');
+        expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+        const prepared = writer.prepareVerifiedRetryIntent(
+          candidate.input,
+          candidate.proof,
+        );
+        expect(prepared.kind).toBe('created');
+        expect(prepared.intent).toMatchObject({
+          requestId: 'synthetic-retry',
+          state: 'prepared',
+          stateVersion: 0,
+          taskFamily: `${engine}/indexer`,
+          payloadDigest: oracle.preimage.payloadDigest,
+          quoteFingerprint: oracle.preimage.quoteFingerprint,
+          reservation: oracle.preimage.reservation,
+          urlCount: 2,
+          periodId: oracle.preimage.period.id,
+        });
+        const after = p1cProjection(api, config, 'after-explicit-prepare');
+        const db = new Database(
+          join(config.stateDirectory, 'ledger.sqlite'),
+          constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_NOFOLLOW,
+        );
+        try {
+          expect(
+            db
+              .query(
+                `SELECT origin_kind,parent_family,parent_task_id,source_manifest_digest,plan_fingerprint FROM intent_context WHERE request_id='synthetic-retry'`,
+              )
+              .get(),
+          ).toEqual({
+            origin_kind: 'retry',
+            parent_family: `${engine}/indexer`,
+            parent_task_id: 'parent',
+            source_manifest_digest: oracle.source.manifestDigest,
+            plan_fingerprint: oracle.planFingerprint,
+          });
+          expect(
+            db
+              .query(
+                `SELECT url_text FROM intent_urls WHERE request_id='synthetic-retry' ORDER BY ordinal`,
+              )
+              .all(),
+          ).toEqual([{ url_text: A }, { url_text: B }]);
+          expect(
+            db
+              .query(
+                `SELECT state,CAST(state_version AS TEXT) AS version,CAST(reserved_tokens AS TEXT) AS tokens,CAST(reserved_indexer AS TEXT) AS indexer,CAST(reserved_checker AS TEXT) AS checker,provider_task_id,provider_type FROM intents WHERE request_id='synthetic-retry'`,
+              )
+              .get(),
+          ).toEqual({
+            state: 'prepared',
+            version: '0',
+            tokens: engine === 'google' ? '200' : '40',
+            indexer: engine === 'google' ? '0' : '2',
+            checker: '0',
+            provider_task_id: null,
+            provider_type: null,
+          });
+          expect(
+            db
+              .query(
+                `SELECT COUNT(*) AS n FROM intent_events WHERE request_id='synthetic-retry'`,
+              )
+              .get(),
+          ).toEqual({ n: 1 });
+          expect(db.query(`SELECT COUNT(*) AS n FROM intents`).get()).toEqual({
+            n: engine === 'google' ? 2 : 1,
+          });
+          expect(
+            db.query(`SELECT COUNT(*) AS n FROM intent_context`).get(),
+          ).toEqual({ n: engine === 'google' ? 2 : 1 });
+        } finally {
+          db.close();
+        }
+        expect(
+          localSnapshot(config).acceptedManifests.map(
+            (row) => row.providerTaskId,
+          ),
+        ).toEqual(engine === 'google' ? ['parent'] : []);
+        expect(() =>
+          writer.prepareVerifiedRetryIntent(
+            {
+              ...candidate.input,
+              intent: {
+                ...candidate.input.intent,
+                requestId: 'consumed-new-id',
+              },
+            },
+            candidate.proof,
+          ),
+        ).toThrow('Retry admission proof is unavailable or mismatched.');
+        expect(logicalProjection(config)).toEqual(after);
+        clock.mono += 60000;
+        const replay = writer.prepareVerifiedRetryIntent(candidate.input);
+        expect(replay.kind).toBe('replay');
+        expect('dispatchCapability' in replay).toBe(false);
+        expect(logicalProjection(config)).toEqual(after);
+        expect(api.wires).toHaveLength(10); // No dispatch or repeat scan.
+      } finally {
+        writer.close();
+      }
+    });
+  });
+
+test('P1C-07 private request identity mismatch consumes no rows and cannot restore the consumed proof', async () => {
+  await withProductionReceiver(script(singleSource('yandex')), async (api) => {
+    const config = fixtureConfiguration(api),
+      before = p1cProjection(api, config, 'before');
+    const composition = productionComposition(api, config);
+    const operation = composition.collectLatest(
+      { searchEngine: 'yandex' },
+      'private-original-id',
+    );
+    api.operations.push(operation);
+    const candidate = await bounded(operation);
+    if (!('kind' in candidate))
+      throw new Error('Expected private identity candidate.');
+    expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+    const writer = composition.open();
+    try {
+      expect(() =>
+        writer.prepareVerifiedRetryIntent(
+          {
+            ...candidate.input,
+            intent: {
+              ...candidate.input.intent,
+              requestId: 'private-altered-id',
+            },
+          },
+          candidate.proof,
+        ),
+      ).toThrow('Retry admission proof is unavailable or mismatched.');
+      expect(() =>
+        writer.prepareVerifiedRetryIntent(candidate.input, candidate.proof),
+      ).toThrow('Retry admission proof is unavailable or mismatched.');
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+      expect(api.wires).toHaveLength(10);
+    } finally {
+      writer.close();
+    }
+  });
 });

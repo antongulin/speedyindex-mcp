@@ -41,6 +41,10 @@ import {
 } from './submission-policy';
 import {
   openLedger,
+  composeVerifiedRetryAdmission,
+  type ProductionRetryComposition,
+  type RetryOwnerOptions,
+  type RetryPlanView,
   SubmissionLedgerError,
   type DispatchOutcome,
   type DispatchOutcomeToken,
@@ -49,6 +53,9 @@ import {
   type PrepareIntentInput,
   type SubmissionLedger,
 } from './submission-ledger';
+
+import { parseRetryPlanInput } from './plan-retry';
+import { freezeSnapshot } from './retry-ledger-snapshot';
 
 type PublicError = SubmissionError<CreateIndexCheckErrorCode>;
 interface BaseResult {
@@ -181,6 +188,8 @@ export interface SubmissionHostOptions {
   clock?: () => number;
   openLedger?: (options: LedgerPathOptions) => SubmissionLedger;
   timeoutMs?: number;
+  /** Trusted internal retry construction, never a tool or environment selector. */
+  retry?: RetryOwnerOptions & Readonly<{ monotonicMs?: () => number }>;
 }
 
 function checked(value: unknown): CreateIndexingTaskResult {
@@ -379,14 +388,17 @@ export class SubmissionHost {
   private readonly clock: () => number;
   private readonly open: (options: LedgerPathOptions) => SubmissionLedger;
   private readonly timeoutMs: number;
+  private readonly configuration: SubmissionConfiguration;
+  private readonly retry: Readonly<ProductionRetryComposition> | undefined;
 
   constructor(
-    private readonly configuration: SubmissionConfiguration = loadSubmissionConfiguration(),
+    configuration: SubmissionConfiguration = loadSubmissionConfiguration(),
     options: SubmissionHostOptions = {},
   ) {
-    this.fetchRequest = options.fetchRequest ?? globalThis.fetch;
-    this.clock = options.clock ?? Date.now;
-    this.open = options.openLedger ?? openLedger;
+    this.configuration = freezeSnapshot(structuredClone(configuration));
+    this.fetchRequest = options.fetchRequest?.bind(options) ?? globalThis.fetch;
+    this.clock = options.clock?.bind(options) ?? Date.now;
+    this.open = options.openLedger?.bind(options) ?? openLedger;
     this.timeoutMs = options.timeoutMs ?? 10_000;
     if (
       !Number.isSafeInteger(this.timeoutMs) ||
@@ -394,6 +406,74 @@ export class SubmissionHost {
       this.timeoutMs > 10_000
     )
       throw new Error('Invalid submission HTTP deadline.');
+    const captured = this.configuration;
+    // Construction captures authority and functions only; no state or network.
+    // Existing inactive and non-retry hosts retain their original create path.
+    if (
+      captured.state === 'configured' &&
+      captured.snapshot.policy.enabled &&
+      captured.snapshot.policy.retry?.enabled
+    ) {
+      try {
+        this.retry = composeVerifiedRetryAdmission({
+          configuration: captured,
+          transport: { fetch: this.fetchRequest },
+          clock: {
+            utcMs: this.clock,
+            monotonicMs:
+              options.retry?.monotonicMs?.bind(options.retry) ??
+              performance.now.bind(performance),
+          },
+          ...(options.retry ? { owner: options.retry } : {}),
+        });
+      } catch {
+        // Invalid retry wiring blocks planning, without breaking pure previews.
+        this.retry = undefined;
+      }
+    }
+  }
+
+  /** Internal no-write inspection. Public registration and result schemas are separate. */
+  async planRetry(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<RetryPlanView> {
+    let args: ReturnType<typeof parseRetryPlanInput>;
+    try {
+      args = parseRetryPlanInput(value);
+    } catch {
+      return Object.freeze({ status: 'error', code: 'InvalidInput' });
+    }
+    if (signal?.aborted)
+      return Object.freeze({ status: 'error', code: 'Cancelled' });
+    const config = this.configuration;
+    if (config.state !== 'configured')
+      return freezeSnapshot({
+        status: 'blocked',
+        blockers: ['StateUnavailable'],
+      });
+    if (!config.snapshot.policy.enabled)
+      return freezeSnapshot({
+        status: 'blocked',
+        blockers: ['WritesDisabled'],
+      });
+    if (!config.snapshot.policy.retry?.enabled)
+      return freezeSnapshot({
+        status: 'blocked',
+        blockers: ['RetryPolicyRequired'],
+      });
+    if (this.busy)
+      return Object.freeze({ status: 'error', code: 'SubmissionBusy' });
+    if (!this.retry || !this.retry.isNewWorkAvailable())
+      return Object.freeze({ status: 'error', code: 'InternalError' });
+    this.busy = true;
+    try {
+      return await this.retry.planLatest(args, signal);
+    } catch {
+      return Object.freeze({ status: 'error', code: 'InternalError' });
+    } finally {
+      this.busy = false;
+    }
   }
 
   async createIndexingTask(
@@ -516,6 +596,8 @@ export class SubmissionHost {
       }
       if (this.busy)
         return blocked(strategy, base, strategy.error('SubmissionBusy'));
+      if (this.retry && !this.retry.isNewWorkAvailable())
+        return blocked(strategy, base, strategy.error('StateUnavailable'));
       this.busy = true;
       ownsGuard = true;
       const ack = prepared.input.acknowledgement;

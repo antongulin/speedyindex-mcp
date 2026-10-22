@@ -20,6 +20,30 @@ import {
 } from 'bun:sqlite';
 import { taskFamilySchema, type TaskFamily } from './task-status';
 import {
+  createInvocationReadBudget,
+  ReadBudgetError,
+  type InvocationReadBudget,
+  type ReadBudgetRuntime,
+} from './read-budget';
+// These imports are used only inside the constructed owner. The pure core also
+// imports the fingerprint below; neither side reads cyclic state at module load.
+import {
+  assessRetryObservations,
+  assertRetryCombinedBytes,
+  buildRetrySemanticIdentity,
+  lowerRetryByteLimit,
+  parseRetryPlanInput,
+  retryLogicalBytes,
+  type RetryAssessment,
+  type RetryComparison,
+  type RetryProposal,
+} from './plan-retry';
+import {
+  createRetryObservationCollector,
+  type RetryCollectionResult,
+  type RetryCollectorLimits,
+} from './retry-observation';
+import {
   providerTaskIdSchema,
   submittedUrlSchema,
   titleSchema,
@@ -33,6 +57,7 @@ import {
   submissionPolicySchema,
   submissionCredentialFingerprint,
   type ConfiguredSubmission,
+  type SubmissionContext,
 } from './submission-policy';
 import {
   checkSnapshotBounds,
@@ -233,8 +258,87 @@ export interface TrustedRetryVerifier {
 export interface TrustedRetryDependencies {
   readonly configuration: ConfiguredSubmission;
   readonly verifier: TrustedRetryVerifier;
+  readonly transport?: never;
   readonly clock: Readonly<{ utcMs(): number; monotonicMs(): number }>;
   readonly hooks?: RetryPrepareHooks;
+}
+/** Trusted construction only. Notifications cannot supply evidence or decisions. */
+export type RetryOwnerPhase =
+  | 'before_initial_read'
+  | 'after_initial_read'
+  | 'after_observation'
+  | 'after_assessment'
+  | 'before_final_read'
+  | 'after_final_read'
+  | 'after_identity'
+  | 'after_serialization'
+  | 'before_close'
+  | 'after_close';
+export interface RetryOwnerOptions {
+  readonly runtime?: Omit<ReadBudgetRuntime, 'now'>;
+  readonly limits?: NonNullable<
+    Parameters<typeof createInvocationReadBudget>[1]
+  >['limits'];
+  readonly collectorLimits?: RetryCollectorLimits;
+  readonly combinedBytes?: number;
+  readonly hooks?: Readonly<{ onOwnerPhase(phase: RetryOwnerPhase): void }>;
+}
+export interface TrustedRetryProductionDependencies {
+  readonly configuration: ConfiguredSubmission;
+  readonly transport: Readonly<{ fetch?: typeof fetch }>;
+  readonly verifier?: never;
+  readonly clock: TrustedRetryDependencies['clock'];
+  readonly hooks?: RetryPrepareHooks;
+  readonly owner?: RetryOwnerOptions;
+}
+export type RetryPlanReady = Readonly<{
+  status: 'ready';
+  source: RetryProposal['source'];
+  eligibleUrls: RetryProposal['eligibleUrls'];
+  excluded: RetryProposal['excluded'];
+  counts: RetryProposal['counts'];
+  request: PreparedCreateIndexingRequest['request'];
+  quote: PreparedCreateIndexingRequest['quote'];
+  authorization: SubmissionContext['authorization'];
+  identity: Extract<RetryComparison, { status: 'comparison' }>;
+}>;
+export type RetryPlanView =
+  | RetryPlanReady
+  | Exclude<RetryAssessment, RetryProposal>
+  | Exclude<RetryCollectionResult, { status: 'complete' }>
+  | Readonly<{ status: 'error'; code: 'SubmissionBusy' }>;
+export type RetryLatestCollection =
+  | Readonly<{
+      kind: 'candidate';
+      input: PrepareRetryIntentInput;
+      request: PreparedCreateIndexingRequest;
+      proof: RetryProof;
+      view: RetryPlanReady;
+    }>
+  | Exclude<RetryPlanView, RetryPlanReady>;
+interface VerifiedRetryComposition {
+  collect(
+    selection: RetrySelection,
+    signal?: AbortSignal,
+  ): Promise<RetryCollection>;
+  open(): VerifiedRetryLedger;
+}
+export interface ProductionRetryComposition {
+  collectLatest(
+    input: unknown,
+    requestId: string,
+    signal?: AbortSignal,
+  ): Promise<RetryLatestCollection>;
+  planLatest(input: unknown, signal?: AbortSignal): Promise<RetryPlanView>;
+  isNewWorkAvailable(): boolean;
+  open(): VerifiedRetryLedger;
+}
+interface RetryFreshness {
+  started: number;
+  expires: number;
+  lastMono: number;
+  signal: AbortSignal | undefined;
+  initialPeriod?: Readonly<{ id: string; startMs: number }>;
 }
 declare const retryProofBrand: unique symbol;
 export type RetryProof = Readonly<{ [retryProofBrand]: never }>;
@@ -592,17 +696,17 @@ export type RetryCollection =
       proof: RetryProof;
     }>
   | Readonly<{ kind: 'blocked'; code: RetryCollectCode }>;
-/** @internal Enclosed authority composition. P1 must supply a same-key latest-source,
- * complete two-pass HTTP verifier; this factory is not wired to production yet. */
+/** @internal The production and parent-first fixture paths share one private issuer. */
 export function composeVerifiedRetryAdmission(
   deps: TrustedRetryDependencies,
-): Readonly<{
-  collect(
-    selection: RetrySelection,
-    signal?: AbortSignal,
-  ): Promise<RetryCollection>;
-  open(): VerifiedRetryLedger;
-}> {
+): Readonly<VerifiedRetryComposition>;
+export function composeVerifiedRetryAdmission(
+  deps: TrustedRetryProductionDependencies,
+): Readonly<ProductionRetryComposition>;
+export function composeVerifiedRetryAdmission(
+  deps: TrustedRetryDependencies | TrustedRetryProductionDependencies,
+) {
+  if ('transport' in deps === 'verifier' in deps) fail('InvalidLedgerInput');
   let configuration: ConfiguredSubmission;
   try {
     configuration = freezeSnapshot(structuredClone(deps.configuration));
@@ -631,7 +735,7 @@ export function composeVerifiedRetryAdmission(
       const clock = deps.clock;
       const hooks = deps.hooks;
       return {
-        verify: verifier.collectAndVerify.bind(verifier),
+        verify: verifier?.collectAndVerify.bind(verifier),
         utcMs: clock.utcMs.bind(clock),
         monotonicMs: clock.monotonicMs.bind(clock),
         onPhase: hooks?.onPhase?.bind(hooks),
@@ -646,6 +750,57 @@ export function composeVerifiedRetryAdmission(
   });
   const binding = configuration.credential.fingerprint;
   const policy = configuration.snapshot.policy;
+  const production = 'transport' in deps && deps.transport !== undefined;
+  if (!production && !verify) fail('InvalidLedgerInput');
+  if ('transport' in deps && !production) fail('InvalidLedgerInput');
+  const owner = production
+    ? (deps as TrustedRetryProductionDependencies).owner
+    : undefined;
+  const limits = Object.freeze({ ...owner?.limits });
+  const horizonMs = limits.horizonMs ?? 60_000;
+  const combinedBytes = lowerRetryByteLimit(
+    'combinedBytes',
+    owner?.combinedBytes,
+  );
+  const nativeArm = globalThis.setTimeout.bind(globalThis);
+  const nativeDisarm = globalThis.clearTimeout.bind(globalThis);
+  const immediate = globalThis.setImmediate.bind(globalThis);
+  const runtime = owner?.runtime;
+  const readRuntime = Object.freeze({
+    now: monotonicMs,
+    setTimeout: runtime ? runtime.setTimeout.bind(runtime) : nativeArm,
+    clearTimeout: runtime
+      ? runtime.clearTimeout.bind(runtime)
+      : (handle: unknown) =>
+          nativeDisarm(handle as ReturnType<typeof setTimeout>),
+  });
+  const ownerHooks = owner?.hooks;
+  const ownerPhase = ownerHooks?.onOwnerPhase.bind(ownerHooks);
+  if (ownerPhase?.constructor.name === 'AsyncFunction')
+    fail('InvalidLedgerInput');
+  const notify = (phase: RetryOwnerPhase) => {
+    const result: unknown = ownerPhase?.(phase);
+    if (result !== undefined) {
+      if (result instanceof Promise) void result.catch(() => undefined);
+      fail('InvalidLedgerInput');
+    }
+  };
+  const collector = production
+    ? createRetryObservationCollector({
+        configuration,
+        fetch:
+          (deps as TrustedRetryProductionDependencies).transport.fetch?.bind(
+            (deps as TrustedRetryProductionDependencies).transport,
+          ) ?? globalThis.fetch,
+        ...(owner?.collectorLimits === undefined
+          ? {}
+          : { limits: { ...owner.collectorLimits } }),
+      })
+    : undefined;
+  // Native bounded I/O drain, outside every SQL transaction. The original
+  // monotonic and UTC fences run again after queued cancellation can execute.
+  const drainPendingIO = () =>
+    new Promise<void>((done) => nativeArm(() => immediate(done), 0));
   const records = new WeakMap<
     RetryProof,
     {
@@ -655,29 +810,20 @@ export function composeVerifiedRetryAdmission(
       request: PreparedCreateIndexingRequest;
       evidence: TrustedRetryEvidence;
       source: ReturnType<typeof classifyRetrySource>;
-      started: number;
-      expires: number;
-      lastMono: number;
-      signal: AbortSignal | undefined;
-    }
+    } & RetryFreshness
   >();
   let collecting = false;
   let writerOpen = false;
   let activeProof: RetryProof | undefined;
+  let unavailable = false;
+  // Retain the first fixed domain cause privately when settlement poisons new work.
+  let primaryFailure: Exclude<RetryPlanView, RetryPlanReady> | undefined;
   const permission = () => {
     if (!policy.retry?.enabled)
       throw new RetryLedgerError('RetryPermissionDenied');
     return policy.retry;
   };
-  const checkTime = (
-    record: {
-      started: number;
-      expires: number;
-      lastMono: number;
-      signal: AbortSignal | undefined;
-    },
-    budget?: TrustedBudgetContext,
-  ) => {
+  const checkTime = (record: RetryFreshness, budget?: TrustedBudgetContext) => {
     if (record.signal?.aborted) throw new RetryLedgerError('RetryCancelled');
     const mono = monotonicMs();
     if (
@@ -691,7 +837,12 @@ export function composeVerifiedRetryAdmission(
     const now = utcMs();
     if (
       !Number.isSafeInteger(now) ||
-      (budget && !currentRetryPeriod(budget, now))
+      (budget && !currentRetryPeriod(budget, now)) ||
+      (record.initialPeriod &&
+        (Math.floor(now / 86400000) * 86400000 !==
+          record.initialPeriod.startMs ||
+          `utc-day:${new Date(now).toISOString().split('T')[0]}` !==
+            record.initialPeriod.id))
     )
       fail('StalePeriodContext');
     return now;
@@ -699,6 +850,7 @@ export function composeVerifiedRetryAdmission(
   const admission: VerifiedAdmission = (database, ledgerId, input) => {
     // This closure is reachable only from the privately configured writer, AFTER
     // BEGIN IMMEDIATE and existing-ID replay. Failed consumption is never restored.
+    if (unavailable) fail('LedgerUnavailable');
     const record = activeProof && records.get(activeProof);
     if (activeProof) records.delete(activeProof);
     if (!record) throw new RetryLedgerError('RetryProofInvalid');
@@ -714,6 +866,7 @@ export function composeVerifiedRetryAdmission(
       expires: record.expires,
       lastMono: record.lastMono,
       signal: record.signal,
+      ...(record.initialPeriod ? { initialPeriod: record.initialPeriod } : {}),
     };
     checkTime(time, input.intent.budget);
     const snapshot = projectRetrySnapshot(
@@ -745,7 +898,402 @@ export function composeVerifiedRetryAdmission(
     assertRetryPlanDecision(state, input.intent);
     return () => checkTime(time, input.intent.budget);
   };
+  const latestFailure = (
+    error: unknown,
+  ): Exclude<RetryPlanView, RetryPlanReady> => {
+    if (error instanceof ReadBudgetError)
+      return Object.freeze({
+        status: 'error',
+        code:
+          error.code === 'ReadInProgress' || error.code === 'CleanupFailed'
+            ? 'InternalError'
+            : error.code,
+      });
+    if (error instanceof RetryLedgerError) {
+      if (error.code === 'RetryCancelled')
+        return Object.freeze({ status: 'error', code: 'Cancelled' });
+      if (error.code === 'RetryProofExpired')
+        return Object.freeze({ status: 'error', code: 'DeadlineExceeded' });
+      if (error.code === 'SnapshotConflict')
+        return freezeSnapshot({
+          status: 'blocked',
+          blockers: ['SnapshotConflict'],
+        });
+    }
+    if (
+      error instanceof SubmissionLedgerError &&
+      error.code === 'StalePeriodContext'
+    )
+      return freezeSnapshot({
+        status: 'blocked',
+        blockers: ['StalePeriodContext'],
+      });
+    return Object.freeze({ status: 'error', code: 'InternalError' });
+  };
+  const snapshotFailure = (
+    reason: SnapshotUnavailableReason,
+  ): Exclude<RetryPlanView, RetryPlanReady> =>
+    freezeSnapshot({
+      status: 'blocked',
+      blockers: [
+        reason === 'UpgradeRequired'
+          ? 'UpgradeRequired'
+          : reason === 'LimitExceeded'
+            ? 'SnapshotLimitExceeded'
+            : 'StateUnavailable',
+      ],
+    });
+  const collectLatest = async (
+    value: unknown,
+    requestId: string,
+    signal?: AbortSignal,
+  ): Promise<RetryLatestCollection> => {
+    let args: ReturnType<typeof parseRetryPlanInput>;
+    try {
+      args = parseRetryPlanInput(value);
+      validateRequestId(requestId);
+    } catch {
+      return Object.freeze({ status: 'error', code: 'InvalidInput' });
+    }
+    if (signal?.aborted)
+      return Object.freeze({ status: 'error', code: 'Cancelled' });
+    if (!collector)
+      return Object.freeze({ status: 'error', code: 'InternalError' });
+    if (!policy.retry?.enabled)
+      return freezeSnapshot({
+        status: 'blocked',
+        blockers: ['RetryPolicyRequired'],
+      });
+    if (collecting || writerOpen)
+      return Object.freeze({ status: 'error', code: 'SubmissionBusy' });
+    if (unavailable)
+      return Object.freeze({ status: 'error', code: 'InternalError' });
+    collecting = true;
+    let budget: InvocationReadBudget | undefined;
+    let horizon: RetryFreshness | undefined;
+    let sealed: RetryProof | undefined;
+    let firstFailure: Exclude<RetryPlanView, RetryPlanReady> | undefined;
+    let result: RetryLatestCollection;
+    const checkpoint = () => {
+      budget!.checkpoint();
+      return checkTime(horizon!);
+    };
+    const phase = (name: RetryOwnerPhase) => {
+      notify(name);
+      checkpoint();
+    };
+    try {
+      const started = monotonicMs();
+      // The only budget/origin is established before the first state operation.
+      budget = createInvocationReadBudget(
+        { startedAtMs: started, ...(signal ? { signal } : {}) },
+        { limits, runtime: readRuntime },
+      );
+      const now = utcMs(),
+        startMs = Math.floor(now / 86400000) * 86400000;
+      if (
+        !Number.isSafeInteger(now) ||
+        !Number.isSafeInteger(startMs) ||
+        !Number.isFinite(new Date(now).getTime()) ||
+        !Number.isFinite(new Date(startMs + 86400000).getTime())
+      )
+        fail('StalePeriodContext');
+      horizon = {
+        started,
+        lastMono: started,
+        expires: started + horizonMs,
+        signal,
+        initialPeriod: Object.freeze({
+          id: `utc-day:${new Date(startMs).toISOString().split('T')[0]}`,
+          startMs,
+        }),
+      };
+      phase('before_initial_read');
+      const initial = readRetrySnapshot(options, binding);
+      phase('after_initial_read');
+      if (initial.availability !== 'available')
+        result = snapshotFailure(initial.reason);
+      else {
+        // A synchronous reader may have delayed queued caller cancellation.
+        await drainPendingIO();
+        checkpoint();
+        const observed = await collector.collect(
+          args,
+          initial,
+          {
+            startedAtMs: started,
+            budget,
+            clock: { utcMs, monotonicMs },
+          },
+          signal,
+        );
+        if (observed.status !== 'complete')
+          firstFailure = freezeSnapshot(observed);
+        phase('after_observation');
+        if (observed.status !== 'complete') result = firstFailure!;
+        else {
+          const proposed = assessRetryObservations(
+            args,
+            observed.observations,
+            initial,
+            policy,
+            { combinedBytes },
+          );
+          phase('after_assessment');
+          if (proposed.status === 'blocked') result = proposed;
+          else if (proposed.status === 'no_source') {
+            await drainPendingIO();
+            phase('before_final_read');
+            const final = readRetrySnapshot(options, binding);
+            phase('after_final_read');
+            result =
+              final.availability !== 'available'
+                ? snapshotFailure(final.reason)
+                : final.ledgerId !== initial.ledgerId ||
+                    final.revision !== initial.revision
+                  ? freezeSnapshot({
+                      status: 'blocked',
+                      blockers: ['SnapshotConflict'],
+                    })
+                  : Object.freeze({ status: 'no_source' });
+            assertRetryCombinedBytes(
+              initial,
+              observed.observations.facts,
+              [proposed, final, result],
+              combinedBytes,
+            );
+            phase('after_serialization');
+          } else {
+            const request = buildCreateIndexingRequest({
+              mode: 'submit',
+              requestId,
+              searchEngine: args.searchEngine,
+              urls: [...proposed.eligibleUrls],
+            });
+            const context = createSubmissionContext(
+              configuration,
+              request.quote.fingerprint,
+              checkpoint(),
+            );
+            checkTime(horizon, context.budget);
+            const intent: PrepareIntentInput = {
+              requestId,
+              budget: context.budget,
+              taskFamily: request.request.family,
+              providerRoute: request.request.providerRoute,
+              payloadDigest: request.request.payloadDigest,
+              submittedUrls: request.input.urls,
+              quoteVersion: request.quote.version,
+              quoteFingerprint: request.quote.fingerprint,
+              reservation: request.quote.maximumExposure,
+            };
+            checkpoint();
+            const report = observed.observations.facts[3]!;
+            const matched: RetryReport = {
+              size: report[2],
+              processedCount: report[3],
+              indexedUrls: report[5],
+              unindexedUrls: report[6],
+            };
+            // Two real passes already matched. Adapt the retained canonical report
+            // to the existing validator; this makes no additional observation.
+            const adapted: TrustedRetryEvidence = {
+              reports: [matched, matched],
+              eligibleUrls: proposed.eligibleUrls,
+              safetyEvidenceDigests: proposed.safetyEvidenceDigests,
+              partitionDigest: proposed.partitionDigest,
+            };
+            const { evidence, semanticBytes } = copyRetryEvidence(adapted);
+            if (
+              semanticBytes + request.request.providerBodyBytes >
+                8 * 1024 * 1024 ||
+              retryLogicalBytes([
+                observed.observations.facts,
+                adapted,
+                evidence,
+              ]) +
+                request.request.providerBodyBytes >
+                8 * 1024 * 1024
+            )
+              throw new ReadBudgetError('ResourceLimitExceeded');
+            const parent = {
+              family: proposed.source.reference[0],
+              taskId: proposed.source.reference[1],
+            };
+            const source = classifyRetrySource(
+              initial,
+              parent,
+              evidence,
+              policy.retry.allowUnattributedParents,
+            );
+            checkpoint();
+            await drainPendingIO();
+            phase('before_final_read');
+            const final = readRetryPlanningState(
+              options,
+              binding,
+              {
+                intent,
+                parent,
+                maxAttemptsPerSource: policy.retry.maxAttemptsPerSource,
+              },
+              { now: utcMs },
+            );
+            phase('after_final_read');
+            const identity = buildRetrySemanticIdentity(
+              proposed,
+              final,
+              context,
+              initial,
+              { combinedBytes },
+            );
+            phase('after_identity');
+            if (identity.status !== 'comparison') result = identity;
+            else {
+              if (final.availability !== 'available')
+                throw new RetryLedgerError('SnapshotUnavailable');
+              assertRetryPlanDecision(final, intent);
+              const planFingerprint = computeRetryPlanFingerprint({
+                ...identity.preimage,
+                ...source,
+                parent,
+                safetyEvidenceDigests: evidence.safetyEvidenceDigests,
+                partitionDigest: evidence.partitionDigest,
+              });
+              if (planFingerprint !== identity.fingerprint)
+                throw new RetryLedgerError('RetryProofInvalid');
+              const input = freezeSnapshot({
+                intent,
+                parent,
+                sourceManifestDigest: source.sourceManifestDigest,
+                planFingerprint,
+                expectedRevision: final.snapshot.revision,
+              });
+              const privateIdentity = privateRetryInputIdentity(input);
+              const view: RetryPlanReady = freezeSnapshot({
+                status: 'ready',
+                source: proposed.source,
+                eligibleUrls: proposed.eligibleUrls,
+                excluded: proposed.excluded,
+                counts: proposed.counts,
+                request: proposed.request.request,
+                quote: proposed.request.quote,
+                authorization: { ...context.authorization, stateChecked: true },
+                identity,
+              });
+              // Include the safe view and every retained/copied private serialization.
+              // No caller receives the observations, ledger identity or private intent.
+              assertRetryCombinedBytes(
+                initial,
+                observed.observations.facts,
+                [
+                  proposed,
+                  final,
+                  identity,
+                  request,
+                  input,
+                  privateIdentity,
+                  adapted,
+                  evidence,
+                  source,
+                  view,
+                ],
+                combinedBytes,
+              );
+              phase('after_serialization');
+              sealed = Object.freeze({}) as RetryProof;
+              records.set(
+                sealed,
+                Object.freeze({
+                  ledgerId: initial.ledgerId,
+                  input,
+                  identity: privateIdentity,
+                  request,
+                  evidence,
+                  source,
+                  ...horizon,
+                }),
+              );
+              result = Object.freeze({
+                kind: 'candidate',
+                input,
+                request,
+                proof: sealed,
+                view,
+              });
+              checkpoint();
+            }
+          }
+        }
+      }
+    } catch (error) {
+      result = firstFailure ?? latestFailure(error);
+    }
+    // Never return from inside the try: cleanup and the post-close original-day
+    // fence must be able to invalidate a just-sealed proof and the safe result.
+    try {
+      try {
+        notify('before_close');
+      } catch (error) {
+        if ('kind' in result || result.status === 'no_source')
+          result = latestFailure(error);
+      }
+      try {
+        await budget?.close();
+      } catch {
+        unavailable = true;
+        primaryFailure ??=
+          firstFailure ??
+          ('kind' in result
+            ? Object.freeze({ status: 'error', code: 'InternalError' })
+            : result);
+        result = Object.freeze({ status: 'error', code: 'InternalError' });
+      }
+      try {
+        notify('after_close');
+        if (horizon && ('kind' in result || result.status === 'no_source')) {
+          checkTime(horizon);
+          if (sealed) {
+            const record = records.get(sealed);
+            if (!record) throw new RetryLedgerError('RetryProofInvalid');
+            records.set(sealed, Object.freeze({ ...record, ...horizon }));
+          }
+        }
+      } catch (error) {
+        if ('kind' in result || result.status === 'no_source')
+          result = latestFailure(error);
+      }
+      if (sealed && !('kind' in result)) records.delete(sealed);
+      return result;
+    } finally {
+      if (sealed && unavailable) records.delete(sealed);
+      collecting = false;
+    }
+  };
   return Object.freeze({
+    collectLatest,
+    async planLatest(
+      value: unknown,
+      signal?: AbortSignal,
+    ): Promise<RetryPlanView> {
+      const result = await collectLatest(
+        value,
+        'retry-read-only-inspection',
+        signal,
+      );
+      if (!('kind' in result)) return result;
+      const record = records.get(result.proof);
+      records.delete(result.proof);
+      try {
+        if (!record || unavailable)
+          throw new RetryLedgerError('RetryProofInvalid');
+        checkTime({ ...record });
+        return result.view;
+      } catch (error) {
+        return latestFailure(error);
+      }
+    },
+    isNewWorkAvailable: () => !unavailable,
     async collect(
       value: RetrySelection,
       signal?: AbortSignal,
@@ -754,6 +1302,7 @@ export function composeVerifiedRetryAdmission(
         return Object.freeze({ kind: 'blocked', code: 'LedgerBusy' });
       collecting = true;
       try {
+        if (!verify || production) fail('InvalidLedgerInput');
         const retry = permission();
         if (signal?.aborted) throw new RetryLedgerError('RetryCancelled');
         requireKeys(
