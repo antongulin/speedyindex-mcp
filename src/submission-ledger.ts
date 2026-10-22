@@ -19,7 +19,21 @@ import {
   SQLiteError,
 } from 'bun:sqlite';
 import { taskFamilySchema, type TaskFamily } from './task-status';
-import { providerTaskIdSchema } from './submission-contract';
+import {
+  providerTaskIdSchema,
+  submittedUrlSchema,
+  titleSchema,
+} from './submission-contract';
+import {
+  buildCreateIndexingRequest,
+  type PreparedCreateIndexingRequest,
+} from './create-indexing-task';
+import {
+  createSubmissionContext,
+  submissionPolicySchema,
+  submissionCredentialFingerprint,
+  type ConfiguredSubmission,
+} from './submission-policy';
 import {
   checkSnapshotBounds,
   freezeSnapshot,
@@ -158,8 +172,19 @@ export type RetryLedgerErrorCode =
   | 'SnapshotLimitExceeded'
   | 'SnapshotConflict'
   | 'RetryLineageConflict'
-  | 'UnknownRetryDispatch';
+  | 'UnknownRetryDispatch'
+  | 'RetryPermissionDenied'
+  | 'RetryProofInvalid'
+  | 'RetryProofExpired'
+  | 'RetryObservationInvalid'
+  | 'RetryCancelled';
 const retryErrorMessages: Record<RetryLedgerErrorCode, string> = {
+  RetryPermissionDenied: 'New retry preparation is not permitted.',
+  RetryProofInvalid: 'Retry admission proof is unavailable or mismatched.',
+  RetryProofExpired: 'Retry admission observation has expired.',
+  RetryObservationInvalid:
+    'Retry source observations are unavailable or invalid.',
+  RetryCancelled: 'Retry admission was cancelled.',
   UpgradeRequired: 'Retry submission requires an explicitly upgraded ledger.',
   SnapshotUnavailable: 'Retry submission history is unavailable.',
   SnapshotLimitExceeded: 'Retry submission history exceeds snapshot limits.',
@@ -176,6 +201,758 @@ export class RetryLedgerError extends Error {
     super(retryErrorMessages[code]);
     this.name = 'RetryLedgerError';
   }
+}
+
+// Constructor wiring is trusted host code. No request can select this gate.
+type VerifiedAdmission = (
+  database: Database,
+  ledgerId: string,
+  input: PrepareRetryIntentInput,
+) => () => number;
+export type RetrySourceProvenance =
+  'local_standalone' | 'legacy_unattributed' | 'external_unattributed';
+export interface RetryReport {
+  readonly size: number;
+  readonly processedCount: number;
+  readonly indexedUrls: readonly string[];
+  readonly unindexedUrls: readonly string[];
+}
+export interface TrustedRetryEvidence {
+  readonly reports: readonly [RetryReport, RetryReport];
+  readonly eligibleUrls: readonly string[];
+  readonly safetyEvidenceDigests: readonly string[];
+  readonly partitionDigest: string;
+}
+export interface TrustedRetryVerifier {
+  collectAndVerify(
+    parent: PrepareRetryIntentInput['parent'],
+    local: AvailableRetrySnapshot,
+    signal?: AbortSignal,
+  ): Promise<TrustedRetryEvidence>;
+}
+export interface TrustedRetryDependencies {
+  readonly configuration: ConfiguredSubmission;
+  readonly verifier: TrustedRetryVerifier;
+  readonly clock: Readonly<{ utcMs(): number; monotonicMs(): number }>;
+  readonly hooks?: RetryPrepareHooks;
+}
+declare const retryProofBrand: unique symbol;
+export type RetryProof = Readonly<{ [retryProofBrand]: never }>;
+export interface VerifiedRetryLedger extends Omit<
+  SubmissionLedger,
+  'prepareIntent'
+> {
+  prepareVerifiedRetryIntent(
+    input: PrepareRetryIntentInput,
+    proof?: RetryProof,
+  ): PrepareResult;
+}
+export interface RetryPlanFingerprintInput {
+  readonly parent: PrepareRetryIntentInput['parent'];
+  readonly provenance: RetrySourceProvenance;
+  readonly originalManifestKnown: boolean;
+  readonly manifestProvenance:
+    'durable_local_intent_ack' | 'provider_report_observed_corpus';
+  readonly sourceManifestDigest: string;
+  readonly safetyEvidenceDigests: readonly string[];
+  readonly partitionDigest: string;
+  readonly revision: string;
+  readonly policyDigest: string;
+  readonly authorizationFingerprint: string;
+  readonly payloadDigest: string;
+  readonly quoteVersion: string;
+  readonly quoteFingerprint: string;
+  readonly period: Readonly<{ id: string; startMs: number; endMs: number }>;
+  readonly providerRoute: ProviderRoute;
+  readonly urlCount: number;
+  readonly providerBodyBytes: number;
+  readonly reservation: UnitVector;
+}
+function retryDigest(domain: string, tuple: readonly unknown[]) {
+  return createHash('sha256')
+    .update(domain + '\0' + JSON.stringify(tuple), 'utf8')
+    .digest('hex');
+}
+function evidenceDigests(value: readonly string[]) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 64)
+    throw new RetryLedgerError('RetryObservationInvalid');
+  for (const digest of value) requireDigest(digest);
+  return [...value];
+}
+/** @internal Pure public-safe identity; obtaining this digest grants no authority.
+ * P1's read-only planner must use this function without calling collect(). */
+export function computeRetryPlanFingerprint(
+  value: RetryPlanFingerprintInput,
+): string {
+  validateRetryParent(value.parent);
+  if (
+    ![
+      'local_standalone',
+      'legacy_unattributed',
+      'external_unattributed',
+    ].includes(value.provenance) ||
+    typeof value.originalManifestKnown !== 'boolean' ||
+    !['durable_local_intent_ack', 'provider_report_observed_corpus'].includes(
+      value.manifestProvenance,
+    ) ||
+    value.providerRoute !== `/v2/task/${value.parent.family}/create` ||
+    !Number.isSafeInteger(value.urlCount) ||
+    value.urlCount < 1 ||
+    value.urlCount > 10000 ||
+    !Number.isSafeInteger(value.providerBodyBytes) ||
+    value.providerBodyBytes < 1 ||
+    value.providerBodyBytes > 2097152
+  )
+    fail('InvalidLedgerInput');
+  for (const digest of [
+    value.sourceManifestDigest,
+    value.partitionDigest,
+    value.revision,
+    value.policyDigest,
+    value.authorizationFingerprint,
+    value.payloadDigest,
+    value.quoteFingerprint,
+  ])
+    requireDigest(digest);
+  requireVisibleAscii(value.quoteVersion);
+  requireVisibleAscii(value.period.id);
+  if (
+    !Number.isSafeInteger(value.period.startMs) ||
+    !Number.isSafeInteger(value.period.endMs) ||
+    value.period.endMs - value.period.startMs !== 86400000
+  )
+    fail('InvalidLedgerInput');
+  validateUnitVector(value.reservation);
+  // Deliberately enumerate public fields. Never stringify a private context/input.
+  return retryDigest('speedyindex-retry-plan-v1', [
+    value.parent.family,
+    value.parent.taskId,
+    value.provenance,
+    value.originalManifestKnown,
+    value.manifestProvenance,
+    value.sourceManifestDigest,
+    evidenceDigests(value.safetyEvidenceDigests),
+    value.partitionDigest,
+    value.revision,
+    value.policyDigest,
+    value.authorizationFingerprint,
+    value.payloadDigest,
+    value.quoteVersion,
+    value.quoteFingerprint,
+    [value.period.id, value.period.startMs, value.period.endMs],
+    value.providerRoute,
+    value.urlCount,
+    value.providerBodyBytes,
+    [
+      value.reservation.tokens,
+      value.reservation.indexer,
+      value.reservation.checker,
+    ],
+  ]);
+}
+function copyRetryEvidence(value: TrustedRetryEvidence) {
+  requireKeys(value, [
+    'reports',
+    'eligibleUrls',
+    'safetyEvidenceDigests',
+    'partitionDigest',
+  ]);
+  if (!Array.isArray(value.reports) || value.reports.length !== 2)
+    throw new RetryLedgerError('RetryObservationInvalid');
+  let bytes = 0;
+  const urls = (items: readonly string[], unique: boolean) => {
+    if (!Array.isArray(items) || items.length > 10000)
+      throw new RetryLedgerError('RetryObservationInvalid');
+    const result: string[] = [];
+    const seen = new Set<string>();
+    for (const url of items) {
+      if (
+        typeof url !== 'string' ||
+        url.length > 8192 ||
+        !submittedUrlSchema.safeParse(url).success
+      )
+        throw new RetryLedgerError('RetryObservationInvalid');
+      bytes += Buffer.byteLength(JSON.stringify(url), 'utf8') + 1;
+      if (bytes > 8 * 1024 * 1024)
+        throw new RetryLedgerError('RetryObservationInvalid');
+      if (!seen.has(url)) result.push(url);
+      else if (unique) throw new RetryLedgerError('RetryObservationInvalid');
+      seen.add(url);
+    }
+    return result;
+  };
+  const copyReport = (report: RetryReport): RetryReport => {
+    requireKeys(report, [
+      'size',
+      'processedCount',
+      'indexedUrls',
+      'unindexedUrls',
+    ]);
+    if (
+      !Number.isSafeInteger(report.size) ||
+      report.size < 0 ||
+      report.size > 10000 ||
+      report.processedCount !== report.size ||
+      !Array.isArray(report.indexedUrls) ||
+      !Array.isArray(report.unindexedUrls) ||
+      report.indexedUrls.length + report.unindexedUrls.length > 10000
+    )
+      throw new RetryLedgerError('RetryObservationInvalid');
+    const indexedUrls = urls(report.indexedUrls, false);
+    const unindexedUrls = urls(report.unindexedUrls, false);
+    const indexed = new Set(indexedUrls);
+    if (
+      indexedUrls.length + unindexedUrls.length !== report.size ||
+      unindexedUrls.some((url) => indexed.has(url))
+    )
+      throw new RetryLedgerError('RetryObservationInvalid');
+    return {
+      size: report.size,
+      processedCount: report.processedCount,
+      indexedUrls,
+      unindexedUrls,
+    };
+  };
+  const reports: [RetryReport, RetryReport] = [
+    copyReport(value.reports[0]),
+    copyReport(value.reports[1]),
+  ];
+  if (JSON.stringify(reports[0]) !== JSON.stringify(reports[1]))
+    throw new RetryLedgerError('RetryObservationInvalid');
+  const eligibleUrls = urls(value.eligibleUrls, true);
+  const selected = new Set(eligibleUrls);
+  if (
+    !eligibleUrls.length ||
+    JSON.stringify(
+      reports[1].unindexedUrls.filter((url) => selected.has(url)),
+    ) !== JSON.stringify(eligibleUrls)
+  )
+    throw new RetryLedgerError('RetryObservationInvalid');
+  const safetyEvidenceDigests = evidenceDigests(value.safetyEvidenceDigests);
+  requireDigest(value.partitionDigest);
+  const semanticBytes = Buffer.byteLength(
+    JSON.stringify([
+      value.reports,
+      safetyEvidenceDigests,
+      value.partitionDigest,
+    ]),
+    'utf8',
+  );
+  if (semanticBytes > 8 * 1024 * 1024)
+    throw new RetryLedgerError('RetryObservationInvalid');
+  return {
+    evidence: freezeSnapshot({
+      reports,
+      eligibleUrls,
+      safetyEvidenceDigests,
+      partitionDigest: value.partitionDigest,
+    }),
+    semanticBytes,
+  };
+}
+function classifyRetrySource(
+  snapshot: AvailableRetrySnapshot,
+  parent: PrepareRetryIntentInput['parent'],
+  evidence: TrustedRetryEvidence,
+  allowUnattributed: boolean,
+) {
+  if (
+    snapshot.ambiguousProviderRefs.some(
+      (row) =>
+        row.taskFamily === parent.family &&
+        row.providerTaskId === parent.taskId,
+    )
+  )
+    throw new RetryLedgerError('RetryLineageConflict');
+  if (
+    snapshot.retryChildren.some(
+      (row) =>
+        row.state === 'accepted' &&
+        row.taskFamily === parent.family &&
+        row.providerTaskId === parent.taskId,
+    )
+  )
+    throw new RetryLedgerError('RetryLineageConflict');
+  const local = snapshot.acceptedManifests.find(
+    (row) =>
+      row.taskFamily === parent.family && row.providerTaskId === parent.taskId,
+  );
+  const observed = [
+    ...evidence.reports[1].indexedUrls,
+    ...evidence.reports[1].unindexedUrls,
+  ];
+  if (local) {
+    if (local.originKind === 'retry')
+      throw new RetryLedgerError('RetryLineageConflict');
+    const manifest = new Set(local.submittedUrls);
+    if (
+      manifest.size !== observed.length ||
+      observed.some((url) => !manifest.has(url)) ||
+      local.manifestDigest !==
+        retryDigest('speedyindex-intent-url-manifest-v1', [
+          parent.family,
+          local.submittedUrls,
+        ])
+    )
+      throw new RetryLedgerError('RetryLineageConflict');
+    if (local.originKind !== 'standalone' && !allowUnattributed)
+      throw new RetryLedgerError('RetryPermissionDenied');
+    return freezeSnapshot({
+      provenance:
+        local.originKind === 'standalone'
+          ? ('local_standalone' as const)
+          : ('legacy_unattributed' as const),
+      originalManifestKnown: true,
+      manifestProvenance: 'durable_local_intent_ack' as const,
+      sourceManifestDigest: local.manifestDigest,
+      manifest: [...local.submittedUrls],
+    });
+  }
+  if (!allowUnattributed) throw new RetryLedgerError('RetryPermissionDenied');
+  return freezeSnapshot({
+    provenance: 'external_unattributed' as const,
+    originalManifestKnown: false,
+    manifestProvenance: 'provider_report_observed_corpus' as const,
+    sourceManifestDigest: retryDigest(
+      'speedyindex-provider-report-url-manifest-v1',
+      [parent.family, parent.taskId, observed],
+    ),
+    manifest: observed,
+  });
+}
+function assertRetryPlanDecision(
+  state: RetryPlanningState,
+  input: PrepareIntentInput,
+) {
+  if (!state.decision.periodCompatible) fail('StalePeriodContext');
+  if (!state.decision.attempts.canCreate)
+    throw new RetryLedgerError('RetryPermissionDenied');
+  for (const unit of units)
+    if (!state.decision.withinCaps[unit]) fail('BudgetExceeded', unit);
+  if (
+    state.snapshot.retryChildren.some(
+      (row) =>
+        (row.state === 'dispatching' || row.state === 'unknown') &&
+        row.providerTaskId === null,
+    )
+  )
+    throw new RetryLedgerError('UnknownRetryDispatch');
+  const submitted = new Set(input.submittedUrls);
+  if (
+    state.snapshot.holds.some((hold) =>
+      hold.urls.some((row) => submitted.has(row.url)),
+    )
+  )
+    fail('UrlOverlap');
+}
+// Explicit PRIVATE tuple also binds incidental scope, caps and exact request ID.
+function privateRetryInputIdentity(value: PrepareRetryIntentInput) {
+  const v = value.intent;
+  for (const url of v.submittedUrls)
+    if (
+      typeof url !== 'string' ||
+      url.length > 8192 ||
+      !submittedUrlSchema.safeParse(url).success
+    )
+      fail('InvalidLedgerInput');
+  return JSON.stringify([
+    v.requestId,
+    v.budget.credentialFingerprint,
+    v.budget.budgetScope,
+    v.budget.periodId,
+    v.budget.periodStartMs,
+    v.budget.policyRevision,
+    v.budget.policyDigest,
+    [v.budget.caps.tokens, v.budget.caps.indexer, v.budget.caps.checker],
+    v.taskFamily,
+    v.providerRoute,
+    v.payloadDigest,
+    v.submittedUrls,
+    v.quoteVersion,
+    v.quoteFingerprint,
+    [v.reservation.tokens, v.reservation.indexer, v.reservation.checker],
+    value.parent.family,
+    value.parent.taskId,
+    value.sourceManifestDigest,
+    value.planFingerprint,
+    value.expectedRevision,
+  ]);
+}
+export type RetryCollectCode = RetryLedgerErrorCode | LedgerErrorCode;
+export type RetrySelection = Readonly<{
+  requestId: string;
+  parent: PrepareRetryIntentInput['parent'];
+  title?: string;
+}>;
+export type RetryCollection =
+  | Readonly<{
+      kind: 'candidate';
+      input: PrepareRetryIntentInput;
+      request: PreparedCreateIndexingRequest;
+      proof: RetryProof;
+    }>
+  | Readonly<{ kind: 'blocked'; code: RetryCollectCode }>;
+/** @internal Enclosed authority composition. P1 must supply a same-key latest-source,
+ * complete two-pass HTTP verifier; this factory is not wired to production yet. */
+export function composeVerifiedRetryAdmission(
+  deps: TrustedRetryDependencies,
+): Readonly<{
+  collect(
+    selection: RetrySelection,
+    signal?: AbortSignal,
+  ): Promise<RetryCollection>;
+  open(): VerifiedRetryLedger;
+}> {
+  let configuration: ConfiguredSubmission;
+  try {
+    configuration = freezeSnapshot(structuredClone(deps.configuration));
+    const { policy, digest } = configuration.snapshot;
+    if (
+      configuration.state !== 'configured' ||
+      !policy.enabled ||
+      !submissionPolicySchema.safeParse(policy).success ||
+      configuration.credential.effectiveKey !==
+        configuration.credential.effectiveKey.trim() ||
+      submissionCredentialFingerprint(configuration.credential.effectiveKey) !==
+        configuration.credential.fingerprint ||
+      configuration.credential.fingerprint !== policy.credentialFingerprint ||
+      createHash('sha256')
+        .update('speedyindex-submission-policy-v1\0' + JSON.stringify(policy))
+        .digest('hex') !== digest
+    )
+      fail('InvalidLedgerInput');
+    validatePathInput({ stateDirectory: configuration.stateDirectory });
+  } catch {
+    fail('InvalidLedgerInput');
+  }
+  const { verify, utcMs, monotonicMs, onPhase } = (() => {
+    try {
+      const verifier = deps.verifier;
+      const clock = deps.clock;
+      const hooks = deps.hooks;
+      return {
+        verify: verifier.collectAndVerify.bind(verifier),
+        utcMs: clock.utcMs.bind(clock),
+        monotonicMs: clock.monotonicMs.bind(clock),
+        onPhase: hooks?.onPhase?.bind(hooks),
+      };
+    } catch {
+      fail('InvalidLedgerInput');
+    }
+  })();
+  const hooks: RetryPrepareHooks = onPhase ? { onPhase } : {};
+  const options = Object.freeze({
+    stateDirectory: configuration.stateDirectory,
+  });
+  const binding = configuration.credential.fingerprint;
+  const policy = configuration.snapshot.policy;
+  const records = new WeakMap<
+    RetryProof,
+    {
+      ledgerId: string;
+      input: PrepareRetryIntentInput;
+      identity: string;
+      request: PreparedCreateIndexingRequest;
+      evidence: TrustedRetryEvidence;
+      source: ReturnType<typeof classifyRetrySource>;
+      started: number;
+      expires: number;
+      lastMono: number;
+      signal: AbortSignal | undefined;
+    }
+  >();
+  let collecting = false;
+  let writerOpen = false;
+  let activeProof: RetryProof | undefined;
+  const permission = () => {
+    if (!policy.retry?.enabled)
+      throw new RetryLedgerError('RetryPermissionDenied');
+    return policy.retry;
+  };
+  const checkTime = (
+    record: {
+      started: number;
+      expires: number;
+      lastMono: number;
+      signal: AbortSignal | undefined;
+    },
+    budget?: TrustedBudgetContext,
+  ) => {
+    if (record.signal?.aborted) throw new RetryLedgerError('RetryCancelled');
+    const mono = monotonicMs();
+    if (
+      !Number.isFinite(mono) ||
+      mono < record.lastMono ||
+      mono < record.started ||
+      mono >= record.expires
+    )
+      throw new RetryLedgerError('RetryProofExpired');
+    record.lastMono = mono;
+    const now = utcMs();
+    if (
+      !Number.isSafeInteger(now) ||
+      (budget && !currentRetryPeriod(budget, now))
+    )
+      fail('StalePeriodContext');
+    return now;
+  };
+  const admission: VerifiedAdmission = (database, ledgerId, input) => {
+    // This closure is reachable only from the privately configured writer, AFTER
+    // BEGIN IMMEDIATE and existing-ID replay. Failed consumption is never restored.
+    const record = activeProof && records.get(activeProof);
+    if (activeProof) records.delete(activeProof);
+    if (!record) throw new RetryLedgerError('RetryProofInvalid');
+    const retry = permission();
+    if (
+      record.ledgerId !== ledgerId ||
+      input.intent.budget.credentialFingerprint !== binding ||
+      privateRetryInputIdentity(input) !== record.identity
+    )
+      throw new RetryLedgerError('RetryProofInvalid');
+    const time = {
+      started: record.started,
+      expires: record.expires,
+      lastMono: record.lastMono,
+      signal: record.signal,
+    };
+    checkTime(time, input.intent.budget);
+    const snapshot = projectRetrySnapshot(
+      database,
+      binding,
+      ledgerId,
+      snapshotLimits(),
+    );
+    if (snapshot.revision !== input.expectedRevision)
+      throw new RetryLedgerError('SnapshotConflict');
+    const source = classifyRetrySource(
+      snapshot,
+      input.parent,
+      record.evidence,
+      retry.allowUnattributedParents,
+    );
+    if (JSON.stringify(source) !== JSON.stringify(record.source))
+      throw new RetryLedgerError('RetryProofInvalid');
+    const state = retryPlanningDecision(
+      database,
+      {
+        intent: input.intent,
+        parent: input.parent,
+        maxAttemptsPerSource: retry.maxAttemptsPerSource,
+      },
+      snapshot,
+      utcMs,
+    );
+    assertRetryPlanDecision(state, input.intent);
+    return () => checkTime(time, input.intent.budget);
+  };
+  return Object.freeze({
+    async collect(
+      value: RetrySelection,
+      signal?: AbortSignal,
+    ): Promise<RetryCollection> {
+      if (collecting || writerOpen)
+        return Object.freeze({ kind: 'blocked', code: 'LedgerBusy' });
+      collecting = true;
+      try {
+        const retry = permission();
+        if (signal?.aborted) throw new RetryLedgerError('RetryCancelled');
+        requireKeys(
+          value,
+          value.title === undefined
+            ? ['requestId', 'parent']
+            : ['requestId', 'parent', 'title'],
+        );
+        validateRequestId(value.requestId);
+        validateRetryParent(value.parent);
+        if (
+          value.title !== undefined &&
+          !titleSchema.safeParse(value.title).success
+        )
+          fail('InvalidLedgerInput');
+        const selection = freezeSnapshot(structuredClone(value));
+        const started = monotonicMs();
+        if (!Number.isFinite(started) || !Number.isFinite(started + 60000))
+          throw new RetryLedgerError('RetryProofExpired');
+        const horizon = {
+          started,
+          lastMono: started,
+          expires: started + 60000,
+          signal,
+        };
+        checkTime(horizon);
+        const local = readRetrySnapshot(options, binding);
+        if (local.availability !== 'available')
+          throw new RetryLedgerError('SnapshotUnavailable');
+        checkTime(horizon);
+        // Reader has CLOSED. There is no owned database handle across this await.
+        let raw: TrustedRetryEvidence;
+        try {
+          raw = await verify(selection.parent, local, signal);
+        } catch (error) {
+          if (signal?.aborted) throw new RetryLedgerError('RetryCancelled');
+          throw error;
+        }
+        checkTime(horizon);
+        const { evidence, semanticBytes } = copyRetryEvidence(raw);
+        const source = classifyRetrySource(
+          local,
+          selection.parent,
+          evidence,
+          retry.allowUnattributedParents,
+        );
+        const request = buildCreateIndexingRequest({
+          mode: 'submit',
+          requestId: selection.requestId,
+          searchEngine:
+            selection.parent.family === 'google/indexer' ? 'google' : 'yandex',
+          urls: [...evidence.eligibleUrls],
+          ...(selection.title === undefined ? {} : { title: selection.title }),
+        });
+        if (semanticBytes + request.request.providerBodyBytes > 8 * 1024 * 1024)
+          throw new RetryLedgerError('RetryObservationInvalid');
+        const context = createSubmissionContext(
+          configuration,
+          request.quote.fingerprint,
+          checkTime(horizon),
+        );
+        const intent: PrepareIntentInput = {
+          requestId: selection.requestId,
+          budget: context.budget,
+          taskFamily: request.request.family,
+          providerRoute: request.request.providerRoute,
+          payloadDigest: request.request.payloadDigest,
+          submittedUrls: request.input.urls,
+          quoteVersion: request.quote.version,
+          quoteFingerprint: request.quote.fingerprint,
+          reservation: request.quote.maximumExposure,
+        };
+        const final = readRetryPlanningState(
+          options,
+          binding,
+          {
+            intent,
+            parent: selection.parent,
+            maxAttemptsPerSource: retry.maxAttemptsPerSource,
+          },
+          { now: utcMs },
+        );
+        if (final.availability !== 'available')
+          throw new RetryLedgerError('SnapshotUnavailable');
+        if (
+          final.snapshot.revision !== local.revision ||
+          final.snapshot.ledgerId !== local.ledgerId
+        )
+          throw new RetryLedgerError('SnapshotConflict');
+        assertRetryPlanDecision(final, intent);
+        checkTime(horizon, intent.budget);
+        const authorizationFingerprint = context.authorization.fingerprint;
+        const period = context.authorization.period;
+        if (!authorizationFingerprint || !period) fail('InvalidLedgerInput');
+        const planFingerprint = computeRetryPlanFingerprint({
+          ...source,
+          parent: selection.parent,
+          safetyEvidenceDigests: evidence.safetyEvidenceDigests,
+          partitionDigest: evidence.partitionDigest,
+          revision: final.snapshot.revision,
+          policyDigest: configuration.snapshot.digest,
+          authorizationFingerprint,
+          payloadDigest: request.request.payloadDigest,
+          quoteVersion: request.quote.version,
+          quoteFingerprint: request.quote.fingerprint,
+          period,
+          providerRoute: request.request.providerRoute,
+          urlCount: request.request.urlCount,
+          providerBodyBytes: request.request.providerBodyBytes,
+          reservation: request.quote.maximumExposure,
+        });
+        const input = freezeSnapshot({
+          intent,
+          parent: selection.parent,
+          sourceManifestDigest: source.sourceManifestDigest,
+          planFingerprint,
+          expectedRevision: final.snapshot.revision,
+        });
+        const proof = Object.freeze({}) as RetryProof;
+        records.set(
+          proof,
+          Object.freeze({
+            ledgerId: local.ledgerId,
+            input,
+            identity: privateRetryInputIdentity(input),
+            request,
+            evidence,
+            source,
+            ...horizon,
+          }),
+        );
+        return Object.freeze({ kind: 'candidate', input, request, proof });
+      } catch (error) {
+        const code: RetryCollectCode =
+          error instanceof RetryLedgerError ||
+          error instanceof SubmissionLedgerError
+            ? error.code
+            : 'RetryObservationInvalid';
+        return Object.freeze({ kind: 'blocked', code });
+      } finally {
+        collecting = false;
+      }
+    },
+    open(): VerifiedRetryLedger {
+      if (collecting || writerOpen) fail('LedgerBusy');
+      writerOpen = true;
+      let ledger: LocalSubmissionLedger;
+      try {
+        ledger = openLocalLedger(options, hooks, admission);
+      } catch (error) {
+        writerOpen = false;
+        throw error;
+      }
+      let closed = false;
+      let preparing = false;
+      const bound = (selected: string) => {
+        if (selected !== binding) fail('InvalidLedgerInput');
+      };
+      return Object.freeze<VerifiedRetryLedger>({
+        prepareVerifiedRetryIntent(
+          input: PrepareRetryIntentInput,
+          proof?: RetryProof,
+        ) {
+          if (closed || preparing) fail('LedgerUnavailable');
+          bound(input.intent.budget.credentialFingerprint);
+          preparing = true;
+          activeProof = proof;
+          try {
+            return ledger.prepareRetryIntent(input);
+          } finally {
+            activeProof = undefined;
+            preparing = false;
+          }
+        },
+        claimDispatch: ledger.claimDispatch.bind(ledger),
+        recordDispatchOutcome(value) {
+          bound(value.credentialFingerprint);
+          return ledger.recordDispatchOutcome(value);
+        },
+        cancelPrepared(selected, requestId, version) {
+          bound(selected);
+          return ledger.cancelPrepared(selected, requestId, version);
+        },
+        readIntent(selected, requestId) {
+          bound(selected);
+          return ledger.readIntent(selected, requestId);
+        },
+        close() {
+          if (closed) return;
+          closed = true;
+          try {
+            ledger.close();
+          } finally {
+            writerOpen = false;
+          }
+        },
+      });
+    },
+  });
 }
 
 export type LedgerErrorCode =
@@ -1384,13 +2161,17 @@ function checkToken(value: unknown) {
 class LocalSubmissionLedger implements RetrySubmissionLedger {
   private closed = false;
   private schemaInvalidated = false;
+  readonly #verifiedAdmission: VerifiedAdmission | undefined;
 
   constructor(
     private readonly database: Database,
     private readonly stateDirectory: string,
     private readonly openedSchema: SchemaIdentity,
     private readonly retryHooks: RetryPrepareHooks = {},
-  ) {}
+    verifiedAdmission?: VerifiedAdmission,
+  ) {
+    this.#verifiedAdmission = verifiedAdmission;
+  }
 
   private ensureOpen() {
     if (this.closed || this.schemaInvalidated) fail('LedgerUnavailable');
@@ -1431,7 +2212,7 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
     this.ensureOpen();
     validatePrepareInput(value);
     const input = value;
-    const now = Date.now();
+    let now = this.#verifiedAdmission ? 0 : Date.now();
     if (!Number.isSafeInteger(now)) fail('LedgerUnavailable');
 
     try {
@@ -1474,7 +2255,17 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
           };
         }
 
-        if (retry) this.validateRetryAdmission(retry);
+        let finalVerifiedCheck: (() => number) | undefined;
+        if (retry) {
+          if (this.#verifiedAdmission) {
+            finalVerifiedCheck = this.#verifiedAdmission(
+              this.database,
+              this.openedSchema.ledgerId!,
+              retry,
+            );
+            now = finalVerifiedCheck();
+          } else this.validateRetryAdmission(retry);
+        }
 
         const overlap = this.database
           .query(
@@ -1495,9 +2286,8 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
 
         const capability = mintToken() as DispatchCapability;
         const capabilityDigest = digestToken(capability);
-        this.database
-          .query(
-            `INSERT INTO intents (
+        const insertIntent = this.database.query(
+          `INSERT INTO intents (
               credential_fp, request_id, budget_scope, period_id, period_start_ms,
               policy_revision, policy_digest, task_family, provider_route,
               payload_digest, quote_version, quote_fingerprint,
@@ -1505,26 +2295,27 @@ class LocalSubmissionLedger implements RetrySubmissionLedger {
               state, state_version, claim_token_digest,
               dispatch_outcome_token_digest, created_at_ms, provider_task_id, provider_type
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 0, ?, NULL, ?, NULL, NULL)`,
-          )
-          .run(
-            input.budget.credentialFingerprint,
-            input.requestId,
-            input.budget.budgetScope,
-            input.budget.periodId,
-            input.budget.periodStartMs,
-            input.budget.policyRevision,
-            input.budget.policyDigest,
-            input.taskFamily,
-            input.providerRoute,
-            input.payloadDigest,
-            input.quoteVersion,
-            input.quoteFingerprint,
-            input.reservation.tokens,
-            input.reservation.indexer,
-            input.reservation.checker,
-            capabilityDigest,
-            now,
-          );
+        );
+        if (finalVerifiedCheck) now = finalVerifiedCheck();
+        insertIntent.run(
+          input.budget.credentialFingerprint,
+          input.requestId,
+          input.budget.budgetScope,
+          input.budget.periodId,
+          input.budget.periodStartMs,
+          input.budget.policyRevision,
+          input.budget.policyDigest,
+          input.taskFamily,
+          input.providerRoute,
+          input.payloadDigest,
+          input.quoteVersion,
+          input.quoteFingerprint,
+          input.reservation.tokens,
+          input.reservation.indexer,
+          input.reservation.checker,
+          capabilityDigest,
+          now,
+        );
         const insertUrl = this.database.query(
           `INSERT INTO intent_urls (credential_fp, request_id, ordinal, url_text)
            VALUES (?, ?, ?, ?)`,
@@ -2027,6 +2818,7 @@ export function openRetryLedgerV2(
 function openLocalLedger(
   options: LedgerPathOptions,
   retryHooks?: RetryPrepareHooks,
+  verifiedAdmission?: VerifiedAdmission,
 ): LocalSubmissionLedger {
   validatePathInput(options);
   const uid = ensurePosixRuntime();
@@ -2056,6 +2848,7 @@ function openLocalLedger(
       options.stateDirectory,
       openedSchema,
       retryHooks,
+      verifiedAdmission,
     );
     database = undefined;
     return ledger;
@@ -2177,6 +2970,66 @@ function readPlanningUsage(database: Database, budget: TrustedBudgetContext) {
   return usage;
 }
 
+function retryPlanningDecision(
+  database: Database,
+  value: RetryPlanningInput,
+  snapshot: AvailableRetrySnapshot,
+  now: () => number,
+): RetryPlanningState {
+  let periodCompatible = true;
+  try {
+    validatePeriod(database, value.intent.budget);
+  } catch (error) {
+    if (
+      !(error instanceof SubmissionLedgerError) ||
+      error.code !== 'StalePeriodContext'
+    )
+      throw error;
+    periodCompatible = false;
+  }
+  const usage = readPlanningUsage(database, value.intent.budget);
+  const countRow = database
+    .query<{ count: string }, [string, string, string]>(
+      `SELECT CAST(COUNT(*) AS TEXT) AS count
+      FROM intent_context WHERE credential_fp = ? AND origin_kind = 'retry'
+      AND parent_family = ? AND parent_task_id = ?`,
+    )
+    .get(
+      value.intent.budget.credentialFingerprint,
+      value.parent.family,
+      value.parent.taskId,
+    );
+  if (!countRow) throw new SnapshotReadError('InvalidState');
+  const count = safeIntegerFromText(countRow.count);
+  if (count < 0 || count > snapshotLimits().intents)
+    throw new SnapshotReadError('InvalidState');
+  const withinCaps = { tokens: false, indexer: false, checker: false };
+  for (const unit of units)
+    withinCaps[unit] =
+      usage[unit] + BigInt(value.intent.reservation[unit]) <=
+      BigInt(value.intent.budget.caps[unit]);
+  // Check the trusted wall clock after SQL, then again after close/identity checks.
+  const current = currentRetryPeriod(value.intent.budget, now());
+  return {
+    availability: 'available',
+    snapshot,
+    decision: {
+      periodCompatible: periodCompatible && current,
+      usage: {
+        tokens: usage.tokens.toString(),
+        indexer: usage.indexer.toString(),
+        checker: usage.checker.toString(),
+      },
+      withinCaps,
+      attempts: {
+        count,
+        limit: value.maxAttemptsPerSource,
+        canCreate: count < value.maxAttemptsPerSource,
+      },
+    },
+  };
+}
+
 export function readRetryPlanningState(
   options: LedgerPathOptions,
   credentialFingerprint: string,
@@ -2208,54 +3061,7 @@ export function readRetryPlanningState(
         ledgerId,
         limits,
       );
-      let periodCompatible = true;
-      try {
-        validatePeriod(database, value.intent.budget);
-      } catch (error) {
-        if (
-          !(error instanceof SubmissionLedgerError) ||
-          error.code !== 'StalePeriodContext'
-        )
-          throw error;
-        periodCompatible = false;
-      }
-      const usage = readPlanningUsage(database, value.intent.budget);
-      const countRow = database
-        .query<{ count: string }, [string, string, string]>(
-          `SELECT CAST(COUNT(*) AS TEXT) AS count
-      FROM intent_context WHERE credential_fp = ? AND origin_kind = 'retry'
-      AND parent_family = ? AND parent_task_id = ?`,
-        )
-        .get(credentialFingerprint, value.parent.family, value.parent.taskId);
-      if (!countRow) throw new SnapshotReadError('InvalidState');
-      const count = safeIntegerFromText(countRow.count);
-      if (count < 0 || count > limits.intents)
-        throw new SnapshotReadError('InvalidState');
-      const withinCaps = { tokens: false, indexer: false, checker: false };
-      for (const unit of units)
-        withinCaps[unit] =
-          usage[unit] + BigInt(value.intent.reservation[unit]) <=
-          BigInt(value.intent.budget.caps[unit]);
-      // Check the trusted wall clock after SQL, then again after close/identity checks.
-      const current = currentRetryPeriod(value.intent.budget, now());
-      return {
-        availability: 'available',
-        snapshot,
-        decision: {
-          periodCompatible: periodCompatible && current,
-          usage: {
-            tokens: usage.tokens.toString(),
-            indexer: usage.indexer.toString(),
-            checker: usage.checker.toString(),
-          },
-          withinCaps,
-          attempts: {
-            count,
-            limit: value.maxAttemptsPerSource,
-            canCreate: count < value.maxAttemptsPerSource,
-          },
-        },
-      };
+      return retryPlanningDecision(database, value, snapshot, now);
     },
     (result) => {
       const current = currentRetryPeriod(value.intent.budget, now());
