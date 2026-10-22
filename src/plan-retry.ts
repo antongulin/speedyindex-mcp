@@ -991,7 +991,7 @@ export function buildRetrySemanticIdentity(
     return freezeSnapshot(result);
   } catch (error) {
     if (error instanceof RetrySemanticError)
-      return { status: 'blocked', blockers: [error.code] };
+      return freezeSnapshot({ status: 'blocked', blockers: [error.code] });
     throw error;
   }
 }

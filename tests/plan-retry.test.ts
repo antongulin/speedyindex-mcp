@@ -853,6 +853,57 @@ test('P1B-08 ordered partition and exact regular quote have independent body and
   expect('proof' in identity).toBe(false);
 });
 
+test('P1B-08 blocked identity remains immutable under caller mutations', () => {
+  const value = proposal(),
+    context = createSubmissionContext(
+      configuration(),
+      value.request.quote.fingerprint,
+      utc,
+    ),
+    snapshot = local(),
+    capped = final();
+  for (const { state, blocker } of [
+    {
+      state: {
+        availability: 'unavailable' as const,
+        reason: 'UpgradeRequired' as const,
+      },
+      blocker: 'UpgradeRequired',
+    },
+    {
+      state: {
+        ...capped,
+        decision: {
+          ...capped.decision,
+          withinCaps: { tokens: false, indexer: true, checker: true },
+        },
+      },
+      blocker: 'BudgetExceeded',
+    },
+  ] as const) {
+    const before = JSON.stringify([value, state, context, snapshot]);
+    const result = buildRetrySemanticIdentity(value, state, context, snapshot);
+    const expected = { status: 'blocked', blockers: [blocker] } as const;
+    expect(result).toEqual(expected);
+    const mutable = result as unknown as { status: string; blockers: string[] };
+    for (const mutate of [
+      () => mutable.blockers.push('StateUnavailable'),
+      () => (mutable.blockers[0] = 'SnapshotConflict'),
+      () => (mutable.status = 'comparison'),
+    ]) {
+      try {
+        mutate();
+      } catch {
+        // A rejected write must leave the same refusal intact.
+      }
+      expect(result).toEqual(expected);
+      expect('fingerprint' in result).toBe(false);
+      expect('preimage' in result).toBe(false);
+    }
+    expect(JSON.stringify([value, state, context, snapshot])).toBe(before);
+  }
+});
+
 test('P1B-08 final revision, ledger, allowance, period and every unit cap can refuse identity', () => {
   const value = proposal(),
     context = createSubmissionContext(
