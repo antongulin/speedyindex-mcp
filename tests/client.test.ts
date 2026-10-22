@@ -1334,6 +1334,7 @@ async function p1Http(
   steps: P1Step[],
   timeoutMs = 10_000,
   maxResponseBytes?: number,
+  fixtureFactory: typeof fixture = fixture,
 ) {
   const priorFetch = globalThis.fetch;
   // Guard the default transport before constructing any client in this fixture.
@@ -1364,7 +1365,8 @@ async function p1Http(
   const receiverErrors: unknown[] = [];
   let entries = 0;
   let arrivals = 0;
-  const api = await fixture((req, res) => {
+  let fixtureOrigin = '';
+  const receiverHandler = (req: IncomingMessage, res: ServerResponse) => {
     const step = onWire[arrivals++];
     if (!step) {
       res.destroy();
@@ -1391,7 +1393,7 @@ async function p1Http(
         res.destroy();
       }),
     );
-  });
+  };
   const mapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const step = steps[entries];
     const url = new URL(String(input));
@@ -1411,19 +1413,45 @@ async function p1Http(
     entries++;
     step.outbound = init!.signal as AbortSignal;
     onWire.push(step);
-    const target = new URL(url.pathname, api.origin);
-    expect(target.origin).toBe(api.origin);
+    const target = new URL(url.pathname, fixtureOrigin);
+    expect(target.origin).toBe(fixtureOrigin);
     expect(target.hostname).toBe('127.0.0.1');
     const response = await guardedFetch(target, init);
     await step.hooks?.response?.();
     return step.hooks ? p1Decorate(response, step.hooks) : response;
   }) as typeof fetch;
-  const client = new SpeedyIndexClient(
-    dummyKey,
-    mapped,
-    timeoutMs,
-    maxResponseBytes,
-  );
+  const { api, client } = await (async () => {
+    let api: Awaited<ReturnType<typeof fixture>> | undefined;
+    try {
+      api = await fixtureFactory(receiverHandler);
+      fixtureOrigin = api.origin;
+      const client = new SpeedyIndexClient(
+        dummyKey,
+        mapped,
+        timeoutMs,
+        maxResponseBytes,
+      );
+      return { api, client };
+    } catch (setupError) {
+      let closeFailed = false;
+      let closeFailure: unknown;
+      try {
+        if (api) await bounded(api.close(), 4_000);
+      } catch (error) {
+        closeFailed = true;
+        closeFailure = error;
+      } finally {
+        globalThis.fetch = priorFetch;
+      }
+      if (closeFailed)
+        throw new AggregateError(
+          [setupError, closeFailure],
+          'P1 fixture setup and cleanup both failed.',
+          { cause: setupError },
+        );
+      throw setupError;
+    }
+  })();
   return {
     client,
     mapped,
@@ -1448,6 +1476,7 @@ async function p1Http(
     },
     async close() {
       let cleanupFailure: unknown;
+      let cleanupFailed = false;
       let phase = 'actual work settlement';
       try {
         for (const release of releases) release();
@@ -1461,16 +1490,31 @@ async function p1Http(
         );
         expect(receiverErrors).toEqual([]);
       } catch (error) {
+        cleanupFailed = true;
         cleanupFailure = new Error(
           `P1 fixture failed at ${phase}; entries=${entries}, arrivals=${arrivals}, receiverErrors=${receiverErrors.length}`,
           { cause: error },
         );
-      } finally {
+      }
+      let receiverCloseFailed = false;
+      let receiverCloseFailure: unknown;
+      try {
         // Forced receiver close is teardown only, after proof, or after a FAILED watchdog.
         await api.close();
+      } catch (error) {
+        receiverCloseFailed = true;
+        receiverCloseFailure = error;
+      } finally {
         globalThis.fetch = priorFetch;
       }
-      if (cleanupFailure) throw cleanupFailure;
+      if (cleanupFailed && receiverCloseFailed)
+        throw new AggregateError(
+          [cleanupFailure, receiverCloseFailure],
+          'P1 fixture cleanup and receiver close both failed.',
+          { cause: cleanupFailure },
+        );
+      if (cleanupFailed) throw cleanupFailure;
+      if (receiverCloseFailed) throw receiverCloseFailure;
     },
   };
 }
@@ -1489,6 +1533,169 @@ function p1Code(error: unknown, code: string) {
   expect(error).toBeInstanceOf(ReadBudgetError);
   expect(error).toMatchObject({ code });
 }
+
+test('P1A-R1-SETUP-1: fixture startup rejection restores fetch before recovery', async () => {
+  const priorFetch = globalThis.fetch;
+  const setupError = new Error('Synthetic fixture startup rejection.');
+  let observedError: unknown;
+  let restoredBeforeRecovery: boolean;
+  try {
+    observedError = await p1Error(
+      p1Http([], 10_000, undefined, async () => {
+        throw setupError;
+      }),
+    );
+    restoredBeforeRecovery = globalThis.fetch === priorFetch;
+  } finally {
+    globalThis.fetch = priorFetch;
+  }
+
+  const recovery = await p1Http([p1Step('list')]);
+  try {
+    await recovery.call('list', p1Budget());
+    expect(recovery.entries).toBe(1);
+  } finally {
+    await recovery.close();
+  }
+
+  expect(observedError).toBe(setupError);
+  expect(restoredBeforeRecovery).toBe(true);
+});
+
+test('P1A-R1-SETUP-1: constructor and native close failures retain both causes', async () => {
+  const priorFetch = globalThis.fetch;
+  const cleanupError = new Error('Synthetic fixture close rejection.');
+  let nativeClose: (() => Promise<void>) | undefined;
+  let nativeCloseReceipt: Promise<void> | undefined;
+  let nativeCloseCompletedAt: number | undefined;
+  let closeReceiptBeforeFailure: Promise<void> | undefined;
+  let closeCompletedBeforeFailure: boolean;
+  let observedError: unknown;
+  let restoredBeforeRecovery: boolean;
+
+  const fixtureFactory: typeof fixture = async (handler) => {
+    const created = await fixture(handler);
+    const close = created.close.bind(created);
+    const closeNative = () => {
+      const receipt = close().then(() => {
+        nativeCloseCompletedAt = performance.now();
+      });
+      nativeCloseReceipt = receipt;
+      return receipt;
+    };
+    nativeClose = closeNative;
+    return {
+      ...created,
+      async close() {
+        await closeNative();
+        throw cleanupError;
+      },
+    };
+  };
+
+  try {
+    observedError = await p1Error(p1Http([], 10_000, 0, fixtureFactory));
+    const failureObservedAt = performance.now();
+    closeReceiptBeforeFailure = nativeCloseReceipt;
+    closeCompletedBeforeFailure =
+      nativeCloseCompletedAt !== undefined &&
+      nativeCloseCompletedAt <= failureObservedAt;
+    restoredBeforeRecovery = globalThis.fetch === priorFetch;
+  } finally {
+    try {
+      if (nativeClose) await nativeClose();
+      if (closeReceiptBeforeFailure) await closeReceiptBeforeFailure;
+    } finally {
+      globalThis.fetch = priorFetch;
+    }
+  }
+
+  const recovery = await p1Http([p1Step('list')]);
+  try {
+    await recovery.call('list', p1Budget());
+    expect(recovery.entries).toBe(1);
+  } finally {
+    await recovery.close();
+  }
+
+  expect(observedError).toBeInstanceOf(AggregateError);
+  if (observedError instanceof AggregateError) {
+    expect(observedError.errors).toHaveLength(2);
+    expect(observedError.errors[0]).toBeInstanceOf(RangeError);
+    expect(observedError.errors[0]).toMatchObject({
+      message:
+        'maxResponseBytes must be a positive integer no greater than 16 MiB.',
+    });
+    expect(observedError.errors[1]).toBe(cleanupError);
+  }
+  expect(closeReceiptBeforeFailure).toBeDefined();
+  expect(closeCompletedBeforeFailure).toBe(true);
+  expect(restoredBeforeRecovery).toBe(true);
+});
+
+test('P1A-R1-SETUP-1: returned close restores fetch when native close rejects', async () => {
+  const priorFetch = globalThis.fetch;
+  const cleanupError = new Error('Synthetic fixture close rejection.');
+  let nativeClose: (() => Promise<void>) | undefined;
+  let nativeCloseReceipt: Promise<void> | undefined;
+  let nativeCloseCompletedAt: number | undefined;
+  let closeReceiptBeforeFailure: Promise<void> | undefined;
+  let closeCompletedBeforeFailure: boolean;
+  let observedError: unknown;
+  let restoredBeforeRecovery: boolean;
+
+  const fixtureFactory: typeof fixture = async (handler) => {
+    const created = await fixture(handler);
+    const close = created.close.bind(created);
+    const closeNative = () => {
+      const receipt = close().then(() => {
+        nativeCloseCompletedAt = performance.now();
+      });
+      nativeCloseReceipt = receipt;
+      return receipt;
+    };
+    nativeClose = closeNative;
+    return {
+      ...created,
+      async close() {
+        await closeNative();
+        throw cleanupError;
+      },
+    };
+  };
+
+  const api = await p1Http([p1Step('list')], 10_000, undefined, fixtureFactory);
+  try {
+    await api.call('list', p1Budget());
+    observedError = await p1Error(api.close());
+    const failureObservedAt = performance.now();
+    closeReceiptBeforeFailure = nativeCloseReceipt;
+    closeCompletedBeforeFailure =
+      nativeCloseCompletedAt !== undefined &&
+      nativeCloseCompletedAt <= failureObservedAt;
+    restoredBeforeRecovery = globalThis.fetch === priorFetch;
+  } finally {
+    try {
+      if (nativeClose) await nativeClose();
+      if (closeReceiptBeforeFailure) await closeReceiptBeforeFailure;
+    } finally {
+      globalThis.fetch = priorFetch;
+    }
+  }
+
+  const recovery = await p1Http([p1Step('list')]);
+  try {
+    await recovery.call('list', p1Budget());
+    expect(recovery.entries).toBe(1);
+  } finally {
+    await recovery.close();
+  }
+
+  expect(observedError).toBe(cleanupError);
+  expect(closeReceiptBeforeFailure).toBeDefined();
+  expect(closeCompletedBeforeFailure).toBe(true);
+  expect(restoredBeforeRecovery).toBe(true);
+});
 
 test('P1A-01: lower-only construction, captured runtime and immutable limits fail safely before dispatch', async () => {
   const api = await p1Http([p1Step('list'), p1Step('list')]);
