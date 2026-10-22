@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { buildCreateIndexingRequest } from '../src/create-indexing-task';
 import { expect, test } from 'bun:test';
 import {
   assessRetryObservations,
@@ -27,6 +28,7 @@ import type { AvailableRetrySnapshot } from '../src/retry-ledger-snapshot';
 import {
   computeRetryPlanFingerprint,
   type RetryPlanningState,
+  type RetryPlanFingerprintInput,
 } from '../src/submission-ledger';
 import {
   createSubmissionContext,
@@ -851,6 +853,138 @@ test('P1B-08 ordered partition and exact regular quote have independent body and
   expect(JSON.stringify(identity.preimage)).not.toContain('synthetic-ledger');
   expect(JSON.stringify(identity.preimage)).not.toContain('pure-synthetic-key');
   expect('proof' in identity).toBe(false);
+});
+
+test('R4-3733-QUOTE-BINDING-01 rejects a real context for a different regular quote', () => {
+  const config = configuration(),
+    snapshot = local(),
+    planning = final(snapshot);
+  const value = proposal(undefined, snapshot, config.snapshot.policy);
+  const other = buildCreateIndexingRequest({
+    mode: 'preview',
+    searchEngine: 'google',
+    urls: [A],
+  });
+  const matching = createSubmissionContext(
+    config,
+    value.request.quote.fingerprint,
+    utc,
+  );
+  const wrongQuote = createSubmissionContext(
+    config,
+    other.quote.fingerprint,
+    utc,
+  );
+  const inputs = [
+    config,
+    snapshot,
+    planning,
+    value,
+    other,
+    matching,
+    wrongQuote,
+  ];
+  const before = structuredClone(inputs);
+  const body =
+    '{"urls":["https://example.test/A?b=1&a=2","https://example.test/A/?b=1&a=2"],"pay_per_indexed":true,"drip_feed":false}';
+  const payloadDigest = createHash('sha256').update(body).digest('hex');
+  const quoteVersion = 'speedyindex-indexing-batch-2026-10-20-v1';
+  const providerRoute = '/v2/task/google/indexer/create';
+  const reservation = { tokens: 200, indexer: 0, checker: 0 };
+  const quoteFingerprint = H('speedyindex-create-quote-v1', {
+    version: quoteVersion,
+    family,
+    providerRoute,
+    payloadDigest,
+    urlCount: 2,
+    maximumExposure: reservation,
+  });
+  const period = {
+    id: 'utc-day:2026-10-21',
+    startMs: Date.parse('2026-10-21T00:00:00Z'),
+    endMs: Date.parse('2026-10-22T00:00:00Z'),
+  };
+  const authorizationFingerprint = H(
+    'speedyindex-submission-authorization-v1',
+    {
+      quoteFingerprint,
+      policyDigest: config.snapshot.digest,
+      credentialFingerprint: config.credential.fingerprint,
+      budgetScope: 'pure',
+      periodId: period.id,
+      periodStartMs: period.startMs,
+    },
+  );
+  const expectedPreimage: RetryPlanFingerprintInput = {
+    parent: { family, taskId: 'parent' },
+    provenance: 'external_unattributed',
+    originalManifestKnown: false,
+    manifestProvenance: 'provider_report_observed_corpus',
+    sourceManifestDigest: value.source.manifestDigest,
+    safetyEvidenceDigests: value.safetyEvidenceDigests,
+    partitionDigest: H('speedyindex-retry-partition-v1', [
+      [A, B],
+      [A, B],
+      [],
+      [0, null],
+    ]),
+    revision: digest,
+    policyDigest: config.snapshot.digest,
+    authorizationFingerprint,
+    payloadDigest,
+    quoteVersion,
+    quoteFingerprint,
+    period,
+    providerRoute,
+    urlCount: 2,
+    providerBodyBytes: Buffer.byteLength(body, 'utf8'),
+    reservation,
+  };
+  const expectedFingerprint = H('speedyindex-retry-plan-v1', [
+    family,
+    'parent',
+    'external_unattributed',
+    false,
+    'provider_report_observed_corpus',
+    value.source.manifestDigest,
+    value.safetyEvidenceDigests,
+    expectedPreimage.partitionDigest,
+    digest,
+    config.snapshot.digest,
+    authorizationFingerprint,
+    payloadDigest,
+    quoteVersion,
+    quoteFingerprint,
+    [period.id, period.startMs, period.endMs],
+    providerRoute,
+    2,
+    Buffer.byteLength(body, 'utf8'),
+    [200, 0, 0],
+  ]);
+  expect(value.request.body).toBe(body);
+  expect(value.request.quote.fingerprint).toBe(quoteFingerprint);
+  expect(other.request.urlCount).toBe(1);
+  expect(other.quote.fingerprint).not.toBe(quoteFingerprint);
+  expect(
+    buildRetrySemanticIdentity(value, planning, matching, snapshot),
+  ).toEqual({
+    status: 'comparison',
+    preimage: expectedPreimage,
+    fingerprint: expectedFingerprint,
+  });
+  const mismatched = buildRetrySemanticIdentity(
+    value,
+    planning,
+    wrongQuote,
+    snapshot,
+  );
+  expect(inputs).toEqual(before);
+  expect(mismatched).toEqual({
+    status: 'blocked',
+    blockers: ['SnapshotConflict'],
+  });
+  for (const key of ['fingerprint', 'preimage', 'proof'])
+    expect(key in mismatched).toBe(false);
 });
 
 test('P1B-08 R3-9049-PURITY1 caller can revise an unindexed URL without changing an earlier comparison', () => {

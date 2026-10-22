@@ -954,6 +954,8 @@ export function buildRetrySemanticIdentity(
       !authorization.policyDigest
     )
       refuse('StateUnavailable');
+    if (context.quoteFingerprint !== proposal.request.quote.fingerprint)
+      refuse('SnapshotConflict');
     const preimage: RetryPlanFingerprintInput = {
       parent: {
         family: proposal.source.reference[0],
