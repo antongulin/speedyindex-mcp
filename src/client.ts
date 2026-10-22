@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { version } from '../package.json';
+import { ReadBudgetError, type InvocationReadBudget } from './read-budget';
 import {
   normalizeTaskReport,
   TaskReportError,
@@ -310,6 +311,179 @@ async function requestJson(
   }
 }
 
+type Receipt<T> = { ok: true; value: T } | { ok: false; error: unknown };
+function observe<T>(operation: Promise<T>): Promise<Receipt<T>> {
+  return operation.then(
+    (value) => ({ ok: true, value }),
+    (error: unknown) => ({ ok: false, error }),
+  );
+}
+
+/** Opt-in settlement boundary, including synchronous normalization/checkpoints. */
+async function requestBudgetedJson<T>(
+  fetchRequest: typeof fetch,
+  key: string,
+  endpoint: string,
+  options: JsonRequestOptions,
+  budget: InvocationReadBudget,
+  normalize: (body: unknown) => T,
+): Promise<T> {
+  let responseBody: ReadableStream<Uint8Array> | null | undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let closed: Promise<Receipt<void>> | undefined;
+  let read:
+    | Promise<
+        Receipt<
+          Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>
+        >
+      >
+    | undefined;
+  let cancellation: Promise<Receipt<void>> | undefined;
+  let cancelStarted = false;
+  let eof = false;
+  const readErrors: unknown[] = [];
+  function cancelOwned() {
+    if (!responseBody || cancelStarted || eof) return;
+    cancelStarted = true;
+    try {
+      cancellation = observe(reader ? reader.cancel() : responseBody.cancel());
+    } catch (error) {
+      cancellation = Promise.resolve({ ok: false, error });
+    }
+  }
+  const lease = budget.acquire(
+    options.signal,
+    options.timeoutMs,
+    new RequestError('timeout'),
+    cancelOwned,
+  );
+  let result: T | undefined;
+  let failure: Error | undefined;
+  let stage: RequestErrorKind = 'network';
+  let cleanupFailed = false;
+  try {
+    lease.enterFetch();
+    // Entered fetches stay charged, including a synchronous transport throw.
+    const response = await fetchRequest(endpoint, {
+      method: options.method,
+      headers: {
+        Authorization: key,
+        Accept: 'application/json',
+        'User-Agent': `speedyindex-mcp/${version}`,
+        ...(options.method === 'POST'
+          ? { 'Content-Type': 'application/json' }
+          : {}),
+      },
+      redirect: 'error',
+      signal: lease.signal,
+      ...(options.body === undefined ? {} : { body: options.body }),
+    });
+    // Register a late response before checking an abort/deadline selected meanwhile.
+    responseBody = response.body;
+    lease.checkpoint();
+    if (!response.ok) throw new RequestError('http');
+    stage = 'response';
+    if (!responseBody) throw new RequestError('response');
+    reader = responseBody.getReader();
+    closed = observe(reader.closed);
+    let bytes = new Uint8Array(Math.min(options.maxResponseBytes, 1024));
+    let byteLength = 0;
+    while (true) {
+      lease.checkpoint();
+      read = observe(reader.read());
+      const receipt = await read;
+      if (!receipt.ok) {
+        readErrors.push(receipt.error);
+        throw new RequestError('response');
+      }
+      const { done, value } = receipt.value;
+      // Every delivered chunk is charged BEFORE cancellation/expiry and copying.
+      if (value) lease.chargeDecodedBytes(value.byteLength);
+      else lease.checkpoint();
+      if (done) {
+        eof = true;
+        break;
+      }
+      const nextByteLength = byteLength + value.byteLength;
+      if (nextByteLength > options.maxResponseBytes)
+        throw new RequestError('response');
+      if (nextByteLength > bytes.byteLength) {
+        const capacity = Math.min(
+          options.maxResponseBytes,
+          Math.max(bytes.byteLength * 2, nextByteLength),
+        );
+        const expanded = new Uint8Array(capacity);
+        expanded.set(bytes.subarray(0, byteLength));
+        bytes = expanded;
+      }
+      bytes.set(value, byteLength);
+      byteLength = nextByteLength;
+    }
+    lease.checkpoint();
+    const body: unknown = JSON.parse(
+      new TextDecoder().decode(bytes.subarray(0, byteLength)),
+    );
+    lease.checkpoint();
+    result = normalize(body);
+    lease.checkpoint();
+  } catch (error) {
+    failure = lease.fail(
+      error instanceof RequestError ||
+        error instanceof ReadBudgetError ||
+        error instanceof TaskListError ||
+        error instanceof TaskStatusError ||
+        error instanceof TaskReportError
+        ? error
+        : new RequestError(stage),
+    );
+  } finally {
+    // Await actual owned receipts. Cancellation never races a surviving fetch/read.
+    if (!eof || failure) cancelOwned();
+    const readReceipt = await read;
+    if (readReceipt && !readReceipt.ok) readErrors.push(readReceipt.error);
+    const closedReceipt = await closed;
+    if (closedReceipt && !closedReceipt.ok) {
+      readErrors.push(closedReceipt.error);
+      if (!failure) cleanupFailed = true;
+    }
+    const cancelReceipt = await cancellation;
+    if (cancelReceipt && !cancelReceipt.ok) {
+      const error = cancelReceipt.error;
+      const expectedAbort =
+        error instanceof Error && error.name === 'AbortError';
+      if (!expectedAbort && !readErrors.includes(error)) cleanupFailed = true;
+    }
+    try {
+      reader?.releaseLock();
+    } catch {
+      cleanupFailed = true;
+    }
+    failure = lease.finish(cleanupFailed) ?? failure;
+  }
+  if (failure) throw failure;
+  return result!;
+}
+
+function readJson<T>(
+  fetchRequest: typeof fetch,
+  key: string,
+  endpoint: string,
+  options: JsonRequestOptions,
+  budget: InvocationReadBudget | undefined,
+  normalize: (body: unknown) => T,
+): Promise<T> {
+  if (budget)
+    return requestBudgetedJson(
+      fetchRequest,
+      key,
+      endpoint,
+      options,
+      budget,
+      normalize,
+    );
+  return requestJson(fetchRequest, key, endpoint, options).then(normalize);
+}
+
 /** One read request, no redirects or retries. The fetch seam supports tests. */
 export class SpeedyIndexClient {
   constructor(
@@ -357,7 +531,11 @@ export class SpeedyIndexClient {
     }
   }
 
-  async listTasks(input: unknown, signal?: AbortSignal) {
+  async listTasks(
+    input: unknown,
+    signal?: AbortSignal,
+    budget?: InvocationReadBudget,
+  ) {
     const parsedInput = listTasksInputSchema.safeParse(input);
     if (!parsedInput.success) throw new TaskListError('input');
     const args = parsedInput.data;
@@ -374,7 +552,7 @@ export class SpeedyIndexClient {
       endpoint.searchParams.set('pay_per_indexed', String(args.payPerIndexed));
 
     try {
-      const body = await requestJson(
+      return await readJson(
         this.fetchAccount,
         key,
         endpoint.toString(),
@@ -384,26 +562,35 @@ export class SpeedyIndexClient {
           maxResponseBytes: this.maxResponseBytes,
           ...(signal === undefined ? {} : { signal }),
         },
+        budget,
+        (body) => {
+          const envelope = z.object({ code: z.number() }).safeParse(body);
+          if (!envelope.success) throw new TaskListError('response');
+          if (envelope.data.code !== 0) throw new TaskListError('provider');
+          const response = taskListEnvelopeSchema.safeParse(body);
+          if (!response.success || response.data.page !== args.page)
+            throw new TaskListError('response');
+          if (
+            response.data.result.length > 0 &&
+            response.data.last_page < args.page
+          )
+            throw new TaskListError('response');
+          return listTasksResultSchema.parse({
+            searchEngine: args.searchEngine,
+            taskType: args.taskType,
+            page: args.page,
+            lastPage: response.data.last_page,
+            tasks: response.data.result,
+          });
+        },
       );
-      const envelope = z.object({ code: z.number() }).safeParse(body);
-      if (!envelope.success) throw new TaskListError('response');
-      if (envelope.data.code !== 0) throw new TaskListError('provider');
-      const response = taskListEnvelopeSchema.safeParse(body);
-      if (!response.success || response.data.page !== args.page)
-        throw new TaskListError('response');
-      if (
-        response.data.result.length > 0 &&
-        response.data.last_page < args.page
-      )
-        throw new TaskListError('response');
-      return listTasksResultSchema.parse({
-        searchEngine: args.searchEngine,
-        taskType: args.taskType,
-        page: args.page,
-        lastPage: response.data.last_page,
-        tasks: response.data.result,
-      });
     } catch (error) {
+      if (budget) {
+        if (error instanceof ReadBudgetError || error instanceof RangeError)
+          throw error;
+        if (error instanceof TaskListError) throw error;
+        if (error instanceof RequestError) throw new TaskListError(error.kind);
+      }
       if (signal?.aborted) throw new TaskListError('cancelled');
       if (error instanceof TaskListError) throw error;
       if (error instanceof RequestError) throw new TaskListError(error.kind);
@@ -412,7 +599,11 @@ export class SpeedyIndexClient {
     }
   }
 
-  async getTaskStatus(input: unknown, signal?: AbortSignal) {
+  async getTaskStatus(
+    input: unknown,
+    signal?: AbortSignal,
+    budget?: InvocationReadBudget,
+  ) {
     const parsedInput = taskStatusInputSchema.safeParse(input);
     if (!parsedInput.success) throw new TaskStatusError('input');
     const args = parsedInput.data;
@@ -427,7 +618,7 @@ export class SpeedyIndexClient {
         : { task_id: args.taskId };
 
     try {
-      const response = await requestJson(
+      return await readJson(
         this.fetchAccount,
         key,
         new URL(taskStatusRoutes[args.family], apiOrigin).toString(),
@@ -438,9 +629,18 @@ export class SpeedyIndexClient {
           ...(signal === undefined ? {} : { signal }),
           body: JSON.stringify(requestBody),
         },
+        budget,
+        (response) =>
+          normalizeTaskStatusResult(args.family, requestedIds, response),
       );
-      return normalizeTaskStatusResult(args.family, requestedIds, response);
     } catch (error) {
+      if (budget) {
+        if (error instanceof ReadBudgetError || error instanceof RangeError)
+          throw error;
+        if (error instanceof TaskStatusError) throw error;
+        if (error instanceof RequestError)
+          throw new TaskStatusError(error.kind);
+      }
       if (signal?.aborted) throw new TaskStatusError('cancelled');
       if (error instanceof TaskStatusError) throw error;
       if (error instanceof RequestError) throw new TaskStatusError(error.kind);
@@ -448,7 +648,11 @@ export class SpeedyIndexClient {
     }
   }
 
-  async getTaskReport(input: unknown, signal?: AbortSignal) {
+  async getTaskReport(
+    input: unknown,
+    signal?: AbortSignal,
+    budget?: InvocationReadBudget,
+  ) {
     const parsedInput = taskReportInputSchema.safeParse(input);
     if (!parsedInput.success) throw new TaskReportError('input');
     const args = parsedInput.data;
@@ -461,7 +665,7 @@ export class SpeedyIndexClient {
       : { task_id: args.taskId };
 
     try {
-      const response = await requestJson(
+      return await readJson(
         this.fetchAccount,
         key,
         new URL(taskReportRoutes[args.family], apiOrigin).toString(),
@@ -472,9 +676,17 @@ export class SpeedyIndexClient {
           ...(signal === undefined ? {} : { signal }),
           body: JSON.stringify(requestBody),
         },
+        budget,
+        (response) => normalizeTaskReport(args, response),
       );
-      return normalizeTaskReport(args, response);
     } catch (error) {
+      if (budget) {
+        if (error instanceof ReadBudgetError || error instanceof RangeError)
+          throw error;
+        if (error instanceof TaskReportError) throw error;
+        if (error instanceof RequestError)
+          throw new TaskReportError(error.kind);
+      }
       if (signal?.aborted) throw new TaskReportError('cancelled');
       if (error instanceof TaskReportError) throw error;
       if (error instanceof RequestError) throw new TaskReportError(error.kind);

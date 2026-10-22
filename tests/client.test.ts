@@ -1,5 +1,12 @@
 import { expect, test } from 'bun:test';
 import { gzipSync } from 'node:zlib';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import {
+  createInvocationReadBudget,
+  ReadBudgetError,
+  type InvocationReadBudget,
+  type ReadBudgetRuntime,
+} from '../src/read-budget';
 import { SpeedyIndexClient } from '../src/client';
 import {
   account,
@@ -1154,4 +1161,1536 @@ test('RB-08: response limit constructor seam is positive, integral, and lower-on
     ).toThrow(RangeError);
   }
   expect(requests).toBe(0);
+});
+
+// P1A fixtures keep phase/receipt controls local to the owning client suite.
+type P1Kind = 'list' | 'status' | 'report';
+const p1List = { searchEngine: 'google', taskType: 'indexer', page: 0 };
+const p1Task = { family: 'google/indexer', taskId: 'p1-task' };
+function p1Envelope(kind: P1Kind) {
+  if (kind === 'list')
+    return listResponse(0, [{ id: 'p1-task', title: 'é🧪' }]);
+  if (kind === 'status') return { code: 0, result: [{ id: 'p1-task' }] };
+  return {
+    code: 0,
+    result: {
+      id: 'p1-task',
+      size: 1,
+      processed_count: 1,
+      indexed_links: ['https://synthetic.invalid/é'],
+      unindexed_links: [],
+      type: 'google/indexer',
+      title: 'é🧪',
+      created_at: 'synthetic-date',
+    },
+  };
+}
+function p1Invoke(
+  client: SpeedyIndexClient,
+  kind: P1Kind,
+  budget: InvocationReadBudget,
+  signal?: AbortSignal,
+) {
+  if (kind === 'list') return client.listTasks(p1List, signal, budget);
+  if (kind === 'status') return client.getTaskStatus(p1Task, signal, budget);
+  return client.getTaskReport(p1Task, signal, budget);
+}
+
+class P1Clock implements ReadBudgetRuntime {
+  time = 0;
+  sequence = 0;
+  handles = new Map<number, { due: number; callback: () => void }>();
+  now() {
+    return this.time;
+  }
+  setTimeout(callback: () => void, delayMs: number) {
+    const id = ++this.sequence;
+    this.handles.set(id, { due: this.time + delayMs, callback });
+    return id;
+  }
+  clearTimeout(handle: unknown) {
+    this.handles.delete(handle as number);
+  }
+  advance(time: number, fire = true) {
+    this.time = time;
+    if (!fire) return;
+    for (const [id, timer] of [...this.handles].sort(
+      (a, b) => a[1].due - b[1].due,
+    )) {
+      if (timer.due <= time && this.handles.delete(id)) timer.callback();
+    }
+  }
+}
+function p1Budget(
+  limits: Parameters<typeof createInvocationReadBudget>[1] = {},
+  signal?: AbortSignal,
+) {
+  return createInvocationReadBudget(
+    {
+      startedAtMs: limits.runtime?.now() ?? performance.now(),
+      ...(signal ? { signal } : {}),
+    },
+    limits,
+  );
+}
+
+type P1Read = Awaited<
+  ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>
+>;
+type P1Hooks = {
+  readStart?: () => void;
+  read?: (value: P1Read) => void;
+  reader?: (reader: ReadableStreamDefaultReader<Uint8Array>) => void;
+  cancelled?: () => Promise<void>;
+  cancelReceipt?: (receipt: Promise<void>) => void;
+  releasing?: () => void;
+  released?: () => void;
+  response?: () => Promise<void>;
+};
+// Each wrapper delegates the native operation; gates only delay its JS receipt.
+function p1Decorate(response: Response, hooks: P1Hooks): Response {
+  const body = response.body;
+  if (!body) return response;
+  const cancel = (operation: () => Promise<void>) => {
+    const receipt = (async () => {
+      try {
+        await operation();
+      } finally {
+        await hooks.cancelled?.();
+      }
+    })();
+    hooks.cancelReceipt?.(receipt);
+    return receipt;
+  };
+  const decoratedBody = new Proxy(body, {
+    get(target, property) {
+      if (property === 'cancel') return () => cancel(() => target.cancel());
+      if (property === 'getReader')
+        return () => {
+          const reader = target.getReader();
+          hooks.reader?.(reader);
+          return new Proxy(reader, {
+            get(targetReader, field) {
+              if (field === 'read')
+                return async () => {
+                  hooks.readStart?.();
+                  const value = await targetReader.read();
+                  hooks.read?.(value);
+                  return value;
+                };
+              if (field === 'cancel')
+                return () => cancel(() => targetReader.cancel());
+              if (field === 'releaseLock')
+                return () => {
+                  hooks.releasing?.();
+                  targetReader.releaseLock();
+                  hooks.released?.();
+                };
+              const value = Reflect.get(
+                targetReader,
+                field,
+                targetReader,
+              ) as unknown;
+              return typeof value === 'function'
+                ? value.bind(targetReader)
+                : value;
+            },
+          });
+        };
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return new Proxy(response, {
+    get(target, property) {
+      if (property === 'body') return decoratedBody;
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+type P1Step = {
+  kind: P1Kind;
+  payload?: string | Buffer;
+  serve?: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+  hooks?: P1Hooks;
+  received: ReturnType<typeof deferred<void>>;
+  terminated: ReturnType<typeof deferred<void>>;
+  outbound?: AbortSignal;
+};
+function p1Step(
+  kind: P1Kind,
+  options: Partial<Pick<P1Step, 'payload' | 'serve' | 'hooks'>> = {},
+): P1Step {
+  return {
+    kind,
+    ...options,
+    received: deferred<void>(),
+    terminated: deferred<void>(),
+  };
+}
+async function p1Http(
+  steps: P1Step[],
+  timeoutMs = 10_000,
+  maxResponseBytes?: number,
+  fixtureFactory: typeof fixture = fixture,
+) {
+  const priorFetch = globalThis.fetch;
+  // Guard the default transport before constructing any client in this fixture.
+  globalThis.fetch = Object.assign(
+    (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (
+        url.protocol !== 'http:' ||
+        url.hostname !== '127.0.0.1' ||
+        url.username ||
+        url.password
+      )
+        throw new Error('P1 fixture blocked external transport.');
+      return priorFetch(input, init);
+    },
+    {
+      preconnect: () => {
+        throw new Error('P1 fixture blocked preconnect.');
+      },
+    },
+  ) as typeof fetch;
+  const guardedFetch = globalThis.fetch;
+  const onWire: P1Step[] = [];
+  const bodies: string[] = [];
+  const pending: Promise<unknown>[] = [];
+  const budgets = new Set<InvocationReadBudget>();
+  const releases: (() => void)[] = [];
+  const receiverErrors: unknown[] = [];
+  let entries = 0;
+  let arrivals = 0;
+  let fixtureOrigin = '';
+  const receiverHandler = (req: IncomingMessage, res: ServerResponse) => {
+    const step = onWire[arrivals++];
+    if (!step) {
+      res.destroy();
+      receiverErrors.push(new Error('Unexpected receiver arrival.'));
+      return;
+    }
+    res.on('close', () => step.terminated.resolve());
+    const work = (async () => {
+      let body = '';
+      for await (const chunk of req) body += String(chunk);
+      bodies.push(body);
+      expect(body).toBe(step.kind === 'list' ? '' : '{"task_id":"p1-task"}');
+      expect(req.method).toBe(step.kind === 'list' ? 'GET' : 'POST');
+      expect(req.url).toBe(
+        `/v2/task/google/indexer/${step.kind === 'list' ? 'list/0' : step.kind}`,
+      );
+      step.received.resolve();
+      if (step.serve) await step.serve(req, res);
+      else res.end(step.payload ?? JSON.stringify(p1Envelope(step.kind)));
+    })();
+    pending.push(
+      work.catch((error: unknown) => {
+        receiverErrors.push(error);
+        res.destroy();
+      }),
+    );
+  };
+  const mapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const step = steps[entries];
+    const url = new URL(String(input));
+    expect(step).toBeDefined();
+    if (!step) throw new Error('Unexpected extra dispatch.');
+    expect(url.origin).toBe('https://api.speedyindex.com');
+    expect(url.username + url.password + url.hash + url.search).toBe('');
+    expect(url.pathname).toBe(
+      `/v2/task/google/indexer/${step.kind === 'list' ? 'list/0' : step.kind}`,
+    );
+    expect(init?.method).toBe(step.kind === 'list' ? 'GET' : 'POST');
+    expect(init?.body).toBe(
+      step.kind === 'list' ? undefined : '{"task_id":"p1-task"}',
+    );
+    expect(init?.redirect).toBe('error');
+    expect(new Headers(init?.headers).get('authorization')).toBe(dummyKey);
+    entries++;
+    step.outbound = init!.signal as AbortSignal;
+    onWire.push(step);
+    const target = new URL(url.pathname, fixtureOrigin);
+    expect(target.origin).toBe(fixtureOrigin);
+    expect(target.hostname).toBe('127.0.0.1');
+    const response = await guardedFetch(target, init);
+    await step.hooks?.response?.();
+    return step.hooks ? p1Decorate(response, step.hooks) : response;
+  }) as typeof fetch;
+  const { api, client } = await (async () => {
+    let api: Awaited<ReturnType<typeof fixture>> | undefined;
+    try {
+      api = await fixtureFactory(receiverHandler);
+      fixtureOrigin = api.origin;
+      const client = new SpeedyIndexClient(
+        dummyKey,
+        mapped,
+        timeoutMs,
+        maxResponseBytes,
+      );
+      return { api, client };
+    } catch (setupError) {
+      let closeFailed = false;
+      let closeFailure: unknown;
+      try {
+        if (api) await bounded(api.close(), 4_000);
+      } catch (error) {
+        closeFailed = true;
+        closeFailure = error;
+      } finally {
+        globalThis.fetch = priorFetch;
+      }
+      if (closeFailed)
+        throw new AggregateError(
+          [setupError, closeFailure],
+          'P1 fixture setup and cleanup both failed.',
+          { cause: setupError },
+        );
+      throw setupError;
+    }
+  })();
+  return {
+    client,
+    mapped,
+    bodies,
+    releases,
+    get entries() {
+      return entries;
+    },
+    get arrivals() {
+      return arrivals;
+    },
+    call(kind: P1Kind, budget: InvocationReadBudget, signal?: AbortSignal) {
+      budgets.add(budget);
+      const operation = p1Invoke(client, kind, budget, signal);
+      pending.push(
+        operation.then(
+          () => undefined,
+          () => undefined,
+        ),
+      );
+      return operation;
+    },
+    async close() {
+      let cleanupFailure: unknown;
+      let cleanupFailed = false;
+      let phase = 'actual work settlement';
+      try {
+        for (const release of releases) release();
+        const closing = [...budgets].map((budget) => budget.close());
+        await bounded(Promise.allSettled([...pending, ...closing]), 4_000);
+        // An idle keepalive socket is not active request work. Each response must terminate.
+        phase = 'peer request termination';
+        await bounded(
+          Promise.all(onWire.map((step) => step.terminated.promise)),
+          4_000,
+        );
+        expect(receiverErrors).toEqual([]);
+      } catch (error) {
+        cleanupFailed = true;
+        cleanupFailure = new Error(
+          `P1 fixture failed at ${phase}; entries=${entries}, arrivals=${arrivals}, receiverErrors=${receiverErrors.length}`,
+          { cause: error },
+        );
+      }
+      let receiverCloseFailed = false;
+      let receiverCloseFailure: unknown;
+      try {
+        // Forced receiver close is teardown only, after proof, or after a FAILED watchdog.
+        await api.close();
+      } catch (error) {
+        receiverCloseFailed = true;
+        receiverCloseFailure = error;
+      } finally {
+        globalThis.fetch = priorFetch;
+      }
+      if (cleanupFailed && receiverCloseFailed)
+        throw new AggregateError(
+          [cleanupFailure, receiverCloseFailure],
+          'P1 fixture cleanup and receiver close both failed.',
+          { cause: cleanupFailure },
+        );
+      if (cleanupFailed) throw cleanupFailure;
+      if (receiverCloseFailed) throw receiverCloseFailure;
+    },
+  };
+}
+
+async function p1Error(operation: Promise<unknown>) {
+  return bounded(
+    operation.then(
+      () => {
+        throw new Error('Expected a read failure.');
+      },
+      (error: unknown) => error,
+    ),
+  );
+}
+function p1Code(error: unknown, code: string) {
+  expect(error).toBeInstanceOf(ReadBudgetError);
+  expect(error).toMatchObject({ code });
+}
+
+test('P1A-R1-SETUP-1: fixture startup rejection restores fetch before recovery', async () => {
+  const priorFetch = globalThis.fetch;
+  const setupError = new Error('Synthetic fixture startup rejection.');
+  let observedError: unknown;
+  let restoredBeforeRecovery: boolean;
+  try {
+    observedError = await p1Error(
+      p1Http([], 10_000, undefined, async () => {
+        throw setupError;
+      }),
+    );
+    restoredBeforeRecovery = globalThis.fetch === priorFetch;
+  } finally {
+    globalThis.fetch = priorFetch;
+  }
+
+  const recovery = await p1Http([p1Step('list')]);
+  try {
+    await recovery.call('list', p1Budget());
+    expect(recovery.entries).toBe(1);
+  } finally {
+    await recovery.close();
+  }
+
+  expect(observedError).toBe(setupError);
+  expect(restoredBeforeRecovery).toBe(true);
+});
+
+test('P1A-R1-SETUP-1: constructor and native close failures retain both causes', async () => {
+  const priorFetch = globalThis.fetch;
+  const cleanupError = new Error('Synthetic fixture close rejection.');
+  let nativeClose: (() => Promise<void>) | undefined;
+  let nativeCloseReceipt: Promise<void> | undefined;
+  let nativeCloseCompletedAt: number | undefined;
+  let closeReceiptBeforeFailure: Promise<void> | undefined;
+  let closeCompletedBeforeFailure: boolean;
+  let observedError: unknown;
+  let restoredBeforeRecovery: boolean;
+
+  const fixtureFactory: typeof fixture = async (handler) => {
+    const created = await fixture(handler);
+    const close = created.close.bind(created);
+    const closeNative = () => {
+      const receipt = close().then(() => {
+        nativeCloseCompletedAt = performance.now();
+      });
+      nativeCloseReceipt = receipt;
+      return receipt;
+    };
+    nativeClose = closeNative;
+    return {
+      ...created,
+      async close() {
+        await closeNative();
+        throw cleanupError;
+      },
+    };
+  };
+
+  try {
+    observedError = await p1Error(p1Http([], 10_000, 0, fixtureFactory));
+    const failureObservedAt = performance.now();
+    closeReceiptBeforeFailure = nativeCloseReceipt;
+    closeCompletedBeforeFailure =
+      nativeCloseCompletedAt !== undefined &&
+      nativeCloseCompletedAt <= failureObservedAt;
+    restoredBeforeRecovery = globalThis.fetch === priorFetch;
+  } finally {
+    try {
+      if (nativeClose) await nativeClose();
+      if (closeReceiptBeforeFailure) await closeReceiptBeforeFailure;
+    } finally {
+      globalThis.fetch = priorFetch;
+    }
+  }
+
+  const recovery = await p1Http([p1Step('list')]);
+  try {
+    await recovery.call('list', p1Budget());
+    expect(recovery.entries).toBe(1);
+  } finally {
+    await recovery.close();
+  }
+
+  expect(observedError).toBeInstanceOf(AggregateError);
+  if (observedError instanceof AggregateError) {
+    expect(observedError.errors).toHaveLength(2);
+    expect(observedError.errors[0]).toBeInstanceOf(RangeError);
+    expect(observedError.errors[0]).toMatchObject({
+      message:
+        'maxResponseBytes must be a positive integer no greater than 16 MiB.',
+    });
+    expect(observedError.errors[1]).toBe(cleanupError);
+  }
+  expect(closeReceiptBeforeFailure).toBeDefined();
+  expect(closeCompletedBeforeFailure).toBe(true);
+  expect(restoredBeforeRecovery).toBe(true);
+});
+
+test('P1A-R1-SETUP-1: returned close restores fetch when native close rejects', async () => {
+  const priorFetch = globalThis.fetch;
+  const cleanupError = new Error('Synthetic fixture close rejection.');
+  let nativeClose: (() => Promise<void>) | undefined;
+  let nativeCloseReceipt: Promise<void> | undefined;
+  let nativeCloseCompletedAt: number | undefined;
+  let closeReceiptBeforeFailure: Promise<void> | undefined;
+  let closeCompletedBeforeFailure: boolean;
+  let observedError: unknown;
+  let restoredBeforeRecovery: boolean;
+
+  const fixtureFactory: typeof fixture = async (handler) => {
+    const created = await fixture(handler);
+    const close = created.close.bind(created);
+    const closeNative = () => {
+      const receipt = close().then(() => {
+        nativeCloseCompletedAt = performance.now();
+      });
+      nativeCloseReceipt = receipt;
+      return receipt;
+    };
+    nativeClose = closeNative;
+    return {
+      ...created,
+      async close() {
+        await closeNative();
+        throw cleanupError;
+      },
+    };
+  };
+
+  const api = await p1Http([p1Step('list')], 10_000, undefined, fixtureFactory);
+  try {
+    await api.call('list', p1Budget());
+    observedError = await p1Error(api.close());
+    const failureObservedAt = performance.now();
+    closeReceiptBeforeFailure = nativeCloseReceipt;
+    closeCompletedBeforeFailure =
+      nativeCloseCompletedAt !== undefined &&
+      nativeCloseCompletedAt <= failureObservedAt;
+    restoredBeforeRecovery = globalThis.fetch === priorFetch;
+  } finally {
+    try {
+      if (nativeClose) await nativeClose();
+      if (closeReceiptBeforeFailure) await closeReceiptBeforeFailure;
+    } finally {
+      globalThis.fetch = priorFetch;
+    }
+  }
+
+  const recovery = await p1Http([p1Step('list')]);
+  try {
+    await recovery.call('list', p1Budget());
+    expect(recovery.entries).toBe(1);
+  } finally {
+    await recovery.close();
+  }
+
+  expect(observedError).toBe(cleanupError);
+  expect(closeReceiptBeforeFailure).toBeDefined();
+  expect(closeCompletedBeforeFailure).toBe(true);
+  expect(restoredBeforeRecovery).toBe(true);
+});
+
+test('P1A-01: lower-only construction, captured runtime and immutable limits fail safely before dispatch', async () => {
+  const api = await p1Http([p1Step('list'), p1Step('list')]);
+  try {
+    for (const [name, ceiling] of Object.entries({
+      maxAttempts: 64,
+      maxDecodedBytes: 33_554_432,
+      horizonMs: 60_000,
+      maxRequestMs: 10_000,
+    })) {
+      for (const value of [0, -1, 1.5, NaN, Infinity, -Infinity, ceiling + 1]) {
+        expect(() => p1Budget({ limits: { [name]: value } })).toThrow(
+          'Invalid invocation read limits.',
+        );
+      }
+    }
+    for (const startedAtMs of [NaN, Infinity, -Infinity])
+      expect(() => createInvocationReadBudget({ startedAtMs })).toThrow(
+        'Invalid invocation read start.',
+      );
+    for (const timeout of [0, -1, NaN, Infinity, -Infinity]) {
+      const client = new SpeedyIndexClient(dummyKey, api.mapped, timeout);
+      await expect(
+        client.listTasks(p1List, undefined, p1Budget()),
+      ).rejects.toThrow('Invalid invocation read timeout.');
+    }
+    expect(api.entries).toBe(0);
+    const runtime = new P1Clock();
+    const limits = { maxAttempts: 1 };
+    const budget = p1Budget({ limits, runtime });
+    limits.maxAttempts = 64;
+    runtime.now = () => Infinity;
+    runtime.setTimeout = () => {
+      throw new Error('MUTATED_RUNTIME');
+    };
+    runtime.clearTimeout = () => {
+      throw new Error('MUTATED_RUNTIME');
+    };
+    await api.call('list', budget);
+    budget.checkpoint();
+    p1Code(await p1Error(api.call('list', budget)), 'ResourceLimitExceeded');
+    expect(runtime.handles.size).toBe(0);
+    await api.call('list', p1Budget());
+    expect(api.arrivals).toBe(2);
+    await budget.close();
+    p1Code(await p1Error(api.call('list', budget)), 'Cancelled');
+  } finally {
+    await api.close();
+  }
+});
+
+test('P1A-02: one shared 64/65 attempt limit counts repeated routes and failed entered fetches', async () => {
+  const kinds: P1Kind[] = Array.from(
+    { length: 64 },
+    (_, i) => ['list', 'status', 'report', 'list'][i % 4] as P1Kind,
+  );
+  const resetRead = deferred<void>();
+  const reset = p1Step('list', {
+    serve: async (_req, res) => {
+      res.writeHead(200);
+      res.write('{');
+      await resetRead.promise;
+      res.destroy();
+    },
+    hooks: {
+      read: (value) => {
+        if (value.value) resetRead.resolve();
+      },
+    },
+  });
+  const api = await p1Http([
+    ...kinds.map((kind) => p1Step(kind)),
+    reset,
+    p1Step('status', { payload: '{bad-json' }),
+    p1Step('report'),
+    p1Step('list'),
+  ]);
+  api.releases.push(() => resetRead.resolve());
+  try {
+    const budget = p1Budget();
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(
+      api.client.listTasks({}, undefined, budget),
+    ).rejects.toMatchObject({ kind: 'input' });
+    await expect(
+      new SpeedyIndexClient(undefined, api.mapped).listTasks(
+        p1List,
+        undefined,
+        budget,
+      ),
+    ).rejects.toMatchObject({ kind: 'credentials' });
+    p1Code(
+      await p1Error(api.call('list', budget, aborted.signal)),
+      'Cancelled',
+    );
+    const cancelledInvocation = p1Budget({}, aborted.signal);
+    p1Code(
+      await p1Error(
+        api.call('list', cancelledInvocation, new AbortController().signal),
+      ),
+      'Cancelled',
+    );
+    expect(api.entries).toBe(0);
+    for (const kind of kinds) await api.call(kind, budget);
+    budget.checkpoint();
+    p1Code(await p1Error(api.call('list', budget)), 'ResourceLimitExceeded');
+    expect(api.entries).toBe(64);
+    expect(api.arrivals).toBe(64);
+    const failed = p1Budget({ limits: { maxAttempts: 3 } });
+    expect(await p1Error(api.call('list', failed))).toMatchObject({
+      kind: 'response',
+    });
+    await bounded(reset.terminated.promise);
+    expect(await p1Error(api.call('status', failed))).toMatchObject({
+      kind: 'response',
+    });
+    await api.call('report', failed);
+    p1Code(await p1Error(api.call('list', failed)), 'ResourceLimitExceeded');
+    expect(api.entries).toBe(67);
+    expect(api.arrivals).toBe(67);
+    // A synchronous entered-fetch failure is charged too (supplements native reset).
+    let throws = 0;
+    const throwing = new SpeedyIndexClient(
+      dummyKey,
+      Object.assign(
+        () => {
+          throws++;
+          throw new Error('SYNTHETIC_TRANSPORT_SECRET');
+        },
+        { preconnect: () => undefined },
+      ) as typeof fetch,
+    );
+    const finite = p1Budget({ limits: { maxAttempts: 1 } });
+    await expect(
+      throwing.listTasks(p1List, undefined, finite),
+    ).rejects.toMatchObject({ kind: 'network' });
+    await expect(
+      throwing.listTasks(p1List, undefined, finite),
+    ).rejects.toMatchObject({ code: 'ResourceLimitExceeded' });
+    expect(throws).toBe(1);
+    await finite.close();
+    await api.call('list', p1Budget());
+  } finally {
+    await api.close();
+  }
+});
+
+test('P1A-03: aggregate counts decoded UTF-8, gzip, ignored fields and failed consumed bodies', async () => {
+  const list = Buffer.from(JSON.stringify(p1Envelope('list')));
+  const status = Buffer.from(
+    JSON.stringify({ ...p1Envelope('status'), ignored: 'é'.repeat(180) }),
+  );
+  const report = Buffer.from(JSON.stringify(p1Envelope('report')));
+  const compressed = gzipSync(status);
+  expect(compressed.byteLength).toBeLessThan(status.byteLength);
+  expect(list.byteLength).toBeGreaterThan(list.toString().length);
+  const exact = list.byteLength + status.byteLength + report.byteLength;
+  for (const extraByte of [false, true]) {
+    const firstRead = deferred<void>();
+    const split = list.indexOf(Buffer.from('é')) + 1;
+    expect(list[split - 1]).toBe(0xc3);
+    expect(list[split]).toBe(0xa9);
+    const steps = [
+      p1Step('list', {
+        serve: async (_req, res) => {
+          res.write(list.subarray(0, split));
+          await firstRead.promise;
+          res.end(list.subarray(split));
+        },
+        hooks: {
+          read: (value) => {
+            if (value.value?.byteLength) firstRead.resolve();
+          },
+        },
+      }),
+      p1Step('status', {
+        serve: (_req, res) => {
+          res.writeHead(200, {
+            'Content-Encoding': 'gzip',
+            'Content-Length': compressed.byteLength,
+          });
+          res.end(compressed);
+        },
+      }),
+      p1Step('report', {
+        payload: Buffer.concat([report, Buffer.from(extraByte ? ' ' : '')]),
+      }),
+      p1Step('list'),
+    ];
+    const api = await p1Http(steps, 10_000, 1024);
+    api.releases.push(() => firstRead.resolve());
+    const budget = p1Budget({ limits: { maxDecodedBytes: exact } });
+    try {
+      expect(await api.call('list', budget)).toMatchObject({
+        tasks: [{ title: 'é🧪' }],
+      });
+      await api.call('status', budget);
+      if (extraByte)
+        p1Code(
+          await p1Error(api.call('report', budget)),
+          'ResourceLimitExceeded',
+        );
+      else {
+        expect(await api.call('report', budget)).toMatchObject({
+          title: 'é🧪',
+          indexedLinks: ['https://synthetic.invalid/é'],
+        });
+        budget.checkpoint();
+      }
+      p1Code(await p1Error(api.call('list', budget)), 'ResourceLimitExceeded');
+      expect(api.arrivals).toBe(3);
+      await api.call('list', p1Budget());
+    } finally {
+      await api.close();
+    }
+  }
+  for (const invalid of [
+    '{"bad":',
+    JSON.stringify({
+      code: 7,
+      error: 'SYNTHETIC_PROVIDER_SECRET',
+      ignored: 'é',
+    }),
+  ]) {
+    const good = JSON.stringify(p1Envelope('status'));
+    const api = await p1Http([
+      p1Step('list', { payload: invalid }),
+      p1Step('status', { payload: good }),
+    ]);
+    const budget = p1Budget({
+      limits: {
+        maxDecodedBytes:
+          Buffer.byteLength(invalid) + Buffer.byteLength(good) - 1,
+      },
+    });
+    try {
+      expect(await p1Error(api.call('list', budget))).toMatchObject({
+        kind: invalid.includes('code') ? 'provider' : 'response',
+      });
+      p1Code(
+        await p1Error(api.call('status', budget)),
+        'ResourceLimitExceeded',
+      );
+      expect(api.arrivals).toBe(2);
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('P1A-04: open-stream overflow stops before EOF; aggregate wins a simultaneous response limit', async () => {
+  const initialBytes = Buffer.byteLength(JSON.stringify(p1Envelope('list')));
+  for (const variant of ['aggregate', 'both', 'response'] as const) {
+    const firstRead = deferred<void>();
+    const tail = deferred<void>();
+    let delivered = 0;
+    let reads = 0;
+    let readsAtCrossing = 0;
+    const crossing = variant === 'aggregate' ? ' '.repeat(32) : ' '.repeat(160);
+    const available =
+      variant === 'aggregate' ? 8 : variant === 'both' ? 64 : 1024;
+    const open = p1Step('status', {
+      serve: async (_req, res) => {
+        res.writeHead(200, { 'Transfer-Encoding': 'chunked' });
+        res.write('{');
+        await firstRead.promise;
+        res.write(crossing);
+        await tail.promise;
+        if (!res.destroyed) res.end('}');
+      },
+      hooks: {
+        readStart: () => {
+          reads++;
+        },
+        read: (value) => {
+          if (value.value) {
+            delivered += value.value.byteLength;
+            firstRead.resolve();
+            if (delivered > (variant === 'response' ? 128 : available))
+              readsAtCrossing = reads;
+          }
+        },
+      },
+    });
+    const api = await p1Http(
+      [p1Step('list'), open, p1Step('list')],
+      10_000,
+      128,
+    );
+    api.releases.push(
+      () => firstRead.resolve(),
+      () => tail.resolve(),
+    );
+    const budget = p1Budget({
+      limits: { maxDecodedBytes: initialBytes + available },
+    });
+    try {
+      await api.call('list', budget);
+      const error = await p1Error(api.call('status', budget));
+      if (variant === 'response')
+        expect(error).toMatchObject({
+          kind: 'response',
+          message: 'SpeedyIndex returned an invalid task-status response.',
+        });
+      else p1Code(error, 'ResourceLimitExceeded');
+      expect(delivered).toBe(1 + Buffer.byteLength(crossing));
+      expect(readsAtCrossing).toBeGreaterThan(0);
+      expect(reads).toBe(readsAtCrossing);
+      await bounded(open.terminated.promise);
+      expect(api.arrivals).toBe(2);
+      await api.call('list', p1Budget());
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('P1A-05: captured origin, request ceiling, remaining horizon, ties and stale checkpoints', async () => {
+  const cases = [
+    {
+      timeout: 20_000,
+      local: 0,
+      due: 10_000,
+      code: 'timeout',
+      request: 10_000,
+    },
+    { timeout: 25, local: 0, due: 25, code: 'timeout', request: 10_000 },
+    { timeout: 10_000, local: 0, due: 40, code: 'timeout', request: 40 },
+    {
+      timeout: 10_000,
+      local: 59_990,
+      due: 60_000,
+      code: 'DeadlineExceeded',
+      request: 10_000,
+    },
+    {
+      timeout: 50,
+      local: 59_950,
+      due: 60_000,
+      code: 'DeadlineExceeded',
+      request: 10_000,
+    },
+    {
+      timeout: 1000,
+      local: 0,
+      due: 1000,
+      code: 'Cancelled',
+      request: 10_000,
+      cancelFirst: true,
+    },
+  ];
+  for (const spec of cases) {
+    const release = deferred<void>();
+    const held = p1Step('status', {
+      serve: async (_req, res) => {
+        await release.promise;
+        if (!res.destroyed) res.end(JSON.stringify(p1Envelope('status')));
+      },
+    });
+    const api = await p1Http([held, p1Step('list')], spec.timeout);
+    api.releases.push(() => release.resolve());
+    const runtime = new P1Clock();
+    // Explicit start precedes the simulated first local observation.
+    const budget = createInvocationReadBudget(
+      { startedAtMs: 0 },
+      { runtime, limits: { maxRequestMs: spec.request } },
+    );
+    runtime.advance(spec.local);
+    try {
+      const caller = new AbortController();
+      const operation = api.call('status', budget, caller.signal);
+      await bounded(held.received.promise);
+      runtime.advance(spec.due - 1);
+      expect(held.outbound?.aborted).toBe(false);
+      if ('cancelFirst' in spec && spec.cancelFirst) caller.abort();
+      runtime.advance(spec.due);
+      expect(held.outbound?.aborted).toBe(true);
+      const error = await p1Error(operation);
+      if (spec.code === 'timeout')
+        expect(error).toMatchObject({
+          kind: 'timeout',
+          message: 'SpeedyIndex task-status request timed out.',
+        });
+      else p1Code(error, spec.code);
+      await bounded(held.terminated.promise);
+      expect(runtime.handles.size).toBe(0);
+      await api.call('list', p1Budget());
+    } finally {
+      await api.close();
+    }
+  }
+  const runtime = new P1Clock();
+  const eofRuntime = new P1Clock();
+  const api = await p1Http([
+    p1Step('list'),
+    p1Step('report', {
+      hooks: {
+        read: (value) => {
+          if (value.done) eofRuntime.advance(60_000, false);
+        },
+      },
+    }),
+  ]);
+  try {
+    const budget = p1Budget({ runtime });
+    await api.call('list', budget);
+    runtime.advance(60_000, false);
+    p1Code(await p1Error(api.call('list', budget)), 'DeadlineExceeded');
+    const eof = p1Budget({ runtime: eofRuntime });
+    p1Code(await p1Error(api.call('report', eof)), 'DeadlineExceeded');
+    expect(api.entries).toBe(2);
+    for (const invalid of [-1, NaN, Infinity, -Infinity, 60_000]) {
+      const clock = new P1Clock();
+      const stale = p1Budget({ runtime: clock });
+      clock.advance(5, false);
+      stale.checkpoint();
+      clock.advance(invalid, false);
+      expect(() => stale.checkpoint()).toThrow(
+        'Invocation read deadline exceeded.',
+      );
+      p1Code(await p1Error(api.call('list', stale)), 'DeadlineExceeded');
+    }
+    expect(api.arrivals).toBe(2);
+  } finally {
+    await api.close();
+  }
+});
+
+test('P1A-06: native caller/invocation cancellation settles pre-header, pending-body and between reads', async () => {
+  for (const phase of ['headers', 'body'] as const) {
+    const release = deferred<void>();
+    const pendingRead = deferred<void>();
+    let reads = 0;
+    let released = false;
+    const kind = phase === 'headers' ? 'status' : 'report';
+    const held = p1Step(kind, {
+      serve: async (_req, res) => {
+        if (phase === 'body') {
+          res.writeHead(200);
+          res.write('{"code":0,');
+        }
+        await release.promise;
+        if (!res.destroyed) res.end();
+      },
+      hooks: {
+        readStart: () => {
+          if (++reads === 2) pendingRead.resolve();
+        },
+        released: () => {
+          released = true;
+        },
+      },
+    });
+    const api = await p1Http([held, p1Step('list')]);
+    api.releases.push(() => release.resolve());
+    const controller = new AbortController();
+    const other = new AbortController();
+    let sentinel = 0;
+    other.signal.addEventListener('abort', () => {
+      sentinel++;
+    });
+    const budget = p1Budget(
+      {},
+      phase === 'body' ? controller.signal : undefined,
+    );
+    try {
+      const operation = api.call(
+        kind,
+        budget,
+        phase === 'headers' ? controller.signal : other.signal,
+      );
+      await bounded(held.received.promise);
+      if (phase === 'body') await bounded(pendingRead.promise);
+      expect(held.outbound?.aborted).toBe(false);
+      controller.abort();
+      p1Code(await p1Error(operation), 'Cancelled');
+      await bounded(held.terminated.promise);
+      if (phase === 'body') {
+        expect(released).toBe(true);
+        p1Code(
+          await p1Error(api.call('list', budget, new AbortController().signal)),
+          'Cancelled',
+        );
+      }
+      expect(other.signal.aborted).toBe(false);
+      other.abort();
+      expect(sentinel).toBe(1);
+      await api.call('list', p1Budget());
+    } finally {
+      await api.close();
+    }
+  }
+  const invocation = new AbortController();
+  const api = await p1Http([p1Step('list'), p1Step('list')]);
+  try {
+    const budget = p1Budget({}, invocation.signal);
+    await api.call('list', budget);
+    invocation.abort();
+    p1Code(
+      await p1Error(api.call('status', budget, new AbortController().signal)),
+      'Cancelled',
+    );
+    expect(api.entries).toBe(1);
+    await api.call('list', p1Budget());
+  } finally {
+    await api.close();
+  }
+});
+
+test('P1A-07: held native cancellation receipt retains lease, frozen HTTP cause and idempotent close', async () => {
+  // All three outer catches must retain the selected transport cause after late abort.
+  for (const kind of ['list', 'status', 'report'] as const) {
+    const cancelEntered = deferred<void>();
+    const cancelRelease = deferred<void>();
+    const tail = deferred<void>();
+    const held = p1Step(kind, {
+      serve: async (_req, res) => {
+        res.writeHead(503);
+        res.write('SYNTHETIC_HTTP_BODY_SECRET');
+        await tail.promise;
+        if (!res.destroyed) res.end();
+      },
+      hooks: {
+        cancelled: async () => {
+          cancelEntered.resolve();
+          await cancelRelease.promise;
+        },
+      },
+    });
+    const api = await p1Http([held, p1Step('list'), p1Step('list')]);
+    api.releases.push(
+      () => tail.resolve(),
+      () => cancelRelease.resolve(),
+    );
+    const runtime = new P1Clock();
+    const budget = p1Budget({ runtime, limits: { maxAttempts: 1 } });
+    const controller = new AbortController();
+    let settled = false;
+    let closeSettled = false;
+    try {
+      const operation = api.call(kind, budget, controller.signal);
+      void operation.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await bounded(cancelEntered.promise);
+      await bounded(held.terminated.promise);
+      // Busy precedes exhausted capacity and introduces no timer/listener/attempt.
+      p1Code(await p1Error(api.call('list', budget)), 'ReadInProgress');
+      const preAborted = new AbortController();
+      preAborted.abort();
+      p1Code(
+        await p1Error(api.call('list', budget, preAborted.signal)),
+        'Cancelled',
+      );
+      expect(runtime.handles.size).toBe(1);
+      runtime.advance(60_000);
+      p1Code(await p1Error(api.call('list', budget)), 'DeadlineExceeded');
+      // The scheduler consumes a fired timer; the lease still owns its receipt.
+      expect(runtime.handles.size).toBe(0);
+      controller.abort();
+      const closing = budget.close();
+      expect(budget.close()).toBe(closing);
+      void closing.then(() => {
+        closeSettled = true;
+      });
+      p1Code(await p1Error(api.call('list', budget)), 'Cancelled');
+      expect(api.entries).toBe(1);
+      expect(settled).toBe(false);
+      expect(closeSettled).toBe(false);
+      // A separate invocation on the same client is not held by this lease.
+      await api.call('list', p1Budget());
+      expect(api.entries).toBe(2);
+      expect(settled).toBe(false);
+      expect(closeSettled).toBe(false);
+      cancelRelease.resolve();
+      expect(await p1Error(operation)).toMatchObject({ kind: 'http' });
+      await bounded(closing);
+      expect(settled).toBe(true);
+      expect(closeSettled).toBe(true);
+      expect(runtime.handles.size).toBe(0);
+      await api.call('list', p1Budget());
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test('P1A-07: close waits for an actual late native Response and its cancellation receipt', async () => {
+  const nativeHeaders = deferred<void>();
+  const forwardResponse = deferred<void>();
+  const tail = deferred<void>();
+  let cancellations = 0;
+  const held = p1Step('report', {
+    serve: async (_req, res) => {
+      res.writeHead(200);
+      res.write('{"code":0,');
+      await tail.promise;
+      if (!res.destroyed) res.end();
+    },
+    hooks: {
+      response: async () => {
+        nativeHeaders.resolve();
+        await forwardResponse.promise;
+      },
+      cancelled: async () => {
+        cancellations++;
+      },
+    },
+  });
+  const api = await p1Http([held, p1Step('list')]);
+  api.releases.push(
+    () => tail.resolve(),
+    () => forwardResponse.resolve(),
+  );
+  const budget = p1Budget();
+  let operationSettled = false;
+  let closeSettled = false;
+  try {
+    const operation = api.call('report', budget);
+    void operation.then(
+      () => {
+        operationSettled = true;
+      },
+      () => {
+        operationSettled = true;
+      },
+    );
+    await bounded(nativeHeaders.promise);
+    const closing = budget.close();
+    void closing.then(() => {
+      closeSettled = true;
+    });
+    p1Code(await p1Error(api.call('list', budget)), 'Cancelled');
+    expect(operationSettled).toBe(false);
+    expect(closeSettled).toBe(false);
+    forwardResponse.resolve();
+    p1Code(await p1Error(operation), 'Cancelled');
+    await bounded(closing);
+    await bounded(held.terminated.promise);
+    expect(cancellations).toBe(1);
+    await api.call('list', p1Budget());
+  } finally {
+    await api.close();
+  }
+});
+
+function p1Subscriptions(signal: AbortSignal) {
+  const add = signal.addEventListener.bind(signal);
+  const remove = signal.removeEventListener.bind(signal);
+  const listeners = new Set<unknown>();
+  Object.defineProperty(signal, 'addEventListener', {
+    configurable: true,
+    value: (
+      name: string,
+      callback: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) => {
+      if (name === 'abort') listeners.add(callback);
+      add(name, callback, options);
+    },
+  });
+  Object.defineProperty(signal, 'removeEventListener', {
+    configurable: true,
+    value: (
+      name: string,
+      callback: EventListenerOrEventListenerObject,
+      options?: boolean | EventListenerOptions,
+    ) => {
+      if (name === 'abort') listeners.delete(callback);
+      remove(name, callback, options);
+    },
+  });
+  return {
+    listeners,
+    restore() {
+      Reflect.deleteProperty(signal, 'addEventListener');
+      Reflect.deleteProperty(signal, 'removeEventListener');
+    },
+  };
+}
+
+for (const abortAtRelease of [false, true]) {
+  test(`P1A-LATE-CANCEL-1: ${abortAtRelease ? 'late abort/close owns any returned cancellation receipt at EOF' : 'normal EOF success control'}`, async () => {
+    const gate = deferred<void>();
+    const boundary = deferred<void>();
+    const controller = new AbortController();
+    const subscriptions = p1Subscriptions(controller.signal);
+    const runtime = new P1Clock();
+    const budget = p1Budget({ runtime });
+    const receipts: Promise<unknown>[] = [];
+    const cancellations: Promise<void>[] = [];
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => {
+      unhandled.push(error);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    let eof = false;
+    let nativeClosed = false;
+    let nativeCancellations = 0;
+    let settledCancellations = 0;
+    let releases = 0;
+    let operationSettled = false;
+    let closeSettled = false;
+    let closing: Promise<void> | undefined;
+    const close = () => {
+      if (!closing) {
+        closing = budget.close();
+        receipts.push(
+          closing.then(
+            () => {
+              closeSettled = true;
+            },
+            () => {
+              closeSettled = true;
+            },
+          ),
+        );
+      }
+      return closing;
+    };
+    const step = p1Step('list', {
+      hooks: {
+        reader: (reader) => {
+          receipts.push(reader.closed);
+          receipts.push(
+            reader.closed.then(() => {
+              nativeClosed = true;
+            }),
+          );
+        },
+        read: (value) => {
+          if (value.done) eof = true;
+        },
+        cancelled: async () => {
+          // Native cancellation has settled; only its returned JS receipt is gated.
+          nativeCancellations++;
+          await gate.promise;
+        },
+        cancelReceipt: (receipt) => {
+          cancellations.push(receipt);
+          receipts.push(receipt);
+          receipts.push(
+            receipt.then(() => {
+              settledCancellations++;
+            }),
+          );
+        },
+        releasing: () => {
+          // Finite transparent observer before forwarding native releaseLock.
+          if (abortAtRelease) {
+            controller.abort();
+            close();
+          }
+          boundary.resolve();
+        },
+        released: () => {
+          releases++;
+        },
+      },
+    });
+    const api = await p1Http([step]);
+    api.releases.push(() => gate.resolve());
+    try {
+      const operation: Promise<unknown> = api.call(
+        'list',
+        budget,
+        controller.signal,
+      );
+      receipts.push(operation);
+      receipts.push(
+        operation.then(
+          () => {
+            operationSettled = true;
+          },
+          () => {
+            operationSettled = true;
+          },
+        ),
+      );
+      await bounded(boundary.promise);
+      // Observe the completed microtask turn without an arbitrary time delay.
+      await bounded(new Promise<void>((resolve) => setImmediate(resolve)));
+      expect(eof).toBe(true);
+      expect(nativeClosed).toBe(true);
+      expect(releases).toBe(1);
+      expect(api.entries).toBe(1);
+      expect(nativeCancellations).toBe(cancellations.length);
+      if (cancellations.length > 0) {
+        expect(settledCancellations).toBe(0);
+        expect(operationSettled).toBe(false);
+        expect(closeSettled).toBe(false);
+      }
+      // Known EOF may need no cancel at all; never require creating one.
+      gate.resolve();
+      if (abortAtRelease) p1Code(await p1Error(operation), 'Cancelled');
+      else {
+        expect(cancellations).toHaveLength(0);
+        expect(await bounded(operation)).toMatchObject({
+          tasks: [{ id: 'p1-task' }],
+        });
+      }
+      const closeReceipt = close();
+      await bounded(closeReceipt);
+      expect(budget.close()).toBe(closeReceipt);
+      await bounded(Promise.all(cancellations));
+      await bounded(step.terminated.promise);
+      expect(settledCancellations).toBe(cancellations.length);
+      expect(operationSettled).toBe(true);
+      expect(closeSettled).toBe(true);
+      expect(runtime.handles.size).toBe(0);
+      expect(subscriptions.listeners.size).toBe(0);
+      expect(unhandled).toEqual([]);
+    } finally {
+      gate.resolve();
+      boundary.resolve();
+      try {
+        await bounded(Promise.allSettled([...receipts, close()]));
+      } finally {
+        try {
+          await api.close();
+        } finally {
+          subscriptions.restore();
+          process.off('unhandledRejection', onUnhandled);
+        }
+      }
+    }
+  });
+}
+
+test('P1A-08: owned timers/listeners/reader receipts settle; errors stay fixed and handled', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown) => {
+    unhandled.push(error);
+  };
+  process.on('unhandledRejection', onUnhandled);
+  const marker = 'SYNTHETIC_PRIVATE_PATH_KEY_BODY';
+  const controller = new AbortController();
+  let sentinel = 0;
+  controller.signal.addEventListener('abort', () => {
+    sentinel++;
+  });
+  const subscriptions = p1Subscriptions(controller.signal);
+  const runtime = new P1Clock();
+  const streamRead = deferred<void>();
+  const steps = [
+    p1Step('list'),
+    p1Step('status', { payload: `{${marker}` }),
+    p1Step('report', { payload: JSON.stringify({ code: 9, error: marker }) }),
+    p1Step('list', {
+      serve: async (_req, res) => {
+        res.writeHead(200);
+        res.write('{');
+        await streamRead.promise;
+        res.destroy();
+      },
+      hooks: {
+        read: (value) => {
+          if (value.value) streamRead.resolve();
+        },
+      },
+    }),
+    p1Step('list'),
+  ];
+  const api = await p1Http(steps);
+  api.releases.push(() => streamRead.resolve());
+  try {
+    for (const [index, step] of steps.entries()) {
+      const budget = p1Budget({ runtime }, controller.signal);
+      const released = deferred<void>();
+      const existing = step.hooks ?? {};
+      step.hooks = {
+        ...existing,
+        released: () => {
+          // Timers/subscriptions belong to the lease until reader settlement/release.
+          expect(runtime.handles.size).toBe(1);
+          expect(subscriptions.listeners.size).toBe(1);
+          released.resolve();
+        },
+      };
+      const operation = api.call(step.kind, budget, controller.signal);
+      if (index === 0 || index === 4) await operation;
+      else {
+        const error = await p1Error(operation);
+        expect(error).toMatchObject({
+          kind: index === 2 ? 'provider' : 'response',
+        });
+        expect(error).toBeInstanceOf(Error);
+        expect(String(error)).not.toContain(marker);
+        expect(String(error)).not.toContain(dummyKey);
+        expect(String(error)).not.toContain('https://');
+      }
+      await bounded(released.promise);
+      expect(runtime.handles.size).toBe(0);
+      expect(subscriptions.listeners.size).toBe(0);
+      await budget.close();
+    }
+    controller.abort();
+    expect(sentinel).toBe(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(unhandled).toEqual([]);
+  } finally {
+    await api.close();
+    subscriptions.restore();
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('P1A-08: charge a fulfilled chunk before same-turn abort; cancellation wins overflow without refund', async () => {
+  const payload = JSON.stringify(p1Envelope('list'));
+  const controller = new AbortController();
+  let delivered = 0;
+  const step = p1Step('list', {
+    payload,
+    hooks: {
+      read: (value) => {
+        delivered += value.value?.byteLength ?? 0;
+        if (delivered === Buffer.byteLength(payload)) controller.abort();
+      },
+    },
+  });
+  const api = await p1Http([step, p1Step('list')]);
+  const budget = p1Budget({
+    limits: { maxDecodedBytes: Buffer.byteLength(payload) - 1 },
+  });
+  try {
+    p1Code(
+      await p1Error(api.call('list', budget, controller.signal)),
+      'Cancelled',
+    );
+    expect(delivered).toBe(Buffer.byteLength(payload));
+    p1Code(await p1Error(api.call('list', budget)), 'ResourceLimitExceeded');
+    expect(api.entries).toBe(1);
+    await budget.close();
+    await api.call('list', p1Budget());
+  } finally {
+    await api.close();
+  }
+});
+
+test('P1A-08: unexpected cleanup failure poisons close and admission, retaining any primary cause', async () => {
+  for (const primary of [false, true]) {
+    const tail = deferred<void>();
+    const marker = 'SYNTHETIC_CLEANUP_SECRET';
+    const broken = p1Step(
+      'list',
+      primary
+        ? {
+            serve: async (_req, res) => {
+              res.writeHead(502);
+              res.write(marker);
+              await tail.promise;
+              if (!res.destroyed) res.end();
+            },
+            hooks: {
+              cancelled: async () => {
+                throw new Error(marker);
+              },
+            },
+          }
+        : {
+            hooks: {
+              released: () => {
+                throw new Error(marker);
+              },
+            },
+          },
+    );
+    const api = await p1Http([broken, p1Step('list')]);
+    api.releases.push(() => tail.resolve());
+    const runtime = new P1Clock();
+    const controller = new AbortController();
+    const budget = p1Budget({ runtime }, controller.signal);
+    try {
+      const error = await p1Error(api.call('list', budget));
+      if (primary) expect(error).toMatchObject({ kind: 'http' });
+      else p1Code(error, 'CleanupFailed');
+      expect(String(error)).not.toContain(marker);
+      const closing = budget.close();
+      expect(budget.close()).toBe(closing);
+      p1Code(await p1Error(closing), 'CleanupFailed');
+      p1Code(await p1Error(budget.close()), 'CleanupFailed');
+      controller.abort();
+      runtime.advance(Infinity, false);
+      p1Code(await p1Error(api.call('list', budget)), 'CleanupFailed');
+      expect(runtime.handles.size).toBe(0);
+      expect(api.entries).toBe(1);
+      await api.call('list', p1Budget());
+    } finally {
+      await api.close();
+    }
+  }
 });
