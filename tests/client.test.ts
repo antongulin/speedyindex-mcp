@@ -1242,6 +1242,8 @@ type P1Hooks = {
   read?: (value: P1Read) => void;
   reader?: (reader: ReadableStreamDefaultReader<Uint8Array>) => void;
   cancelled?: () => Promise<void>;
+  cancelReceipt?: (receipt: Promise<void>) => void;
+  releasing?: () => void;
   released?: () => void;
   response?: () => Promise<void>;
 };
@@ -1249,16 +1251,20 @@ type P1Hooks = {
 function p1Decorate(response: Response, hooks: P1Hooks): Response {
   const body = response.body;
   if (!body) return response;
+  const cancel = (operation: () => Promise<void>) => {
+    const receipt = (async () => {
+      try {
+        await operation();
+      } finally {
+        await hooks.cancelled?.();
+      }
+    })();
+    hooks.cancelReceipt?.(receipt);
+    return receipt;
+  };
   const decoratedBody = new Proxy(body, {
     get(target, property) {
-      if (property === 'cancel')
-        return async () => {
-          try {
-            await target.cancel();
-          } finally {
-            await hooks.cancelled?.();
-          }
-        };
+      if (property === 'cancel') return () => cancel(() => target.cancel());
       if (property === 'getReader')
         return () => {
           const reader = target.getReader();
@@ -1273,15 +1279,10 @@ function p1Decorate(response: Response, hooks: P1Hooks): Response {
                   return value;
                 };
               if (field === 'cancel')
-                return async () => {
-                  try {
-                    await targetReader.cancel();
-                  } finally {
-                    await hooks.cancelled?.();
-                  }
-                };
+                return () => cancel(() => targetReader.cancel());
               if (field === 'releaseLock')
                 return () => {
+                  hooks.releasing?.();
                   targetReader.releaseLock();
                   hooks.released?.();
                 };
@@ -2173,6 +2174,154 @@ function p1Subscriptions(signal: AbortSignal) {
       Reflect.deleteProperty(signal, 'removeEventListener');
     },
   };
+}
+
+for (const abortAtRelease of [false, true]) {
+  test(`P1A-LATE-CANCEL-1: ${abortAtRelease ? 'late abort/close owns any returned cancellation receipt at EOF' : 'normal EOF success control'}`, async () => {
+    const gate = deferred<void>();
+    const boundary = deferred<void>();
+    const controller = new AbortController();
+    const subscriptions = p1Subscriptions(controller.signal);
+    const runtime = new P1Clock();
+    const budget = p1Budget({ runtime });
+    const receipts: Promise<unknown>[] = [];
+    const cancellations: Promise<void>[] = [];
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => {
+      unhandled.push(error);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    let eof = false;
+    let nativeClosed = false;
+    let nativeCancellations = 0;
+    let settledCancellations = 0;
+    let releases = 0;
+    let operationSettled = false;
+    let closeSettled = false;
+    let closing: Promise<void> | undefined;
+    const close = () => {
+      if (!closing) {
+        closing = budget.close();
+        receipts.push(
+          closing.then(
+            () => {
+              closeSettled = true;
+            },
+            () => {
+              closeSettled = true;
+            },
+          ),
+        );
+      }
+      return closing;
+    };
+    const step = p1Step('list', {
+      hooks: {
+        reader: (reader) => {
+          receipts.push(reader.closed);
+          receipts.push(
+            reader.closed.then(() => {
+              nativeClosed = true;
+            }),
+          );
+        },
+        read: (value) => {
+          if (value.done) eof = true;
+        },
+        cancelled: async () => {
+          // Native cancellation has settled; only its returned JS receipt is gated.
+          nativeCancellations++;
+          await gate.promise;
+        },
+        cancelReceipt: (receipt) => {
+          cancellations.push(receipt);
+          receipts.push(receipt);
+          receipts.push(
+            receipt.then(() => {
+              settledCancellations++;
+            }),
+          );
+        },
+        releasing: () => {
+          // Finite transparent observer before forwarding native releaseLock.
+          if (abortAtRelease) {
+            controller.abort();
+            close();
+          }
+          boundary.resolve();
+        },
+        released: () => {
+          releases++;
+        },
+      },
+    });
+    const api = await p1Http([step]);
+    api.releases.push(() => gate.resolve());
+    try {
+      const operation: Promise<unknown> = api.call(
+        'list',
+        budget,
+        controller.signal,
+      );
+      receipts.push(operation);
+      receipts.push(
+        operation.then(
+          () => {
+            operationSettled = true;
+          },
+          () => {
+            operationSettled = true;
+          },
+        ),
+      );
+      await bounded(boundary.promise);
+      // Observe the completed microtask turn without an arbitrary time delay.
+      await bounded(new Promise<void>((resolve) => setImmediate(resolve)));
+      expect(eof).toBe(true);
+      expect(nativeClosed).toBe(true);
+      expect(releases).toBe(1);
+      expect(api.entries).toBe(1);
+      expect(nativeCancellations).toBe(cancellations.length);
+      if (cancellations.length > 0) {
+        expect(settledCancellations).toBe(0);
+        expect(operationSettled).toBe(false);
+        expect(closeSettled).toBe(false);
+      }
+      // Known EOF may need no cancel at all; never require creating one.
+      gate.resolve();
+      if (abortAtRelease) p1Code(await p1Error(operation), 'Cancelled');
+      else {
+        expect(cancellations).toHaveLength(0);
+        expect(await bounded(operation)).toMatchObject({
+          tasks: [{ id: 'p1-task' }],
+        });
+      }
+      const closeReceipt = close();
+      await bounded(closeReceipt);
+      expect(budget.close()).toBe(closeReceipt);
+      await bounded(Promise.all(cancellations));
+      await bounded(step.terminated.promise);
+      expect(settledCancellations).toBe(cancellations.length);
+      expect(operationSettled).toBe(true);
+      expect(closeSettled).toBe(true);
+      expect(runtime.handles.size).toBe(0);
+      expect(subscriptions.listeners.size).toBe(0);
+      expect(unhandled).toEqual([]);
+    } finally {
+      gate.resolve();
+      boundary.resolve();
+      try {
+        await bounded(Promise.allSettled([...receipts, close()]));
+      } finally {
+        try {
+          await api.close();
+        } finally {
+          subscriptions.restore();
+          process.off('unhandledRejection', onUnhandled);
+        }
+      }
+    }
+  });
 }
 
 test('P1A-08: owned timers/listeners/reader receipts settle; errors stay fixed and handled', async () => {

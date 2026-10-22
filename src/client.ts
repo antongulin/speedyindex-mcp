@@ -343,7 +343,7 @@ async function requestBudgetedJson<T>(
   let eof = false;
   const readErrors: unknown[] = [];
   function cancelOwned() {
-    if (!responseBody || cancelStarted) return;
+    if (!responseBody || cancelStarted || eof) return;
     cancelStarted = true;
     try {
       cancellation = observe(reader ? reader.cancel() : responseBody.cancel());
