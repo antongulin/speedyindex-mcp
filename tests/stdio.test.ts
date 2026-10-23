@@ -15,11 +15,40 @@ import {
 } from './helpers';
 import { verifyEof } from './stdio-eof';
 import {
+  verifyRetryHistorySourceSdk,
+  verifyRetryHistoryObservedSdk,
+  verifyRetryHistoryFiniteSdk,
+  verifyRetryHistoryBoundedSdk,
+  verifyRetryHistoryCancellationSdk,
+  retryHistoryFiniteCases,
+} from './get-retry-history-sdk';
+import {
   verifyPlanRetrySdk,
   verifyPlanRetryFiniteSdk,
   verifyPlanRetryCancellationSdk,
   planRetryFiniteCases,
 } from './plan-retry-sdk';
+
+test('GRH-15 SOURCE CLI advertises strict local history and returns genuine independent SQL pages', async () => {
+  await verifyRetryHistorySourceSdk();
+}, 30000);
+
+test('GRH-15 SOURCE observed SDK extra authority keys never enter handler or SQL', async () => {
+  await verifyRetryHistoryObservedSdk();
+}, 30000);
+
+for (const kind of retryHistoryFiniteCases)
+  test(`GRH-16 SOURCE finite ${kind}`, async () => {
+    await verifyRetryHistoryFiniteSdk(kind);
+  }, 30000);
+
+test('GRH-16 SOURCE bounded genuine history surfaces only fixed whole-envelope overflow', async () => {
+  await verifyRetryHistoryBoundedSdk();
+}, 30000);
+
+test('GRH-17 SOURCE queued SDK cancellation settles actual native owner before same-host recovery', async () => {
+  await verifyRetryHistoryCancellationSdk();
+}, 30000);
 
 test('P2-06 SOURCE SDK: strict advertised plan_retry and genuine local/external ready', async () => {
   await verifyPlanRetrySdk('src/cli.ts');

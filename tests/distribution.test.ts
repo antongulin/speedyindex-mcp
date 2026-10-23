@@ -20,10 +20,24 @@ import { taskReportOutputSchema } from '../src/task-report';
 import { account, bounded, connect, dummyKey, fixture } from './helpers';
 import { verifyEof } from './stdio-eof';
 import {
+  verifyRetryHistorySourceSdk,
+  verifyRetryHistoryFiniteSdk,
+  retryHistoryFiniteCases,
+} from './get-retry-history-sdk';
+import {
   verifyPlanRetrySdk,
   verifyPlanRetryFiniteSdk,
   planRetryFiniteCases,
 } from './plan-retry-sdk';
+
+test('GRH-15 BUILT CLI nine tools and genuine selected-key six-state history paginate without writes', async () => {
+  await verifyRetryHistorySourceSdk('dist/cli.js');
+}, 30000);
+
+for (const kind of retryHistoryFiniteCases)
+  test(`GRH-16 BUILT finite ${kind}`, async () => {
+    await verifyRetryHistoryFiniteSdk(kind, 'dist/cli.js');
+  }, 30000);
 
 test('P2-06 BUILT SDK: strict advertised plan_retry and genuine local/external ready', async () => {
   await verifyPlanRetrySdk('dist/cli.js');
