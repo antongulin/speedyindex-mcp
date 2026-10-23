@@ -115,6 +115,10 @@ const quoteSchema = z.strictObject({
   basis: z.literal('documented_independent_maxima'),
   providerEnforced: z.literal(false),
 });
+export {
+  requestSchema as indexingRequestSchema,
+  quoteSchema as indexingQuoteSchema,
+};
 export type IndexingRequestSummary = z.infer<typeof requestSchema>;
 export type IndexingQuote = z.infer<typeof quoteSchema>;
 

@@ -24,6 +24,12 @@ import {
 } from '../src/plan-retry';
 import { packRetryStatusIds } from '../src/retry-observation';
 import { ReadBudgetError } from '../src/read-budget';
+import {
+  planRetryResultSchema,
+  planRetryToolResult,
+  retryPlanResultFromView,
+  type PlanRetryResult,
+} from '../src/plan-retry-result';
 import type { AvailableRetrySnapshot } from '../src/retry-ledger-snapshot';
 import {
   computeRetryPlanFingerprint,
@@ -1507,4 +1513,765 @@ test('P1B-05 report omission cannot erase an indexed count supplied by status', 
     ),
     'SourceManifestConflict',
   );
+});
+
+type PublicReady = Extract<PlanRetryResult, { status: 'ready' }>;
+function publicReadyFixture(
+  options: {
+    engine?: 'google' | 'yandex';
+    provenance?: PublicReady['source']['provenance'];
+    urls?: readonly string[];
+    exclusions?: 'local' | 'active';
+  } = {},
+) {
+  const engine = options.engine ?? 'google';
+  const sourceFamily: RetryFamily = `${engine}/indexer`;
+  const provenance = options.provenance ?? 'local_standalone';
+  const urls = options.urls ?? [A, B];
+  const fact = projectRetryFact(
+    sourceFamily,
+    fields('parent', {
+      size: urls.length + 1,
+      processedCount: urls.length + 1,
+      indexedCount: 1,
+    }),
+  );
+  const activeFacts =
+    options.exclusions === 'active'
+      ? (['google/indexer', 'yandex/indexer'] as const).map((engine) =>
+          projectRetryFact(
+            engine,
+            fields('active-é', {
+              createdAt: '2026-09-01T00:00:00Z',
+              isCompleted: false,
+              status: undefined,
+            }),
+          ),
+        )
+      : [];
+  const snapshot = local({
+    acceptedManifests: [
+      ...(provenance === 'external_unattributed'
+        ? []
+        : [
+            manifest(
+              'parent',
+              [C, ...urls],
+              sourceFamily,
+              provenance === 'legacy_unattributed' ? provenance : 'standalone',
+            ),
+          ]),
+      ...activeFacts.map((f) => manifest(f[1], [urls[1]!], f[0])),
+    ],
+    holds: options.exclusions
+      ? [
+          {
+            requestId: 'private-checker',
+            taskFamily: 'backlink/checker',
+            state: 'unknown',
+            stateVersion: '2',
+            urls: [{ ordinal: '0', url: urls[1]! }],
+          },
+        ]
+      : [],
+  });
+  const original = configuration();
+  const policy: SubmissionPolicy = {
+    ...original.snapshot.policy,
+    caps: { tokens: 1_000_000, indexer: 10_000, checker: 10_000 },
+  };
+  const config: ConfiguredSubmission = {
+    ...original,
+    snapshot: { policy, digest: H('synthetic-policy', policy) },
+  };
+  const assessed = assessRetryObservations(
+    { searchEngine: engine },
+    observations(
+      pass([fact, ...activeFacts], report(fact, [C], [...urls])),
+      snapshot,
+    ),
+    snapshot,
+    policy,
+  );
+  if (assessed.status !== 'proposal')
+    throw new Error(
+      'Pure result fixture needs a real proposal: ' + assessed.status,
+    );
+  const context = createSubmissionContext(
+    config,
+    assessed.request.quote.fingerprint,
+    utc,
+  );
+  const identity = buildRetrySemanticIdentity(
+    assessed,
+    final(snapshot),
+    context,
+    snapshot,
+  );
+  if (identity.status !== 'comparison')
+    throw new Error('Pure result fixture needs comparison data.');
+  const view = {
+    status: 'ready' as const,
+    source: assessed.source,
+    eligibleUrls: assessed.eligibleUrls,
+    excluded: assessed.excluded,
+    counts: assessed.counts,
+    request: assessed.request.request,
+    quote: assessed.request.quote,
+    authorization: { ...context.authorization, stateChecked: true },
+    identity,
+  };
+  const value = retryPlanResultFromView(engine, view);
+  if (value.status !== 'ready')
+    throw new Error('Expected a valid pure ready result.');
+  return { value, view, proposal: assessed };
+}
+function changedResult<T>(
+  value: T,
+  path: readonly (string | number)[],
+  replacement: unknown,
+): T {
+  const copy = structuredClone(value);
+  let parent: unknown = copy;
+  for (const key of path.slice(0, -1))
+    parent = (parent as Record<string | number, unknown>)[key];
+  (parent as Record<string | number, unknown>)[path.at(-1)!] = replacement;
+  return copy;
+}
+const envelopeBytes = (value: unknown) =>
+  Buffer.from(JSON.stringify(value), 'utf8').length;
+function expectInternalResult(value: unknown) {
+  const result = planRetryToolResult(value);
+  expect(result.isError).toBe(true);
+  expect(result.structuredContent).toEqual({
+    status: 'error',
+    error: {
+      code: 'InternalError',
+      message: 'Retry planning failed internally.',
+    },
+  });
+  expect(
+    planRetryResultSchema.safeParse(result.structuredContent).success,
+  ).toBe(true);
+  expect(JSON.parse(result.content[0]!.text)).toEqual(result.structuredContent);
+  expect(JSON.stringify(result)).not.toContain('SYNTHETIC-SECRET');
+  return result;
+}
+function independentPublicFingerprint(value: PublicReady) {
+  const p = value.identity.preimage;
+  return H('speedyindex-retry-plan-v1', [
+    value.source.reference[0],
+    value.source.reference[1],
+    value.source.provenance,
+    value.source.originalManifestKnown,
+    value.source.manifestProvenance,
+    value.source.manifestDigest,
+    p.safetyEvidenceDigests,
+    p.partitionDigest,
+    p.revision,
+    value.authorization.policyDigest,
+    value.authorization.fingerprint,
+    value.request.payloadDigest,
+    value.quote.version,
+    value.quote.fingerprint,
+    [
+      value.authorization.period.id,
+      value.authorization.period.startMs,
+      value.authorization.period.endMs,
+    ],
+    value.request.providerRoute,
+    value.request.urlCount,
+    value.request.providerBodyBytes,
+    [
+      value.quote.maximumExposure.tokens,
+      value.quote.maximumExposure.indexer,
+      value.quote.maximumExposure.checker,
+    ],
+  ]);
+}
+
+test('P2-02 pure four variants and every fixed blocker/error are locally validated with exact isError', () => {
+  const ready = publicReadyFixture().value;
+  const noSource = retryPlanResultFromView('yandex', { status: 'no_source' });
+  expect(noSource).toEqual({ status: 'no_source', searchEngine: 'yandex' });
+  const codes = [
+    'UnprovenLatest',
+    'AmbiguousLatest',
+    'ConflictingEvidence',
+    'IncompleteScan',
+    'SourceReportIncomplete',
+    'SourceManifestConflict',
+    'UnattributedParentPermissionRequired',
+    'ActiveCoverageUnknown',
+    'PriorRetryEvidenceUnknown',
+    'AmbiguousLocalReference',
+    'UnknownRetryDispatch',
+    'RetryPolicyRequired',
+    'WritesDisabled',
+    'SnapshotConflict',
+    'StateUnavailable',
+    'UpgradeRequired',
+    'SnapshotLimitExceeded',
+    'RetryAllowanceExceeded',
+    'BudgetExceeded',
+    'StalePeriodContext',
+    'NoCandidates',
+  ];
+  for (const value of [
+    ready,
+    noSource,
+    ...codes.map((code) =>
+      retryPlanResultFromView('google', {
+        status: 'blocked',
+        blockers: [code],
+      }),
+    ),
+  ]) {
+    const result = planRetryToolResult(value);
+    expect(result.structuredContent).toEqual(value);
+    expect(result.isError).toBe(false);
+    expect(
+      planRetryResultSchema.safeParse(result.structuredContent).success,
+    ).toBe(true);
+    expect(JSON.parse(result.content[0]!.text)).toEqual(
+      result.structuredContent,
+    );
+  }
+  const blocked = retryPlanResultFromView('google', {
+    status: 'blocked',
+    blockers: ['WritesDisabled', 'StateUnavailable'],
+  });
+  expect(blocked).toMatchObject({
+    blockers: [{ code: 'StateUnavailable' }, { code: 'WritesDisabled' }],
+  });
+  for (const code of [
+    'InvalidInput',
+    'MissingCredentials',
+    'SubmissionBusy',
+    'Cancelled',
+    'DeadlineExceeded',
+    'ReadFailed',
+    'ResourceLimitExceeded',
+    'InternalError',
+  ]) {
+    const value = retryPlanResultFromView('google', {
+      status: 'error',
+      code,
+      phase: 'report',
+      ...(code === 'ReadFailed' ? { cause: 'response' } : {}),
+    });
+    const result = planRetryToolResult(value);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      status: 'error',
+      error: { code, phase: 'report' },
+    });
+    expect(
+      planRetryResultSchema.safeParse(result.structuredContent).success,
+    ).toBe(true);
+    expect(JSON.parse(result.content[0]!.text)).toEqual(
+      result.structuredContent,
+    );
+    expect(envelopeBytes(result)).toBeLessThanOrEqual(2_097_152);
+  }
+});
+
+test('P2-02 correlated missing metadata preserves local, external and zero-unknown incomplete reports', () => {
+  const source = projectRetryFact(family, fields());
+  const snapshot = local({
+    acceptedManifests: [manifest('parent', [A, B, C])],
+  });
+  for (const [state, expectedMissing] of [
+    [snapshot, [B]],
+    [local(), null],
+  ] as const) {
+    const assessed = assessRetryObservations(
+      {},
+      observations(pass([source], report(source, [C], [A])), state),
+      state,
+      configuration().snapshot.policy,
+    );
+    const value = retryPlanResultFromView('google', assessed);
+    expect(value).toMatchObject({
+      status: 'blocked',
+      unknownUrlCount: 1,
+      knownMissingLocalUrls: expectedMissing,
+    });
+    expect(planRetryToolResult(value).isError).toBe(false);
+  }
+  const incomplete = projectRetryFact(
+    family,
+    fields('parent', { processedCount: 2 }),
+  );
+  const assessed = assessRetryObservations(
+    {},
+    observations(pass([incomplete], report(incomplete)), snapshot),
+    snapshot,
+    configuration().snapshot.policy,
+  );
+  const zero = retryPlanResultFromView('google', assessed);
+  expect(zero).toMatchObject({
+    status: 'blocked',
+    unknownUrlCount: 0,
+    knownMissingLocalUrls: [],
+  });
+  expect(planRetryToolResult(zero).isError).toBe(false);
+  const bare = retryPlanResultFromView('google', {
+    status: 'blocked',
+    blockers: ['SourceReportIncomplete'],
+  });
+  expect(bare).not.toHaveProperty('unknownUrlCount');
+  expect(bare).not.toHaveProperty('knownMissingLocalUrls');
+  const valid = retryPlanResultFromView('google', {
+    status: 'blocked',
+    blockers: ['SourceReportIncomplete'],
+    unknownUrlCount: 1,
+    knownMissingLocalUrls: [B],
+  });
+  const unrelated = retryPlanResultFromView('google', {
+    status: 'blocked',
+    blockers: ['NoCandidates'],
+  });
+  if (unrelated.status !== 'blocked')
+    throw new Error('Expected pure blocker data.');
+  expectInternalResult({ ...valid, blockers: unrelated.blockers });
+  for (const [path, replacement] of [
+    [['unknownUrlCount'], undefined],
+    [['knownMissingLocalUrls'], undefined],
+    [['unknownUrlCount'], 2],
+    [['knownMissingLocalUrls'], [B, B]],
+    [['knownMissingLocalUrls'], ['javascript:bad']],
+    [['unknownUrlCount'], -1],
+    [['blockers', 0, 'code'], 'NoCandidates'],
+  ] as const)
+    expectInternalResult(changedResult(valid, path, replacement));
+});
+
+test('P2-02 closed variants and nested objects reject malformed isError payloads and redact exceptional values', () => {
+  const ready = publicReadyFixture().value;
+  const noSource = retryPlanResultFromView('google', { status: 'no_source' });
+  const blocked = retryPlanResultFromView('google', {
+    status: 'blocked',
+    blockers: ['WritesDisabled'],
+  });
+  const readError = retryPlanResultFromView('google', {
+    status: 'error',
+    code: 'ReadFailed',
+    phase: 'report',
+    cause: 'http',
+  });
+  const multiple = retryPlanResultFromView('google', {
+    status: 'blocked',
+    blockers: ['WritesDisabled', 'StateUnavailable'],
+  });
+  if (multiple.status !== 'blocked')
+    throw new Error('Expected ordered pure blockers.');
+  expectInternalResult({
+    ...multiple,
+    blockers: [...multiple.blockers].reverse(),
+  });
+  for (const value of [
+    null,
+    [],
+    'SYNTHETIC-SECRET',
+    { status: 'invented' },
+    { ...ready, proof: 'SYNTHETIC-SECRET' },
+    { ...noSource, identity: ready.identity },
+    { ...blocked, quote: ready.quote },
+    changedResult(blocked, ['blockers'], []),
+    changedResult(
+      blocked,
+      ['blockers'],
+      [
+        ...(blocked.status === 'blocked' ? blocked.blockers : []),
+        ...(blocked.status === 'blocked' ? blocked.blockers : []),
+      ],
+    ),
+    changedResult(blocked, ['blockers', 0, 'code'], 'Unknown'),
+    changedResult(blocked, ['blockers', 0, 'message'], 'SYNTHETIC-SECRET'),
+    changedResult(readError, ['error', 'code'], undefined),
+    changedResult(readError, ['error', 'message'], 'SYNTHETIC-SECRET'),
+    changedResult(readError, ['error', 'cause'], 'SYNTHETIC-SECRET'),
+    changedResult(readError, ['error', 'phase'], 'unknown'),
+    changedResult(readError, ['error', 'phase'], undefined),
+    changedResult(readError, ['error', 'cause'], undefined),
+    changedResult(readError, ['error', 'raw'], 'SYNTHETIC-SECRET'),
+    changedResult(readError, ['error', 'code'], 'Cancelled'),
+    changedResult(ready, ['authorization'], undefined),
+    changedResult(ready, ['counts', 'raw'], 'SYNTHETIC-SECRET'),
+    changedResult(
+      ready,
+      ['identity', 'preimage', 'parent', 'raw'],
+      'SYNTHETIC-SECRET',
+    ),
+  ])
+    expectInternalResult(value);
+  const cyclic = { ...noSource, cycle: null as unknown };
+  cyclic.cycle = cyclic;
+  expectInternalResult(cyclic);
+  const throwing = Object.defineProperty({}, 'status', {
+    enumerable: true,
+    get() {
+      throw new Error('SYNTHETIC-SECRET /private/path provider-body');
+    },
+  });
+  expectInternalResult(throwing);
+  expectInternalResult(retryPlanResultFromView('google', throwing));
+  for (const view of [
+    { status: 'complete', observations: 'SYNTHETIC-SECRET' },
+    { status: 'error', code: 'ReadFailed', raw: 'SYNTHETIC-SECRET' },
+    { status: 'blocked', blockers: ['Unknown'] },
+    { status: 'blocked', blockers: ['WritesDisabled', 'WritesDisabled'] },
+    {
+      status: 'blocked',
+      blockers: ['SourceReportIncomplete'],
+      unknownUrlCount: 0,
+    },
+  ])
+    expectInternalResult(retryPlanResultFromView('google', view));
+  const stringify = JSON.stringify;
+  let failure: ReturnType<typeof planRetryToolResult>;
+  try {
+    JSON.stringify = () => {
+      throw new Error('SYNTHETIC-SECRET serialization');
+    };
+    failure = planRetryToolResult(noSource);
+  } finally {
+    JSON.stringify = stringify;
+  }
+  expectInternalResult(failure.structuredContent);
+});
+
+test('P2-03 real local Google, external Yandex and legacy proposals have independent body/quote/fingerprint oracles', () => {
+  for (const [engine, provenance] of [
+    ['google', 'local_standalone'],
+    ['yandex', 'external_unattributed'],
+    ['google', 'legacy_unattributed'],
+  ] as const) {
+    const { value, proposal } = publicReadyFixture({ engine, provenance });
+    const body =
+      engine === 'google'
+        ? '{"urls":["https://example.test/A?b=1&a=2","https://example.test/A/?b=1&a=2"],"pay_per_indexed":true,"drip_feed":false}'
+        : '{"urls":["https://example.test/A?b=1&a=2","https://example.test/A/?b=1&a=2"]}';
+    const payloadDigest = createHash('sha256')
+      .update(body, 'utf8')
+      .digest('hex');
+    const maximumExposure =
+      engine === 'google'
+        ? { tokens: 200, indexer: 0, checker: 0 }
+        : { tokens: 40, indexer: 2, checker: 0 };
+    const quoteFingerprint = createHash('sha256')
+      .update(
+        'speedyindex-create-quote-v1\0' +
+          JSON.stringify({
+            version: 'speedyindex-indexing-batch-2026-10-20-v1',
+            family: `${engine}/indexer`,
+            providerRoute: `/v2/task/${engine}/indexer/create`,
+            payloadDigest,
+            urlCount: 2,
+            maximumExposure,
+          }),
+        'utf8',
+      )
+      .digest('hex');
+    expect(proposal.request.body).toBe(body);
+    expect(value.eligibleUrls).toEqual([A, B]);
+    expect(value.request).toEqual({
+      family: `${engine}/indexer`,
+      providerRoute: `/v2/task/${engine}/indexer/create`,
+      urlCount: 2,
+      providerBodyBytes: Buffer.from(body, 'utf8').length,
+      payloadDigest,
+    });
+    expect(value.quote).toEqual({
+      version: 'speedyindex-indexing-batch-2026-10-20-v1',
+      fingerprint: quoteFingerprint,
+      maximumExposure,
+      basis: 'documented_independent_maxima',
+      providerEnforced: false,
+    });
+    expect(value.source).toMatchObject({
+      provenance,
+      originalManifestKnown: provenance !== 'external_unattributed',
+      manifestProvenance:
+        provenance === 'external_unattributed'
+          ? 'provider_report_observed_corpus'
+          : 'durable_local_intent_ack',
+    });
+    expect(value.identity.fingerprint).toBe(
+      independentPublicFingerprint(value),
+    );
+    expect(value.authorization).toMatchObject({
+      state: 'configured',
+      stateChecked: true,
+      mode: 'operator_policy',
+      period: {
+        id: 'utc-day:2026-10-21',
+        startMs: Date.parse('2026-10-21T00:00:00Z'),
+        endMs: Date.parse('2026-10-22T00:00:00Z'),
+      },
+    });
+    expect(planRetryToolResult(value).structuredContent).toEqual(value);
+  }
+});
+
+test('P2-03 visible source, partition, body, quote, authorization and comparison contradictions fail closed', () => {
+  const value = publicReadyFixture().value;
+  const mutations: readonly (readonly [
+    readonly (string | number)[],
+    unknown,
+  ])[] = [
+    [['searchEngine'], 'yandex'],
+    [['source', 'reference', 0], 'yandex/indexer'],
+    [['source', 'reference', 1], 'different'],
+    [['source', 'provenance'], 'external_unattributed'],
+    [['source', 'originalManifestKnown'], false],
+    [['source', 'manifestProvenance'], 'provider_report_observed_corpus'],
+    [['source', 'manifestDigest'], 'b'.repeat(64)],
+    [['source', 'reference', 1], 'x'.repeat(4097)],
+    [['eligibleUrls'], [B, A]],
+    [['eligibleUrls'], [A, A]],
+    [['eligibleUrls'], ['https://EXAMPLE.test/a?A=2', B]],
+    [['eligibleUrls'], []],
+    [
+      ['excluded'],
+      [{ url: A, reasons: ['LocalUnresolvedHold'], references: [] }],
+    ],
+    [['counts', 'eligible'], 1],
+    [['counts', 'excluded'], 1],
+    [['counts', 'unindexed'], 3],
+    [['counts', 'unknown'], 1],
+    [['counts', 'indexed'], 10_000],
+    [['counts', 'indexed'], -1],
+    [['request', 'family'], 'yandex/indexer'],
+    [['request', 'providerRoute'], '/v2/task/yandex/indexer/create'],
+    [['request', 'providerBodyBytes'], value.request.providerBodyBytes + 1],
+    [['request', 'urlCount'], 1],
+    [['request', 'payloadDigest'], 'c'.repeat(64)],
+    [['quote', 'version'], 'other'],
+    [['quote', 'fingerprint'], 'd'.repeat(64)],
+    [['quote', 'basis'], 'wallet'],
+    [['quote', 'providerEnforced'], true],
+    [['quote', 'maximumExposure', 'tokens'], 199],
+    [['quote', 'maximumExposure', 'indexer'], 1],
+    [['quote', 'maximumExposure', 'checker'], 1],
+    [['authorization', 'state'], 'unconfigured'],
+    [['authorization', 'stateChecked'], false],
+    [['authorization', 'mode'], undefined],
+    [['authorization', 'policyRevision'], undefined],
+    [['authorization', 'budgetScope'], undefined],
+    [['authorization', 'caps', 'tokens'], 199],
+    [['authorization', 'policyDigest'], 'e'.repeat(64)],
+    [['authorization', 'fingerprint'], 'f'.repeat(64)],
+    [['authorization', 'period', 'id'], 'utc-day:2026-02-30'],
+    [
+      ['authorization', 'period', 'startMs'],
+      Date.parse('2026-10-21T01:00:00Z'),
+    ],
+    [['identity', 'status'], 'ready'],
+    [['identity', 'preimage', 'parent', 'taskId'], 'different'],
+    [['identity', 'preimage', 'originalManifestKnown'], false],
+    [['identity', 'preimage', 'sourceManifestDigest'], '1'.repeat(64)],
+    [['identity', 'preimage', 'policyDigest'], '2'.repeat(64)],
+    [['identity', 'preimage', 'authorizationFingerprint'], '3'.repeat(64)],
+    [['identity', 'preimage', 'payloadDigest'], '4'.repeat(64)],
+    [['identity', 'preimage', 'quoteFingerprint'], '5'.repeat(64)],
+    [['identity', 'preimage', 'quoteVersion'], 'other'],
+    [['identity', 'preimage', 'period', 'id'], 'utc-day:2026-10-22'],
+    [['identity', 'preimage', 'urlCount'], 1],
+    [['identity', 'preimage', 'providerBodyBytes'], 1],
+    [['identity', 'preimage', 'reservation', 'tokens'], 201],
+    [['identity', 'preimage', 'partitionDigest'], '6'.repeat(64)],
+    [['identity', 'preimage', 'revision'], '7'.repeat(64)],
+    [['identity', 'preimage', 'safetyEvidenceDigests'], []],
+    [['identity', 'fingerprint'], '8'.repeat(64)],
+  ];
+  for (const [path, replacement] of mutations) {
+    const changed = changedResult(value, path, replacement);
+    expect(
+      planRetryResultSchema.safeParse(changed).success,
+      path.join('.'),
+    ).toBe(false);
+    expectInternalResult(changed);
+  }
+  const incoherent = changedResult(
+    value,
+    ['identity', 'preimage', 'parent', 'taskId'],
+    'fabricated',
+  );
+  incoherent.identity.fingerprint = computeRetryPlanFingerprint(
+    incoherent.identity.preimage,
+  );
+  expectInternalResult(incoherent);
+});
+
+test('P2-03 exclusions retain exact canonical reasons/references and permit reference-free local checker holds', () => {
+  const localOnly = publicReadyFixture({ exclusions: 'local' }).value;
+  expect(localOnly.excluded).toEqual([
+    { url: B, reasons: ['LocalUnresolvedHold'], references: [] },
+  ]);
+  expect(planRetryToolResult(localOnly).isError).toBe(false);
+  const active = publicReadyFixture({ exclusions: 'active' }).value;
+  expect(active.excluded).toEqual([
+    {
+      url: B,
+      reasons: ['ActiveIndexing', 'LocalUnresolvedHold'],
+      references: [
+        ['google/indexer', 'active-é'],
+        ['yandex/indexer', 'active-é'],
+      ],
+    },
+  ]);
+  for (const [path, replacement] of [
+    [['excluded'], [active.excluded[0]!, active.excluded[0]!]],
+    [
+      ['excluded', 0, 'reasons'],
+      ['LocalUnresolvedHold', 'ActiveIndexing'],
+    ],
+    [
+      ['excluded', 0, 'reasons'],
+      ['ActiveIndexing', 'ActiveIndexing'],
+    ],
+    [['excluded', 0, 'reasons'], []],
+    [['excluded', 0, 'reasons'], ['Unknown']],
+    [
+      ['excluded', 0, 'references'],
+      [...active.excluded[0]!.references].reverse(),
+    ],
+    [
+      ['excluded', 0, 'references'],
+      [active.excluded[0]!.references[0]!, active.excluded[0]!.references[0]!],
+    ],
+    [['excluded', 0, 'references'], []],
+    [['excluded', 0, 'references', 0, 0], 'google/checker'],
+  ] as const)
+    expectInternalResult(changedResult(active, path, replacement));
+});
+
+test('P2-03 self-consistent changed opaque commitments remain pure comparison data without proof', () => {
+  const value = structuredClone(publicReadyFixture().value);
+  value.identity.preimage.safetyEvidenceDigests = ['9'.repeat(64)];
+  value.identity.preimage.partitionDigest = '0'.repeat(64);
+  value.identity.fingerprint = independentPublicFingerprint(value);
+  expect(planRetryToolResult(value).structuredContent).toEqual(value);
+  expect(value).not.toHaveProperty('proof');
+  expect(value.identity).not.toHaveProperty('ledgerId');
+});
+
+test('P2-04 exact N versus N-1 counts the complete UTF8 escaped and duplicated envelope', () => {
+  const { value } = publicReadyFixture({
+    urls: ['https://example.test/é"\\?A=1', 'https://example.test/é/"\\?A=1'],
+  });
+  const expected = {
+    isError: false,
+    content: [{ type: 'text' as const, text: JSON.stringify(value) }],
+    structuredContent: value,
+  };
+  const n = Buffer.from(JSON.stringify(expected), 'utf8').length;
+  expect(n).toBeGreaterThan(
+    2 * Buffer.from(JSON.stringify(value), 'utf8').length,
+  );
+  expect(n).toBeGreaterThan(JSON.stringify(expected).length);
+  const exact = planRetryToolResult(value, { maxBytes: n });
+  expect(exact).toEqual(expected);
+  expect(envelopeBytes(exact)).toBe(n);
+  const overflow = planRetryToolResult(value, { maxBytes: n - 1 });
+  expect(overflow.structuredContent).toMatchObject({
+    status: 'error',
+    error: { code: 'ResourceLimitExceeded' },
+  });
+  expect(overflow.isError).toBe(true);
+  expect(envelopeBytes(overflow)).toBeLessThanOrEqual(n - 1);
+  expect(overflow.structuredContent).not.toHaveProperty('eligibleUrls');
+});
+
+test('P2-04 legal create body and valid blocked missing URLs cross the real production envelope ceiling without truncation', () => {
+  const urls = Array.from(
+    { length: 250 },
+    (_, i) => 'https://example.test/' + i + '/' + 'é"\\'.repeat(600),
+  );
+  const { value, proposal } = publicReadyFixture({
+    urls,
+    provenance: 'external_unattributed',
+  });
+  expect(Buffer.from(proposal.request.body, 'utf8').length).toBeLessThanOrEqual(
+    2_097_152,
+  );
+  const blocked = retryPlanResultFromView('google', {
+    status: 'blocked',
+    blockers: ['SourceReportIncomplete'],
+    unknownUrlCount: urls.length,
+    knownMissingLocalUrls: urls,
+  });
+  expect(blocked.status).toBe('blocked');
+  for (const payload of [value, blocked]) {
+    expect(planRetryResultSchema.safeParse(payload).success).toBe(true);
+    const expected = {
+      isError: false,
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      structuredContent: payload,
+    };
+    expect(envelopeBytes(expected)).toBeGreaterThan(2_097_152);
+    const result = planRetryToolResult(payload);
+    expect(result.structuredContent).toMatchObject({
+      status: 'error',
+      error: { code: 'ResourceLimitExceeded' },
+    });
+    expect(Object.keys(result.structuredContent).sort()).toEqual([
+      'error',
+      'status',
+    ]);
+    expect(
+      planRetryResultSchema.safeParse(result.structuredContent).success,
+    ).toBe(true);
+    expect(envelopeBytes(result)).toBeLessThanOrEqual(2_097_152);
+    expect(result.content).toHaveLength(1);
+    expect(JSON.parse(result.content[0]!.text)).toEqual(
+      result.structuredContent,
+    );
+  }
+});
+
+test('P2-04 admitted output is copied and deeply immutable; trusted lower-only limits keep both fallbacks bounded', () => {
+  const value = structuredClone(publicReadyFixture().value);
+  const admitted = planRetryToolResult(value);
+  const before = JSON.stringify(admitted);
+  value.eligibleUrls[0] = 'https://example.test/changed';
+  value.authorization.caps.tokens = 0;
+  expect(JSON.stringify(admitted)).toBe(before);
+  const frozen = (value: unknown) => {
+    if (value && typeof value === 'object') {
+      expect(Object.isFrozen(value)).toBe(true);
+      for (const item of Object.values(value)) frozen(item);
+    }
+  };
+  frozen(admitted);
+  expect(() =>
+    admitted.content.push({ type: 'text', text: 'changed' }),
+  ).toThrow();
+  expect(() => {
+    admitted.structuredContent.status = 'error';
+  }).toThrow();
+  const internal = expectInternalResult({ status: 'invalid' });
+  const resource = planRetryToolResult(
+    retryPlanResultFromView('google', {
+      status: 'error',
+      code: 'ResourceLimitExceeded',
+    }),
+  );
+  const minimum = Math.max(envelopeBytes(internal), envelopeBytes(resource));
+  for (const payload of [
+    internal.structuredContent,
+    resource.structuredContent,
+  ]) {
+    const result = planRetryToolResult(payload, { maxBytes: minimum });
+    expect(result.structuredContent).toEqual(payload);
+    expect(envelopeBytes(result)).toBeLessThanOrEqual(minimum);
+    frozen(result);
+  }
+  for (const maxBytes of [minimum - 1, 2_097_153, 0, -1, 1.5, NaN, Infinity])
+    expect(() =>
+      planRetryToolResult(internal.structuredContent, { maxBytes }),
+    ).toThrow(RangeError);
+  expectInternalResult(value);
 });
