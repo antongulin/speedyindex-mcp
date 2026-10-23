@@ -510,7 +510,8 @@ async function journey(entry: string, engine: Engine) {
               ...task,
               type: 'indexer',
               indexed_links: [C],
-              unindexed_links: [A, ASlash],
+              unindexed_links:
+                engine === 'google' ? [A, ASlash, A] : [A, ASlash],
             },
           };
         } else throw new Error('Unexpected retry SDK HTTP request.');
