@@ -1324,3 +1324,44 @@ describe('SR-D01-A pure boundaries', () => {
     expect(lowerSubmitRetryResultByteLimit()).toBe(2097152);
   });
 });
+
+test('SR-A2-LATE-DAY-SHAPE permits late-day error only with coherent durable or unrecorded evidence', () => {
+  const error = submitRetryError('StalePeriodContext');
+  for (const state of [
+    'prepared',
+    'cancelled',
+    'accepted',
+    'unknown',
+  ] as const) {
+    const value = {
+      status: 'error',
+      requestId: 'retry-01',
+      error,
+      evidence: evidence(durable(state)),
+    };
+    expect(expectGoodResult(value).isError).toBe(true);
+    expectBadResult({ status: 'error', requestId: 'retry-01', error });
+    expectBadResult({ ...value, status: 'blocked' });
+    expectBadResult(changed(value, ['requestId'], 'different'));
+  }
+  const value = {
+    status: 'error',
+    requestId: 'retry-01',
+    error,
+    evidence: {
+      kind: 'unrecorded',
+      ...data(),
+      lastObservedState: 'dispatching',
+      observation: observed('ambiguous', false),
+    },
+  };
+  expect(expectGoodResult(value).isError).toBe(true);
+  expectBadResult({ ...value, status: 'blocked' });
+  expectBadResult(
+    changed(value, ['evidence', 'observation', 'recorded'], true),
+  );
+  expectBadResult(
+    changed(value, ['evidence', 'lastObservedState'], 'accepted'),
+  );
+  expectGoodResult({ status: 'blocked', requestId: 'retry-01', error });
+});

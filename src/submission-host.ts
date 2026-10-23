@@ -5,6 +5,7 @@ import {
   createIndexingTaskToolResult,
   normalizeCreateIndexingOutcome,
   type CreateIndexingTaskResult,
+  type PreparedCreateIndexingRequest,
 } from './create-indexing-task';
 import {
   buildCreateIndexCheckRequest,
@@ -43,9 +44,17 @@ import {
   openLedger,
   composeVerifiedRetryAdmission,
   type ProductionRetryComposition,
+  type RetryCreatedOwner,
+  type RetryOwnerIntent,
+  type RetryOwnerWriter,
+  type RetryPrepareHooks,
+  type RetryLatestCollection,
   type RetryOwnerOptions,
   type RetryPlanView,
   SubmissionLedgerError,
+  RetryLedgerError,
+  readRetryReplay,
+  computeRetryPlanFingerprint,
   type DispatchOutcome,
   type DispatchOutcomeToken,
   type IntentView,
@@ -68,6 +77,236 @@ import {
   type RetryHistoryOwnerOptions,
 } from './retry-history-owner';
 import type { RetryHistoryToolResult } from './get-retry-history';
+import {
+  parseSubmitRetryInput,
+  reconstructSubmitRetry,
+  SubmitRetryError,
+  submitRetryError,
+  submitRetryResultSchema,
+  submitRetryToolResult,
+  type SubmitRetryInput,
+  type SubmitRetryErrorCode,
+  type SubmitRetryResult,
+  type SubmitRetryToolResult,
+} from './submit-retry';
+
+type RetryCandidate = Extract<RetryLatestCollection, { kind: 'candidate' }>;
+type RetryReconstruction = ReturnType<typeof reconstructSubmitRetry>;
+type RetryFailure = Readonly<{
+  status: 'blocked' | 'error';
+  error: ReturnType<typeof submitRetryError>;
+}>;
+type CreatedRetryWork = Readonly<{
+  owner: RetryCreatedOwner;
+  request: PreparedCreateIndexingRequest;
+  retry: Pick<
+    RetryReconstruction['replay'],
+    'parent' | 'sourceManifestDigest' | 'planFingerprint'
+  >;
+}>;
+
+// Both operands are closed parsed/frozen JSON data. Array order is significant;
+// object key insertion order is not. This compares values, not authority hashes.
+function sameRetryData(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right))
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, i) => sameRetryData(value, right[i]))
+    );
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object')
+    return false;
+  const keys = Object.keys(left);
+  return (
+    keys.length === Object.keys(right).length &&
+    keys.every(
+      (key) =>
+        Object.hasOwn(right, key) &&
+        sameRetryData(Reflect.get(left, key), Reflect.get(right, key)),
+    )
+  );
+}
+function retryFailure(
+  status: RetryFailure['status'],
+  code: SubmitRetryErrorCode,
+): RetryFailure {
+  return { status, error: submitRetryError(code) };
+}
+function collectionRetryFailure(
+  view: Exclude<RetryLatestCollection, RetryCandidate>,
+): RetryFailure {
+  if (view.status === 'no_source')
+    return retryFailure('blocked', 'SnapshotConflict');
+  if (view.status === 'blocked') {
+    if (view.blockers.length !== 1)
+      return retryFailure('error', 'InternalError');
+    const code = view.blockers[0];
+    if (!code) return retryFailure('error', 'InternalError');
+    return { status: 'blocked', error: submitRetryError(code) };
+  }
+  if (view.code === 'ReadFailed')
+    return {
+      status: 'error',
+      error: submitRetryError('ReadFailed', {
+        ...(view.phase === undefined ? {} : { phase: view.phase }),
+        ...('cause' in view && view.cause !== undefined
+          ? { cause: view.cause }
+          : {}),
+      }),
+    };
+  if (view.code === 'MissingCredentials' || view.code === 'SubmissionBusy')
+    return retryFailure('blocked', view.code);
+  if (
+    [
+      'InvalidInput',
+      'Cancelled',
+      'DeadlineExceeded',
+      'ResourceLimitExceeded',
+      'InternalError',
+    ].includes(view.code)
+  )
+    return { status: 'error', error: submitRetryError(view.code) };
+  return retryFailure('error', 'InternalError');
+}
+function preparationRetryFailure(
+  error: unknown,
+  config: ConfiguredSubmission,
+  candidate: RetryCandidate | undefined,
+  admissionAttempted: boolean,
+): RetryFailure {
+  if (error instanceof SubmitRetryError)
+    return retryFailure('error', error.code);
+  if (error instanceof RetryLedgerError) {
+    switch (error.code) {
+      case 'RetryCancelled':
+        return retryFailure('error', 'Cancelled');
+      case 'RetryProofExpired':
+        return retryFailure('error', 'DeadlineExceeded');
+      case 'SnapshotConflict':
+      case 'RetryLineageConflict':
+        return retryFailure('blocked', 'SnapshotConflict');
+      case 'UnknownRetryDispatch':
+      case 'UpgradeRequired':
+      case 'SnapshotLimitExceeded':
+        return retryFailure('blocked', error.code);
+      case 'SnapshotUnavailable':
+        return retryFailure(
+          'blocked',
+          error.reason === 'LimitExceeded'
+            ? 'SnapshotLimitExceeded'
+            : error.reason === 'UpgradeRequired'
+              ? 'UpgradeRequired'
+              : 'StateUnavailable',
+        );
+      case 'RetryPermissionDenied': {
+        const policy = config.snapshot.policy.retry;
+        if (!policy?.enabled)
+          return retryFailure('blocked', 'RetryPolicyRequired');
+        if (!candidate || !admissionAttempted)
+          return retryFailure('error', 'InternalError');
+        const provenance = candidate.view.source.provenance;
+        if (
+          (provenance === 'legacy_unattributed' ||
+            provenance === 'external_unattributed') &&
+          !policy.allowUnattributedParents
+        )
+          return retryFailure(
+            'blocked',
+            'UnattributedParentPermissionRequired',
+          );
+        if (
+          provenance === 'local_standalone' ||
+          ((provenance === 'legacy_unattributed' ||
+            provenance === 'external_unattributed') &&
+            policy.allowUnattributedParents)
+        )
+          return retryFailure('blocked', 'RetryAllowanceExceeded');
+        return retryFailure('error', 'InternalError');
+      }
+      default:
+        return retryFailure('error', 'InternalError');
+    }
+  }
+  if (error instanceof SubmissionLedgerError) {
+    switch (error.code) {
+      case 'RequestIdConflict':
+      case 'UrlOverlap':
+      case 'StalePeriodContext':
+      case 'LedgerBusy':
+        return retryFailure('blocked', error.code);
+      case 'BudgetExceeded':
+        return {
+          status: 'blocked',
+          error: submitRetryError(
+            'BudgetExceeded',
+            error.unit === undefined ? {} : { unit: error.unit },
+          ),
+        };
+      case 'LedgerUnavailable':
+        return retryFailure('blocked', 'StateUnavailable');
+      default:
+        return retryFailure('error', 'InternalError');
+    }
+  }
+  return retryFailure('error', 'InternalError');
+}
+function retryStoredResult(
+  reconstruction: RetryReconstruction,
+  intent: RetryOwnerIntent,
+): SubmitRetryResult {
+  const p = reconstruction.input.expectedPlan.identity.preimage;
+  if (
+    intent.periodId !== p.period.id ||
+    intent.periodStartMs !== p.period.startMs
+  )
+    return submitRetryResultSchema.parse({
+      status: 'blocked',
+      requestId: reconstruction.input.requestId,
+      error: submitRetryError('RequestIdConflict'),
+    });
+  return submitRetryResultSchema.parse({
+    status: intent.state,
+    requestId: reconstruction.input.requestId,
+    replayed: true,
+    request: reconstruction.request.request,
+    quote: reconstruction.request.quote,
+    retry: {
+      parent: reconstruction.replay.parent,
+      sourceManifestDigest: reconstruction.replay.sourceManifestDigest,
+      planFingerprint: reconstruction.replay.planFingerprint,
+    },
+    intent: projectIntent(intent),
+    ...(intent.state === 'accepted'
+      ? {}
+      : {
+          error: submitRetryError(
+            intent.state === 'cancelled'
+              ? 'Cancelled'
+              : intent.state === 'unknown'
+                ? 'OutcomeUnknown'
+                : 'DispatchClaimLost',
+          ),
+        }),
+  });
+}
+function retryDurableEvidence(
+  reconstruction: RetryReconstruction,
+  intent: RetryOwnerIntent,
+) {
+  return {
+    kind: 'durable' as const,
+    request: reconstruction.request.request,
+    quote: reconstruction.request.quote,
+    retry: {
+      parent: reconstruction.replay.parent,
+      sourceManifestDigest: reconstruction.replay.sourceManifestDigest,
+      planFingerprint: reconstruction.replay.planFingerprint,
+    },
+    intent: projectIntent(intent),
+  };
+}
 
 type PublicError = SubmissionError<CreateIndexCheckErrorCode>;
 interface BaseResult {
@@ -203,7 +442,11 @@ export interface SubmissionHostOptions {
   openLedger?: (options: LedgerPathOptions) => SubmissionLedger;
   timeoutMs?: number;
   /** Trusted internal retry construction, never a tool or environment selector. */
-  retry?: RetryOwnerOptions & Readonly<{ monotonicMs?: () => number }>;
+  retry?: RetryOwnerOptions &
+    Readonly<{
+      monotonicMs?: () => number;
+      preparationHooks?: RetryPrepareHooks;
+    }>;
 }
 
 function checked(value: unknown): CreateIndexingTaskResult {
@@ -234,7 +477,7 @@ function safeLedgerError<Result>(
   return strategy.error('StateUnavailable');
 }
 
-function projectIntent(intent: IntentView) {
+function projectIntent(intent: IntentView | RetryOwnerIntent) {
   return {
     requestId: intent.requestId,
     state: intent.state,
@@ -448,6 +691,9 @@ export class SubmissionHost {
             ...options.retry,
             publicResultBytes: this.publicResultBytes,
           },
+          ...(options.retry?.preparationHooks === undefined
+            ? {}
+            : { hooks: options.retry.preparationHooks }),
         });
       } catch {
         // Invalid retry wiring blocks planning, without breaking pure previews.
@@ -546,6 +792,301 @@ export class SubmissionHost {
     } finally {
       this.busy = false;
     }
+  }
+
+  /** Trusted owning preparation only. No public entry or paid consumer yet. */
+  protected async withRetryPreparation(
+    value: unknown,
+    signal: AbortSignal | undefined,
+    consumeCreated: (work: CreatedRetryWork) => Promise<SubmitRetryResult>,
+  ): Promise<SubmitRetryToolResult> {
+    let input: SubmitRetryInput;
+    try {
+      input = parseSubmitRetryInput(value);
+    } catch {
+      return submitRetryToolResult({
+        status: 'error',
+        error: submitRetryError('InvalidInput'),
+      });
+    }
+    const id = input.requestId;
+    const refusal = (failure: RetryFailure) =>
+      submitRetryToolResult({ ...failure, requestId: id });
+    if (signal?.aborted) return refusal(retryFailure('error', 'Cancelled'));
+    const config = this.configuration;
+    if (config.state !== 'configured')
+      return refusal(retryFailure('blocked', config.error.code));
+    if (!config.snapshot.policy.enabled)
+      return refusal(retryFailure('blocked', 'WritesDisabled'));
+    let reconstruction: RetryReconstruction;
+    try {
+      reconstruction = reconstructSubmitRetry(input, {
+        credentialFingerprint: config.credential.fingerprint,
+        currentCaps: config.snapshot.policy.caps,
+      });
+    } catch (error) {
+      return refusal(
+        error instanceof SubmitRetryError
+          ? retryFailure('error', error.code)
+          : retryFailure('error', 'InternalError'),
+      );
+    }
+    const fp = config.credential.fingerprint;
+    const path = { stateDirectory: config.stateDirectory };
+    const historical = readRetryReplay(path, fp, reconstruction.replay);
+    if (historical.availability === 'unavailable')
+      return refusal(
+        retryFailure(
+          'blocked',
+          historical.reason === 'UpgradeRequired'
+            ? 'UpgradeRequired'
+            : historical.reason === 'LimitExceeded'
+              ? 'SnapshotLimitExceeded'
+              : 'StateUnavailable',
+        ),
+      );
+    if (historical.kind === 'conflict')
+      return refusal(retryFailure('blocked', 'RequestIdConflict'));
+    if (historical.kind === 'replay')
+      return submitRetryToolResult(
+        retryStoredResult(reconstruction, historical.intent),
+      );
+    // Everything above is historical comparison outside the new-work meter.
+    if (!config.snapshot.policy.retry?.enabled)
+      return refusal(retryFailure('blocked', 'RetryPolicyRequired'));
+    if (this.busy) return refusal(retryFailure('blocked', 'SubmissionBusy'));
+    const composition = this.retry;
+    if (!composition || !composition.isNewWorkAvailable())
+      return refusal(retryFailure('blocked', 'StateUnavailable'));
+    this.busy = true;
+    let candidate: RetryCandidate | undefined;
+    let writer: RetryOwnerWriter | undefined;
+    let owner: RetryCreatedOwner | undefined;
+    let observed: RetryOwnerIntent | undefined;
+    let admissionAttempted = false;
+    let result: SubmitRetryResult | undefined;
+    let publication: SubmitRetryToolResult | undefined;
+    const failureResult = (failure: RetryFailure): SubmitRetryResult => {
+      if (observed) {
+        const code =
+          failure.status === 'error' ||
+          failure.error.code === 'StalePeriodContext'
+            ? failure.error.code
+            : 'StateUnavailable';
+        return submitRetryResultSchema.parse({
+          status: 'error',
+          requestId: id,
+          error: submitRetryError(
+            code,
+            code === 'ReadFailed'
+              ? {
+                  ...(failure.error.phase === undefined
+                    ? {}
+                    : { phase: failure.error.phase }),
+                  ...(failure.error.cause === undefined
+                    ? {}
+                    : { cause: failure.error.cause }),
+                }
+              : {},
+          ),
+          evidence: retryDurableEvidence(reconstruction, observed),
+        });
+      }
+      return submitRetryResultSchema.parse({ ...failure, requestId: id });
+    };
+    try {
+      const collected = await composition.collectLatest(
+        { searchEngine: input.expectedPlan.searchEngine },
+        id,
+        signal,
+      );
+      if (!('kind' in collected))
+        result = failureResult(collectionRetryFailure(collected));
+      else {
+        candidate = collected;
+        composition.checkpointCandidate(candidate.proof);
+        const expected = input.expectedPlan,
+          p = expected.identity.preimage;
+        const current = createSubmissionContext(
+          config,
+          candidate.request.quote.fingerprint,
+          this.clock(),
+        );
+        const candidateReplay = {
+          intent: candidate.input.intent,
+          parent: candidate.input.parent,
+          sourceManifestDigest: candidate.input.sourceManifestDigest,
+          planFingerprint: candidate.input.planFingerprint,
+        };
+        const matches =
+          sameRetryData(expected.identity, candidate.view.identity) &&
+          computeRetryPlanFingerprint(candidate.view.identity.preimage) ===
+            expected.identity.fingerprint &&
+          sameRetryData(expected.eligibleUrls, candidate.view.eligibleUrls) &&
+          sameRetryData(expected.eligibleUrls, candidate.request.input.urls) &&
+          candidate.request.body === reconstruction.request.body &&
+          sameRetryData(
+            candidate.request.request,
+            reconstruction.request.request,
+          ) &&
+          sameRetryData(
+            candidate.request.quote,
+            reconstruction.request.quote,
+          ) &&
+          sameRetryData(candidate.view.request, candidate.request.request) &&
+          sameRetryData(candidate.view.quote, candidate.request.quote) &&
+          sameRetryData(candidateReplay, reconstruction.replay) &&
+          candidate.input.expectedRevision === p.revision &&
+          sameRetryData(candidate.input.intent.budget, current.budget) &&
+          sameRetryData(candidate.view.authorization, {
+            ...current.authorization,
+            stateChecked: true,
+          }) &&
+          sameRetryData(candidate.view.source, {
+            reference: [p.parent.family, p.parent.taskId],
+            provenance: p.provenance,
+            originalManifestKnown: p.originalManifestKnown,
+            manifestProvenance: p.manifestProvenance,
+            manifestDigest: p.sourceManifestDigest,
+          });
+        composition.checkpointCandidate(candidate.proof);
+        if (!matches)
+          result = failureResult(retryFailure('blocked', 'SnapshotConflict'));
+        else {
+          const ack = input.acknowledgement;
+          if (!ack && config.snapshot.policy.mode === 'caller_acknowledgement')
+            result = failureResult(
+              retryFailure('blocked', 'AcknowledgementRequired'),
+            );
+          else if (
+            ack &&
+            (ack.quoteFingerprint !== candidate.request.quote.fingerprint ||
+              ack.authorizationFingerprint !==
+                candidate.view.authorization.fingerprint)
+          )
+            result = failureResult(
+              retryFailure('blocked', 'AcknowledgementMismatch'),
+            );
+          else {
+            composition.checkpointCandidate(candidate.proof);
+            writer = composition.openForSubmission();
+            admissionAttempted = true;
+            const prepared = writer.prepare(candidate.input, candidate.proof);
+            if (prepared.kind === 'replay') {
+              observed = prepared.intent;
+              result = retryStoredResult(reconstruction, prepared.intent);
+            } else {
+              owner = prepared.owner; // Retain actual ownership before any late fence.
+              observed = owner.lastObservedIntent();
+              owner.checkpoint();
+              await yieldForPendingIO();
+              owner.checkpoint();
+              result = await consumeCreated(
+                Object.freeze({
+                  owner,
+                  request: candidate.request,
+                  retry: Object.freeze({
+                    parent: candidate.input.parent,
+                    sourceManifestDigest: candidate.input.sourceManifestDigest,
+                    planFingerprint: candidate.input.planFingerprint,
+                  }),
+                }),
+              );
+              observed = owner.refreshIntent() ?? owner.lastObservedIntent();
+              owner.checkpoint();
+            }
+          }
+        }
+      }
+    } catch (error) {
+      const failure = preparationRetryFailure(
+        error,
+        config,
+        candidate,
+        admissionAttempted,
+      );
+      if (owner) {
+        // The actual owner, never a cached/read row, permits this atomic cancel.
+        // Claimed work/outcome settlement belongs to the later paid consumer.
+        try {
+          const current = owner.refreshIntent();
+          if (current?.state === 'prepared') owner.cancelPrepared();
+          observed = owner.refreshIntent() ?? owner.lastObservedIntent();
+        } catch {
+          observed = owner.lastObservedIntent();
+        }
+      } else if (admissionAttempted && candidate) {
+        // Prepare can throw after a possible commit. Close before confirming;
+        // matching historical evidence supplies no replacement ownership.
+        try {
+          writer?.close();
+        } catch {
+          /* Owned close already poisoned admission. */
+        }
+        const exact = {
+          intent: candidate.input.intent,
+          parent: candidate.input.parent,
+          sourceManifestDigest: candidate.input.sourceManifestDigest,
+          planFingerprint: candidate.input.planFingerprint,
+        };
+        const confirmed = readRetryReplay(path, fp, exact);
+        if (
+          confirmed.availability === 'available' &&
+          confirmed.kind === 'replay'
+        )
+          observed = confirmed.intent;
+      }
+      result = failureResult(failure);
+    } finally {
+      try {
+        if (candidate) composition.discardCandidate(candidate.proof);
+        // Validate/freeze/serialize while the original owner is still live.
+        publication = submitRetryToolResult(
+          result ?? {
+            status: 'error',
+            requestId: id,
+            error: submitRetryError('InternalError'),
+          },
+        );
+        if (owner && result?.status !== 'error') owner.checkpoint();
+      } catch (error) {
+        result = failureResult(
+          preparationRetryFailure(error, config, candidate, admissionAttempted),
+        );
+        publication = submitRetryToolResult(result);
+      } finally {
+        try {
+          if (owner) owner.finish();
+          else writer?.close();
+        } catch (error) {
+          const failure = preparationRetryFailure(
+            error,
+            config,
+            candidate,
+            admissionAttempted,
+          );
+          if (
+            !result ||
+            result.status !== 'error' ||
+            failure.error.code === 'StateUnavailable'
+          ) {
+            if (owner) observed = owner.lastObservedIntent();
+            result = failureResult(failure);
+            publication = submitRetryToolResult(result);
+          }
+        } finally {
+          this.busy = false;
+        }
+      }
+    }
+    return (
+      publication ??
+      submitRetryToolResult({
+        status: 'error',
+        requestId: id,
+        error: submitRetryError('InternalError'),
+      })
+    );
   }
 
   async createIndexingTask(

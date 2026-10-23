@@ -494,9 +494,11 @@ export const submitRetryResultSchema = z
         !runtimeCodes.includes(value.error.code) &&
         !(
           value.evidence &&
-          ['StateUnavailable', 'OutcomePersistenceFailed'].includes(
-            value.error.code,
-          )
+          [
+            'StateUnavailable',
+            'OutcomePersistenceFailed',
+            'StalePeriodContext',
+          ].includes(value.error.code)
         )
       )
         invalid(context);
