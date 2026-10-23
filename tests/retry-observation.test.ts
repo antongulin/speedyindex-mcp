@@ -9,6 +9,15 @@ import { join } from 'node:path';
 import { expect, test } from 'bun:test';
 import { SpeedyIndexClient } from '../src/client';
 import {
+  SubmissionHost,
+  type SubmissionHostOptions,
+} from '../src/submission-host';
+import type {
+  RetryPlanReady,
+  RetryProof,
+  RetryPlanFingerprintInput,
+} from '../src/submission-ledger';
+import {
   createInvocationReadBudget,
   ReadBudgetError,
   type InvocationReadBudget,
@@ -324,7 +333,9 @@ import {
 import { buildCreateIndexingRequest } from '../src/create-indexing-task';
 import {
   composeVerifiedRetryAdmission,
+  initializeLedger,
   initializeLedgerV2,
+  migrateLedgerV2,
   openLedger,
   readRetrySnapshot,
   readRetryPlanningState,
@@ -377,9 +388,12 @@ type Api = Awaited<ReturnType<typeof receiver>>;
 function fixtureConfiguration(
   api: Api,
   overrides: Partial<SubmissionPolicy> = {},
+  schemaVersion: 1 | 2 = 2,
 ) {
   const stateDirectory = join(api.root, 'state');
-  const ledger = initializeLedgerV2({ stateDirectory });
+  const ledger = (schemaVersion === 1 ? initializeLedger : initializeLedgerV2)({
+    stateDirectory,
+  });
   ledger.close();
   const policyPath = join(api.root, 'policy.json');
   const policy: SubmissionPolicy = {
@@ -1661,14 +1675,15 @@ async function seedExternalChild(
   state:
     'accepted' | 'rejected' | 'cancelled' | 'prepared' | 'unknown' = 'accepted',
   evidenceUrls: readonly string[] = [C, A, B],
+  options: { requestId?: string; utcMs?: number } = {},
 ) {
   const composition = composeVerifiedRetryAdmission({
     configuration: config,
     verifier: fixtureRetryVerifier(fixtureRetryEvidence(evidenceUrls)),
-    clock: { utcMs: () => utc, monotonicMs: () => 100 },
+    clock: { utcMs: () => options.utcMs ?? utc, monotonicMs: () => 100 },
   });
   const selected = await composition.collect({
-    requestId: 'real-retry-child',
+    requestId: options.requestId ?? 'real-retry-child',
     parent,
   });
   if (selected.kind !== 'candidate')
@@ -2356,3 +2371,1990 @@ test('P1B-12 expiry after the first report settlement prevents any fence dispatc
     },
   );
 });
+
+async function withProductionReceiver(
+  handler: Handler,
+  run: (api: Api) => Promise<void>,
+  decorate?: Parameters<typeof receiver>[1],
+) {
+  const api = await receiver(handler, decorate);
+  let passed = false,
+    settled = false;
+  try {
+    await run(api);
+    passed = true;
+  } finally {
+    try {
+      await api.close(false);
+      settled = true;
+    } finally {
+      writeFileSync(
+        join(api.root, 'p1c-wires.json'),
+        JSON.stringify(
+          api.wires.map(({ path, method, body, ids }) => ({
+            path,
+            method,
+            body,
+            ids,
+          })),
+        ),
+      );
+      writeFileSync(
+        join(api.root, 'p1c-resource-status.json'),
+        JSON.stringify({ passed, settled, pid: process.pid }),
+      );
+      console.error(
+        'P1C_FIXTURE ' + JSON.stringify({ root: api.root, passed, settled }),
+      );
+    }
+  }
+}
+
+function p1cProjection(api: Api, config: ConfiguredSubmission, label: string) {
+  const state = logicalProjection(config);
+  writeFileSync(
+    join(api.root, `p1c-logical-${label}.json`),
+    JSON.stringify(state),
+  );
+  return state;
+}
+
+// P1C oracles spell out the synthetic wire facts and canonical hash tuple. They
+// do not call the proposal/comparison/fingerprint builders being integrated.
+function productionOracle(
+  config: ConfiguredSubmission,
+  engine: 'google' | 'yandex',
+) {
+  const family = `${engine}/indexer` as RetryFamily;
+  const local = localSnapshot(config);
+  const provenance =
+    engine === 'google' ? 'local_standalone' : 'external_unattributed';
+  const originalManifestKnown = engine === 'google';
+  const manifestProvenance = originalManifestKnown
+    ? 'durable_local_intent_ack'
+    : 'provider_report_observed_corpus';
+  const manifestDigest = originalManifestKnown
+    ? H('speedyindex-intent-url-manifest-v1', [family, [A, B, C]])
+    : H('speedyindex-provider-report-url-manifest-v1', [
+        family,
+        'parent',
+        [C, A, B],
+      ]);
+  const fact: RetryPass[1][number] = [
+    family,
+    'parent',
+    3,
+    3,
+    1,
+    true,
+    'completed',
+    [Date.parse('2026-10-01T00:00:00Z'), ''],
+    engine === 'google' ? true : null,
+    [Date.parse('2026-10-08T00:00:00Z'), ''],
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  ];
+  const pass: RetryPass = [
+    [
+      [
+        'google/indexer',
+        'regular',
+        0,
+        [[0, engine === 'google' ? [[family, 'parent']] : []]],
+      ],
+      ['google/indexer', 'drip', 0, [[0, []]]],
+      [
+        'yandex/indexer',
+        'regular',
+        0,
+        [[0, engine === 'yandex' ? [[family, 'parent']] : []]],
+      ],
+    ],
+    [fact],
+    [],
+    [family, 'parent', 3, 3, 1, [C], [A, B], fact],
+    [],
+  ];
+  const safetyEvidenceDigests = [
+    H('speedyindex-retry-observation-safety-v1', pass),
+    H('speedyindex-retry-local-safety-v1', [
+      local.revision,
+      family,
+      'parent',
+      provenance,
+      manifestDigest,
+    ]),
+  ];
+  const partitionDigest = H('speedyindex-retry-partition-v1', [
+    [A, B],
+    [A, B],
+    [],
+    [0, originalManifestKnown ? [] : null],
+  ]);
+  const body =
+    engine === 'google'
+      ? '{"urls":["https://example.test/A?b=1&a=2","https://example.test/A/?b=1&a=2"],"pay_per_indexed":true,"drip_feed":false}'
+      : '{"urls":["https://example.test/A?b=1&a=2","https://example.test/A/?b=1&a=2"]}';
+  const payloadDigest = createHash('sha256').update(body, 'utf8').digest('hex');
+  const quoteVersion = 'speedyindex-indexing-batch-2026-10-20-v1';
+  const providerRoute = `/v2/task/${family}/create` as const;
+  const reservation =
+    engine === 'google'
+      ? { tokens: 200, indexer: 0, checker: 0 }
+      : { tokens: 40, indexer: 2, checker: 0 };
+  const quoteFingerprint = H('speedyindex-create-quote-v1', {
+    version: quoteVersion,
+    family,
+    providerRoute,
+    payloadDigest,
+    urlCount: 2,
+    maximumExposure: reservation,
+  });
+  const period = {
+    id: 'utc-day:2026-10-21',
+    startMs: Date.parse('2026-10-21T00:00:00Z'),
+    endMs: Date.parse('2026-10-22T00:00:00Z'),
+  };
+  const authorizationFingerprint = H(
+    'speedyindex-submission-authorization-v1',
+    {
+      quoteFingerprint,
+      policyDigest: config.snapshot.digest,
+      credentialFingerprint: fingerprint,
+      budgetScope: config.snapshot.policy.budgetScope,
+      periodId: period.id,
+      periodStartMs: period.startMs,
+    },
+  );
+  const preimage: RetryPlanFingerprintInput = {
+    parent: { family, taskId: 'parent' },
+    provenance,
+    originalManifestKnown,
+    manifestProvenance,
+    sourceManifestDigest: manifestDigest,
+    safetyEvidenceDigests,
+    partitionDigest,
+    revision: local.revision,
+    policyDigest: config.snapshot.digest,
+    authorizationFingerprint,
+    payloadDigest,
+    quoteVersion,
+    quoteFingerprint,
+    period,
+    providerRoute,
+    urlCount: 2,
+    providerBodyBytes: Buffer.byteLength(body, 'utf8'),
+    reservation,
+  };
+  const planFingerprint = H('speedyindex-retry-plan-v1', [
+    family,
+    'parent',
+    provenance,
+    originalManifestKnown,
+    manifestProvenance,
+    manifestDigest,
+    safetyEvidenceDigests,
+    partitionDigest,
+    local.revision,
+    config.snapshot.digest,
+    authorizationFingerprint,
+    payloadDigest,
+    quoteVersion,
+    quoteFingerprint,
+    [period.id, period.startMs, period.endMs],
+    providerRoute,
+    2,
+    Buffer.byteLength(body, 'utf8'),
+    [reservation.tokens, reservation.indexer, reservation.checker],
+  ]);
+  const source: RetryPlanReady['source'] = {
+    reference: [family, 'parent'],
+    provenance,
+    originalManifestKnown,
+    manifestProvenance,
+    manifestDigest,
+  };
+  return { body, preimage, planFingerprint, source };
+}
+function expectProductionReady(
+  view: RetryPlanReady,
+  oracle: ReturnType<typeof productionOracle>,
+  config: ConfiguredSubmission,
+) {
+  expect(view.source).toEqual(oracle.source);
+  expect(view.eligibleUrls).toEqual([A, B]);
+  expect(view.excluded).toEqual([]);
+  expect(view.counts).toEqual({
+    indexed: 1,
+    unindexed: 2,
+    eligible: 2,
+    excluded: 0,
+    unknown: 0,
+  });
+  expect(view.request).toEqual({
+    family: oracle.preimage.parent.family,
+    providerRoute: `/v2/task/${oracle.preimage.parent.family}/create`,
+    payloadDigest: oracle.preimage.payloadDigest,
+    urlCount: 2,
+    providerBodyBytes: Buffer.byteLength(oracle.body),
+  });
+  expect(view.quote).toEqual({
+    version: 'speedyindex-indexing-batch-2026-10-20-v1',
+    fingerprint: oracle.preimage.quoteFingerprint,
+    maximumExposure: oracle.preimage.reservation,
+    basis: 'documented_independent_maxima',
+    providerEnforced: false,
+  });
+  expect(view.authorization).toEqual({
+    state: 'configured',
+    stateChecked: true,
+    mode: config.snapshot.policy.mode,
+    policyRevision: config.snapshot.policy.policyRevision,
+    policyDigest: config.snapshot.digest,
+    budgetScope: config.snapshot.policy.budgetScope,
+    caps: config.snapshot.policy.caps,
+    period: oracle.preimage.period,
+    fingerprint: oracle.preimage.authorizationFingerprint,
+  });
+  expect(view.identity).toEqual({
+    status: 'comparison',
+    preimage: oracle.preimage,
+    fingerprint: oracle.planFingerprint,
+  });
+  const inspect = (value: unknown) => {
+    if (!value || typeof value !== 'object') return;
+    expect(Object.isFrozen(value)).toBe(true);
+    for (const [key, item] of Object.entries(value)) {
+      expect([
+        'proof',
+        'input',
+        'body',
+        'ledgerId',
+        'stateDirectory',
+        'credential',
+        'binding',
+        'callback',
+        'preimages',
+        'observations',
+        'requestId',
+        'inspectionId',
+      ]).not.toContain(key);
+      expect(typeof item).not.toBe('function');
+      inspect(item);
+    }
+  };
+  inspect(view);
+  expect(Object.keys(view).sort()).toEqual([
+    'authorization',
+    'counts',
+    'eligibleUrls',
+    'excluded',
+    'identity',
+    'quote',
+    'request',
+    'source',
+    'status',
+  ]);
+  for (const privateValue of [
+    fixtureKey,
+    fingerprint,
+    config.stateDirectory,
+    localSnapshot(config).ledgerId,
+    'retry-read-only-inspection',
+  ])
+    expect(JSON.stringify(view)).not.toContain(privateValue);
+}
+function retryHost(
+  api: Api,
+  config: ConfiguredSubmission,
+  clock = new Clock(),
+) {
+  return new SubmissionHost(config, {
+    fetchRequest: api.fetch,
+    clock: () => clock.utcMs(),
+    retry: { monotonicMs: () => clock.monotonicMs(), runtime: clock },
+  });
+}
+function productionComposition(
+  api: Api,
+  config: ConfiguredSubmission,
+  clock = new Clock(),
+) {
+  return composeVerifiedRetryAdmission({
+    configuration: config,
+    transport: { fetch: api.fetch },
+    clock,
+    owner: { runtime: clock },
+  });
+}
+function expectProductionWires(api: Api, engine: 'google' | 'yandex') {
+  const pass = [
+    { path: '/v2/task/google/indexer/list/0', method: 'GET', body: '' },
+    {
+      path: '/v2/task/google/indexer/list/0?filter=drip_feed',
+      method: 'GET',
+      body: '',
+    },
+    { path: '/v2/task/yandex/indexer/list/0', method: 'GET', body: '' },
+    {
+      path: `/v2/task/${engine}/indexer/status`,
+      method: 'POST',
+      body: '{"task_ids":["parent"]}',
+    },
+    {
+      path: `/v2/task/${engine}/indexer/report`,
+      method: 'POST',
+      body: '{"task_id":"parent"}',
+    },
+  ];
+  expect(
+    api.wires.map(({ path, method, body }) => ({ path, method, body })),
+  ).toEqual([...pass, ...pass]);
+}
+for (const engine of ['google', 'yandex'] as const)
+  test(`P1C-01 actual host ${engine === 'google' ? 'local Google' : 'permitted external Yandex'} ready is frozen, independently identified and logically read-only`, async () => {
+    await withProductionReceiver(script(singleSource(engine)), async (api) => {
+      const config = fixtureConfiguration(api, {
+        retry: {
+          enabled: true,
+          allowUnattributedParents: engine === 'yandex',
+          maxAttemptsPerSource: 3,
+        },
+      });
+      if (engine === 'google') seedStandalone(config, 'parent', [A, B, C]);
+      const before = p1cProjection(api, config, 'before'),
+        oracle = productionOracle(config, engine);
+      const host = retryHost(api, config);
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before); // Constructor opened no state.
+      expect(api.wires).toHaveLength(0);
+      const operation = host.planRetry({ searchEngine: engine });
+      api.operations.push(operation);
+      const result = await bounded(operation);
+      expect(result.status).toBe('ready');
+      if (result.status !== 'ready')
+        throw new Error(
+          'Expected production host ready: ' + JSON.stringify(result),
+        );
+      expectProductionReady(result, oracle, config);
+      expectProductionWires(api, engine);
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+      expect(localSnapshot(config).retryChildren).toEqual([]);
+      if (engine === 'yandex')
+        expect(localSnapshot(config).acceptedManifests).toEqual([]);
+    });
+  });
+
+test('P1C-02 strict authority/preabort/inactive/binding/mixed construction reject before SQL or HTTP and retain preview', async () => {
+  await withProductionReceiver(script(singleSource()), async (api) => {
+    const config = fixtureConfiguration(api);
+    const before = p1cProjection(api, config, 'before'),
+      phases: string[] = [];
+    let opens = 0;
+    const options: SubmissionHostOptions = {
+      fetchRequest: api.fetch,
+      clock: () => utc,
+      openLedger(value) {
+        opens++;
+        return openLedger(value);
+      },
+      retry: {
+        monotonicMs: () => 100,
+        hooks: {
+          onOwnerPhase(phase) {
+            phases.push(phase);
+          },
+        },
+      },
+    };
+    const host = new SubmissionHost(config, options);
+    expect(await host.planRetry({ proof: {} })).toEqual({
+      status: 'error',
+      code: 'InvalidInput',
+    });
+    const abort = new AbortController();
+    abort.abort();
+    expect(await host.planRetry({}, abort.signal)).toEqual({
+      status: 'error',
+      code: 'Cancelled',
+    });
+    const inactive = new SubmissionHost(
+      loadSubmissionConfiguration({ apiKey: '' }),
+      options,
+    );
+    expect(await inactive.planRetry({})).toEqual({
+      status: 'blocked',
+      blockers: ['StateUnavailable'],
+    });
+    expect(
+      await inactive.createIndexingTask({
+        mode: 'preview',
+        searchEngine: 'google',
+        urls: [A],
+      }),
+    ).toMatchObject({
+      status: 'preview',
+      authorization: { state: 'unconfigured', stateChecked: false },
+    });
+    // Use the actual loader's mismatched-key result as well as a malformed trusted binding.
+    const mismatch = loadSubmissionConfiguration({
+      apiKey: 'different-synthetic-key',
+      policyPath: join(api.root, 'policy.json'),
+      stateDirectory: config.stateDirectory,
+    });
+    expect(mismatch.state).toBe('credential_mismatch');
+    expect(await new SubmissionHost(mismatch, options).planRetry({})).toEqual({
+      status: 'blocked',
+      blockers: ['StateUnavailable'],
+    });
+    const malformed = structuredClone(config);
+    (malformed.credential as { fingerprint: string }).fingerprint = '0'.repeat(
+      64,
+    );
+    expect(await new SubmissionHost(malformed, options).planRetry({})).toEqual({
+      status: 'error',
+      code: 'InternalError',
+    });
+    const mixed = {
+      configuration: config,
+      transport: { fetch: api.fetch },
+      verifier: fixtureRetryVerifier(fixtureRetryEvidence([C, A, B])),
+      clock: new Clock(),
+    };
+    expect(() => composeVerifiedRetryAdmission(mixed as never)).toThrow(
+      'Invalid submission ledger input.',
+    );
+    const composition = productionComposition(api, config);
+    expect(
+      await composition.collectLatest(
+        { binding: fingerprint },
+        'synthetic-invalid',
+      ),
+    ).toEqual({ status: 'error', code: 'InvalidInput' });
+    expect(
+      await composition.collectLatest({}, 'synthetic-preabort', abort.signal),
+    ).toEqual({ status: 'error', code: 'Cancelled' });
+    expect(phases).toEqual([]);
+    expect(opens).toBe(0);
+    expect(api.wires).toEqual([]);
+    expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+  });
+});
+for (const retry of [
+  undefined,
+  { enabled: false, allowUnattributedParents: false, maxAttemptsPerSource: 3 },
+])
+  test(`P1C-02 ${retry ? 'disabled' : 'absent'} retry preserves ordinary configured construction and preview`, async () => {
+    await withProductionReceiver(script(), async (api) => {
+      const config = fixtureConfiguration(api, { retry });
+      const before = p1cProjection(api, config, 'before'),
+        host = retryHost(api, config);
+      expect(await host.planRetry({})).toEqual({
+        status: 'blocked',
+        blockers: ['RetryPolicyRequired'],
+      });
+      expect(
+        await host.createIndexingTask({
+          mode: 'preview',
+          searchEngine: 'google',
+          urls: [A],
+        }),
+      ).toMatchObject({
+        status: 'preview',
+        authorization: { state: 'configured', stateChecked: false },
+      });
+      expect(api.wires).toEqual([]);
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+    });
+  });
+
+for (const route of ['host', 'composition'] as const)
+  test(`P1C-02 immutable ${route} capture keeps original methods, receivers, key, state and policy before and during real HTTP`, async () => {
+    const arrived = deferred(),
+      release = deferred();
+    const normal = script(singleSource('yandex'));
+    let once = false;
+    await withProductionReceiver(
+      async (wire, req, res) => {
+        if (!once) {
+          once = true;
+          arrived.resolve();
+          await release.promise;
+        }
+        return normal(wire, req, res);
+      },
+      async (api) => {
+        api.releases.push(() => release.resolve());
+        const original = fixtureConfiguration(api),
+          config = structuredClone(original),
+          clock = new Clock();
+        const before = p1cProjection(api, original, 'before'),
+          oracle = productionOracle(original, 'yandex');
+        const runtime = {
+          setTimeout(callback: () => void, delay: number) {
+            expect(this).toBe(runtime);
+            return clock.setTimeout(callback, delay);
+          },
+          clearTimeout(handle: unknown) {
+            expect(this).toBe(runtime);
+            clock.clearTimeout(handle);
+          },
+        };
+        const retry = {
+          monotonicMs() {
+            expect(this).toBe(retry);
+            return clock.mono;
+          },
+          runtime,
+        };
+        const options = {
+          fetchRequest(input: RequestInfo | URL, init?: RequestInit) {
+            expect(this).toBe(options);
+            return api.fetch(input, init);
+          },
+          clock() {
+            expect(this).toBe(options);
+            return clock.wall;
+          },
+          retry,
+        };
+        const transport = {
+          fetch(input: RequestInfo | URL, init?: RequestInit) {
+            expect(this).toBe(transport);
+            return api.fetch(input, init);
+          },
+        };
+        const ownerClock = {
+          utcMs() {
+            expect(this).toBe(ownerClock);
+            return clock.wall;
+          },
+          monotonicMs() {
+            expect(this).toBe(ownerClock);
+            return clock.mono;
+          },
+        };
+        const owner =
+          route === 'host'
+            ? new SubmissionHost(config, options as SubmissionHostOptions)
+            : composeVerifiedRetryAdmission({
+                configuration: config,
+                transport: transport as { fetch: typeof fetch },
+                clock: ownerClock,
+                owner: { runtime },
+              });
+        const failMutation = () => {
+          throw new Error('MUTATED_PRIVATE_DEPENDENCY');
+        };
+        const mutate = () => {
+          transport.fetch = failMutation;
+          ownerClock.utcMs = failMutation;
+          ownerClock.monotonicMs = failMutation;
+          options.fetchRequest = failMutation;
+          options.clock = failMutation;
+          retry.monotonicMs = failMutation;
+          runtime.setTimeout = failMutation;
+          runtime.clearTimeout = failMutation;
+          (config as { stateDirectory: string }).stateDirectory = join(
+            api.root,
+            'missing-mutated-state',
+          );
+          (config.credential as { effectiveKey: string }).effectiveKey =
+            'mutated-synthetic-key';
+          (config.snapshot.policy.caps as { tokens: number }).tokens = 1;
+          (config.snapshot.policy.retry as { enabled: boolean }).enabled =
+            false;
+        };
+        mutate();
+        const operation =
+          owner instanceof SubmissionHost
+            ? owner.planRetry({ searchEngine: 'yandex' })
+            : owner.planLatest({ searchEngine: 'yandex' });
+        api.operations.push(operation);
+        await bounded(arrived.promise);
+        mutate();
+        release.resolve();
+        const result = await bounded(operation);
+        expect(result.status).toBe('ready');
+        if (result.status !== 'ready')
+          throw new Error(
+            'Expected captured production ready: ' + JSON.stringify(result),
+          );
+        expectProductionReady(result, oracle, original);
+        expectProductionWires(api, 'yandex');
+        expect(p1cProjection(api, original, 'unchanged')).toEqual(before);
+      },
+    );
+  });
+
+for (const engine of ['google', 'yandex'] as const)
+  test(`P1C-07 actual ${engine} production candidate is consumed only by its owning writer after measured no-write`, async () => {
+    await withProductionReceiver(script(singleSource(engine)), async (api) => {
+      const config = fixtureConfiguration(api, {
+        retry: {
+          enabled: true,
+          allowUnattributedParents: engine === 'yandex',
+          maxAttemptsPerSource: 3,
+        },
+      });
+      if (engine === 'google') seedStandalone(config, 'parent', [A, B, C]);
+      const clock = new Clock(),
+        oracle = productionOracle(config, engine),
+        before = p1cProjection(api, config, 'before');
+      const composition = productionComposition(api, config, clock);
+      const operation = composition.collectLatest(
+        { searchEngine: engine },
+        'synthetic-retry',
+      );
+      api.operations.push(operation);
+      const candidate = await bounded(operation);
+      expect('kind' in candidate && candidate.kind).toBe('candidate');
+      if (!('kind' in candidate))
+        throw new Error(
+          'Expected real production candidate: ' + JSON.stringify(candidate),
+        );
+      expectProductionReady(candidate.view, oracle, config);
+      expect(candidate.request.body).toBe(oracle.body);
+      expect(candidate.input.intent.submittedUrls).toEqual([A, B]);
+      expect(candidate.input.planFingerprint).toBe(oracle.planFingerprint);
+      expect(candidate.input.sourceManifestDigest).toBe(
+        oracle.source.manifestDigest,
+      );
+      expectProductionWires(api, engine);
+      expect(
+        p1cProjection(api, config, 'after-collection-before-prepare'),
+      ).toEqual(before); // BEFORE any explicit synthetic prepare.
+      const foreign = productionComposition(api, config, clock).open();
+      try {
+        expect(() =>
+          foreign.prepareVerifiedRetryIntent(candidate.input, candidate.proof),
+        ).toThrow('Retry admission proof is unavailable or mismatched.');
+      } finally {
+        foreign.close();
+      }
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+      const writer = composition.open();
+      try {
+        const impostor = JSON.parse(
+          JSON.stringify(candidate.proof),
+        ) as RetryProof;
+        expect(() =>
+          writer.prepareVerifiedRetryIntent(candidate.input, impostor),
+        ).toThrow('Retry admission proof is unavailable or mismatched.');
+        expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+        const prepared = writer.prepareVerifiedRetryIntent(
+          candidate.input,
+          candidate.proof,
+        );
+        expect(prepared.kind).toBe('created');
+        expect(prepared.intent).toMatchObject({
+          requestId: 'synthetic-retry',
+          state: 'prepared',
+          stateVersion: 0,
+          taskFamily: `${engine}/indexer`,
+          payloadDigest: oracle.preimage.payloadDigest,
+          quoteFingerprint: oracle.preimage.quoteFingerprint,
+          reservation: oracle.preimage.reservation,
+          urlCount: 2,
+          periodId: oracle.preimage.period.id,
+        });
+        const after = p1cProjection(api, config, 'after-explicit-prepare');
+        const db = new Database(
+          join(config.stateDirectory, 'ledger.sqlite'),
+          constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_NOFOLLOW,
+        );
+        try {
+          expect(
+            db
+              .query(
+                `SELECT origin_kind,parent_family,parent_task_id,source_manifest_digest,plan_fingerprint FROM intent_context WHERE request_id='synthetic-retry'`,
+              )
+              .get(),
+          ).toEqual({
+            origin_kind: 'retry',
+            parent_family: `${engine}/indexer`,
+            parent_task_id: 'parent',
+            source_manifest_digest: oracle.source.manifestDigest,
+            plan_fingerprint: oracle.planFingerprint,
+          });
+          expect(
+            db
+              .query(
+                `SELECT url_text FROM intent_urls WHERE request_id='synthetic-retry' ORDER BY ordinal`,
+              )
+              .all(),
+          ).toEqual([{ url_text: A }, { url_text: B }]);
+          expect(
+            db
+              .query(
+                `SELECT state,CAST(state_version AS TEXT) AS version,CAST(reserved_tokens AS TEXT) AS tokens,CAST(reserved_indexer AS TEXT) AS indexer,CAST(reserved_checker AS TEXT) AS checker,provider_task_id,provider_type FROM intents WHERE request_id='synthetic-retry'`,
+              )
+              .get(),
+          ).toEqual({
+            state: 'prepared',
+            version: '0',
+            tokens: engine === 'google' ? '200' : '40',
+            indexer: engine === 'google' ? '0' : '2',
+            checker: '0',
+            provider_task_id: null,
+            provider_type: null,
+          });
+          expect(
+            db
+              .query(
+                `SELECT COUNT(*) AS n FROM intent_events WHERE request_id='synthetic-retry'`,
+              )
+              .get(),
+          ).toEqual({ n: 1 });
+          expect(db.query(`SELECT COUNT(*) AS n FROM intents`).get()).toEqual({
+            n: engine === 'google' ? 2 : 1,
+          });
+          expect(
+            db.query(`SELECT COUNT(*) AS n FROM intent_context`).get(),
+          ).toEqual({ n: engine === 'google' ? 2 : 1 });
+        } finally {
+          db.close();
+        }
+        expect(
+          localSnapshot(config).acceptedManifests.map(
+            (row) => row.providerTaskId,
+          ),
+        ).toEqual(engine === 'google' ? ['parent'] : []);
+        expect(() =>
+          writer.prepareVerifiedRetryIntent(
+            {
+              ...candidate.input,
+              intent: {
+                ...candidate.input.intent,
+                requestId: 'consumed-new-id',
+              },
+            },
+            candidate.proof,
+          ),
+        ).toThrow('Retry admission proof is unavailable or mismatched.');
+        expect(logicalProjection(config)).toEqual(after);
+        clock.mono += 60000;
+        const replay = writer.prepareVerifiedRetryIntent(candidate.input);
+        expect(replay.kind).toBe('replay');
+        expect('dispatchCapability' in replay).toBe(false);
+        expect(logicalProjection(config)).toEqual(after);
+        expect(api.wires).toHaveLength(10); // No dispatch or repeat scan.
+      } finally {
+        writer.close();
+      }
+    });
+  });
+
+test('P1C-07 private request identity mismatch consumes no rows and cannot restore the consumed proof', async () => {
+  await withProductionReceiver(script(singleSource('yandex')), async (api) => {
+    const config = fixtureConfiguration(api),
+      before = p1cProjection(api, config, 'before');
+    const composition = productionComposition(api, config);
+    const operation = composition.collectLatest(
+      { searchEngine: 'yandex' },
+      'private-original-id',
+    );
+    api.operations.push(operation);
+    const candidate = await bounded(operation);
+    if (!('kind' in candidate))
+      throw new Error('Expected private identity candidate.');
+    expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+    const writer = composition.open();
+    try {
+      expect(() =>
+        writer.prepareVerifiedRetryIntent(
+          {
+            ...candidate.input,
+            intent: {
+              ...candidate.input.intent,
+              requestId: 'private-altered-id',
+            },
+          },
+          candidate.proof,
+        ),
+      ).toThrow('Retry admission proof is unavailable or mismatched.');
+      expect(() =>
+        writer.prepareVerifiedRetryIntent(candidate.input, candidate.proof),
+      ).toThrow('Retry admission proof is unavailable or mismatched.');
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+      expect(api.wires).toHaveLength(10);
+    } finally {
+      writer.close();
+    }
+  });
+});
+
+// B1 native helpers begin. The private sanity entry executes these exact bytes.
+class NativeOwnerClock extends Clock {
+  arms: { at: number; delay: number; fired: boolean; cleared: boolean }[] = [];
+  handles = new Map<unknown, (typeof this.arms)[number]>();
+  breakClear = false;
+  override setTimeout(callback: () => void, delay: number) {
+    const record = { at: this.mono, delay, fired: false, cleared: false };
+    const handle = setTimeout(() => {
+      record.fired = true;
+      this.handles.delete(handle);
+      this.mono = Math.max(this.mono, record.at + record.delay);
+      callback();
+    }, delay);
+    this.arms.push(record);
+    this.handles.set(handle, record);
+    return handle;
+  }
+  override clearTimeout(handle: unknown) {
+    clearTimeout(handle as ReturnType<typeof setTimeout>);
+    const record = this.handles.get(handle);
+    if (record) record.cleared = true;
+    this.handles.delete(handle);
+    if (this.breakClear) {
+      this.breakClear = false;
+      throw new Error('PRIVATE_CLEANUP_SENTINEL');
+    }
+  }
+}
+function trackOwnerSignal(signal: AbortSignal) {
+  const active = new Set<EventListenerOrEventListenerObject>();
+  const add = signal.addEventListener.bind(signal),
+    remove = signal.removeEventListener.bind(signal);
+  Object.defineProperty(signal, 'addEventListener', {
+    configurable: true,
+    value(
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) {
+      if (type === 'abort') active.add(listener);
+      add(type, listener, options);
+    },
+  });
+  Object.defineProperty(signal, 'removeEventListener', {
+    configurable: true,
+    value(
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | EventListenerOptions,
+    ) {
+      if (type === 'abort') active.delete(listener);
+      remove(type, listener, options);
+    },
+  });
+  return {
+    active,
+    restore() {
+      Reflect.deleteProperty(signal, 'addEventListener');
+      Reflect.deleteProperty(signal, 'removeEventListener');
+    },
+  };
+}
+// B1 native helpers end.
+
+const allCreatePolicy: Partial<SubmissionPolicy> = {
+  allowIndexChecks: true,
+  indexCheckReservations: { google: { tokens: 3, indexer: 0, checker: 1 } },
+  allowBacklinkChecks: true,
+  backlinkCheckReservations: { tokens: 2, indexer: 0, checker: 1 },
+};
+async function expectAllFreshBlocked(
+  host: SubmissionHost,
+  code: 'SubmissionBusy' | 'StateUnavailable' = 'SubmissionBusy',
+) {
+  const inputs = [
+    host.createIndexingTask({
+      mode: 'submit',
+      searchEngine: 'google',
+      requestId: 'new-indexing',
+      urls: ['https://example.test/new-indexing'],
+    }),
+    host.createIndexCheck({
+      mode: 'submit',
+      searchEngine: 'google',
+      requestId: 'new-check',
+      urls: ['https://example.test/new-check'],
+    }),
+    host.createBacklinkCheck({
+      mode: 'submit',
+      requestId: 'new-backlink',
+      urls: ['https://example.test/new-backlink'],
+      targetDomains: ['synthetic.test'],
+    }),
+  ];
+  for (const result of await Promise.all(inputs))
+    expect(result.error?.code).toBe(code);
+}
+function b1Host(
+  api: Api,
+  config: ConfiguredSubmission,
+  clock: NativeOwnerClock,
+  options: NonNullable<SubmissionHostOptions['retry']> = {},
+) {
+  return new SubmissionHost(config, {
+    fetchRequest: api.fetch,
+    clock: () => clock.wall,
+    retry: { monotonicMs: () => clock.mono, runtime: clock, ...options },
+  });
+}
+function expectSafeFailure(value: unknown) {
+  const json = JSON.stringify(value);
+  for (const sentinel of [
+    fixtureKey,
+    fingerprint,
+    'PRIVATE_',
+    'dispatchCapability',
+    'proof',
+    'ledgerId',
+    'stateDirectory',
+    'retry-read-only-inspection',
+  ])
+    expect(json).not.toContain(sentinel);
+  expect('identity' in (value as object)).toBe(false);
+  expect('kind' in (value as object)).toBe(false);
+}
+
+test('P1C-03 actual shared host guard excludes planner and all three fresh creates while preview/exact replay remain pure', async () => {
+  const arrived = deferred(),
+    release = deferred();
+  let held = false;
+  const normal = script(singleSource());
+  await withProductionReceiver(
+    async (wire, req, res) => {
+      if (!held && wire.path.endsWith('/report')) {
+        held = true;
+        arrived.resolve();
+        await release.promise;
+      }
+      return normal(wire, req, res);
+    },
+    async (api) => {
+      api.releases.push(() => release.resolve());
+      const config = fixtureConfiguration(api, {
+        ...allCreatePolicy,
+        mode: 'caller_acknowledgement',
+      });
+      seedStandalone(config, 'parent', [A, B, C]);
+      const clock = new NativeOwnerClock(),
+        phases: string[] = [];
+      const host = b1Host(api, config, clock, {
+        hooks: {
+          onOwnerPhase(phase) {
+            phases.push(phase);
+          },
+        },
+      });
+      const before = p1cProjection(api, config, 'before');
+      const planning = host.planRetry({});
+      api.operations.push(planning);
+      await bounded(arrived.promise);
+      const wireCount = api.wires.length,
+        initialReads = phases.filter((p) => p === 'before_initial_read').length;
+      expect(await host.planRetry({})).toEqual({
+        status: 'error',
+        code: 'SubmissionBusy',
+      });
+      await expectAllFreshBlocked(host);
+      expect(
+        await host.createIndexingTask({
+          mode: 'preview',
+          searchEngine: 'google',
+          urls: [A, B],
+        }),
+      ).toMatchObject({
+        status: 'preview',
+        authorization: { stateChecked: false },
+      });
+      const replay = await host.createIndexingTask({
+        mode: 'submit',
+        searchEngine: 'google',
+        requestId: 'seed-parent',
+        urls: [A, B, C],
+      });
+      expect(replay).toMatchObject({
+        status: 'accepted',
+        replayed: true,
+        intent: { requestId: 'seed-parent', providerTaskId: 'parent' },
+      });
+      expect('dispatchCapability' in replay).toBe(false);
+      expect(api.wires).toHaveLength(wireCount);
+      expect(phases.filter((p) => p === 'before_initial_read')).toHaveLength(
+        initialReads,
+      );
+      expect(p1cProjection(api, config, 'held-unchanged')).toEqual(before);
+      release.resolve();
+      expect((await bounded(planning)).status).toBe('ready');
+      const next = host.planRetry({});
+      api.operations.push(next);
+      expect((await bounded(next)).status).toBe('ready');
+      expect(clock.handles.size).toBe(0);
+      expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+    },
+  );
+});
+
+for (const remaining of [0, 1])
+  test(`P1C-04 real initial snapshot spends original lowered horizon with ${remaining} ticks remaining`, async () => {
+    const tail = deferred();
+    await withProductionReceiver(
+      async () => {
+        await tail.promise;
+        return undefined;
+      },
+      async (api) => {
+        api.releases.push(() => tail.resolve());
+        const config = fixtureConfiguration(api),
+          clock = new NativeOwnerClock();
+        const before = p1cProjection(api, config, 'before');
+        const phases: string[] = [];
+        const origin = clock.mono,
+          horizon = 101,
+          spent = horizon - remaining;
+        const host = b1Host(api, config, clock, {
+          limits: { horizonMs: horizon },
+          hooks: {
+            onOwnerPhase(phase) {
+              phases.push(phase);
+              // Charge the native reader phase at its actual return; no snapshot is supplied.
+              if (phase === 'after_initial_read') clock.mono += spent;
+            },
+          },
+        });
+        const operation = host.planRetry({});
+        api.operations.push(operation);
+        const result = await bounded(operation);
+        expect(phases).toContain('after_initial_read');
+        expect(result).toMatchObject({
+          status: 'error',
+          code: 'DeadlineExceeded',
+        });
+        expectSafeFailure(result);
+        expect(api.wires.length).toBe(remaining);
+        expect(clock.arms.length).toBe(remaining);
+        if (remaining) {
+          expect(clock.arms[0]).toEqual({
+            at: origin + spent,
+            delay: horizon - spent,
+            fired: true,
+            cleared: false,
+          });
+          expect(clock.mono).toBe(origin + horizon);
+        }
+        expect(clock.handles.size).toBe(0);
+        expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+        writeFileSync(
+          join(api.root, 'p1c-clock.json'),
+          JSON.stringify({ origin, horizon, spent, phases, arms: clock.arms }),
+        );
+      },
+    );
+  });
+
+for (const boundary of [
+  'scan_day',
+  'identity_expiry',
+  'result_expiry',
+  'close_day',
+  'owner_bad_clock',
+] as const)
+  test(`P1C-06 original day and final owner fence refuse ${boundary} without identity/proof`, async () => {
+    const clock = new NativeOwnerClock(),
+      normal = script(singleSource('yandex'));
+    let moved = false;
+    await withProductionReceiver(
+      (wire, req, res) => {
+        if (
+          boundary === 'scan_day' &&
+          !moved &&
+          wire.path.endsWith('/report')
+        ) {
+          moved = true;
+          clock.wall += 86400000;
+        }
+        return normal(wire, req, res);
+      },
+      async (api) => {
+        const config = fixtureConfiguration(api),
+          before = p1cProjection(api, config, 'before'),
+          phases: string[] = [];
+        const hooks = {
+          onOwnerPhase(
+            phase: import('../src/submission-ledger').RetryOwnerPhase,
+          ) {
+            phases.push(phase);
+            if (boundary === 'identity_expiry' && phase === 'after_identity')
+              clock.mono += 60000;
+            if (boundary === 'result_expiry' && phase === 'after_serialization')
+              clock.mono += 60000;
+            if (boundary === 'owner_bad_clock' && phase === 'after_identity')
+              clock.mono = Number.NaN;
+            if (boundary === 'close_day' && phase === 'before_close')
+              queueMicrotask(() => {
+                clock.wall += 86400000;
+              });
+          },
+        };
+        const host = b1Host(api, config, clock, { hooks });
+        const operation = host.planRetry({ searchEngine: 'yandex' });
+        api.operations.push(operation);
+        const result = await bounded(operation);
+        if (boundary.endsWith('day'))
+          expect(result).toEqual({
+            status: 'blocked',
+            blockers: ['StalePeriodContext'],
+          });
+        else
+          expect(result).toMatchObject({
+            status: 'error',
+            code: 'DeadlineExceeded',
+          });
+        expectSafeFailure(result);
+        expect(api.wires).toHaveLength(10);
+        expect(phases).toContain('after_close');
+        if (boundary === 'close_day') {
+          expect(phases).toContain('after_serialization');
+          expect(phases.indexOf('after_serialization')).toBeLessThan(
+            phases.indexOf('before_close'),
+          );
+        }
+        expect(clock.handles.size).toBe(0);
+        expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+        writeFileSync(
+          join(api.root, 'p1c-phases.json'),
+          JSON.stringify(phases),
+        );
+      },
+    );
+  });
+
+for (const boundary of [
+  'headers_deadline',
+  'pending_body',
+  'eof_cancel',
+] as const)
+  test(`P1C-08 actual ${boundary} keeps shared guard through native settlement`, async () => {
+    const arrived = deferred(),
+      tail = deferred(),
+      entered = deferred(),
+      release = deferred(),
+      nativeClosed = deferred(),
+      pendingRead = deferred();
+    const controller = new AbortController(),
+      signal = trackOwnerSignal(controller.signal),
+      clock = new NativeOwnerClock();
+    const normal = script(singleSource('yandex'));
+    let once = false,
+      done = false,
+      nativeClosedCount = 0,
+      nativeReadCalls = 0;
+    try {
+      await withProductionReceiver(
+        async (wire, req, res) => {
+          if (!once) {
+            once = true;
+            arrived.resolve();
+            if (boundary === 'headers_deadline') {
+              await tail.promise;
+              return undefined;
+            }
+            if (boundary === 'pending_body') {
+              res.writeHead(200);
+              res.write('{"code":0,');
+              await tail.promise;
+              return undefined;
+            }
+          }
+          return normal(wire, req, res);
+        },
+        async (api) => {
+          api.releases.push(
+            () => tail.resolve(),
+            () => release.resolve(),
+          );
+          const config = fixtureConfiguration(api),
+            before = p1cProjection(api, config, 'before');
+          const host = new SubmissionHost(config, {
+            fetchRequest:
+              boundary === 'headers_deadline'
+                ? (Object.assign(
+                    async (input: RequestInfo | URL, init?: RequestInit) => {
+                      try {
+                        return await api.fetch(input, init);
+                      } catch (error) {
+                        entered.resolve();
+                        await release.promise;
+                        throw error;
+                      }
+                    },
+                    {
+                      preconnect() {
+                        throw new Error('Unexpected preconnect.');
+                      },
+                    },
+                  ) as typeof fetch)
+                : api.fetch,
+            clock: () => clock.wall,
+            retry: {
+              monotonicMs: () => clock.mono,
+              runtime: clock,
+              ...(boundary === 'headers_deadline'
+                ? { limits: { horizonMs: 150 } }
+                : {}),
+            },
+          });
+          const operation = host.planRetry(
+            { searchEngine: 'yandex' },
+            controller.signal,
+          );
+          api.operations.push(operation);
+          void operation.then(() => {
+            done = true;
+          });
+          await bounded(arrived.promise);
+          if (boundary === 'headers_deadline') {
+            // A pre-header fetch has no response/body to decorate. Hold its actual
+            // rejected native fetch receipt below, after the peer observes abort.
+            await bounded(entered.promise);
+          } else {
+            if (boundary === 'pending_body') {
+              await bounded(pendingRead.promise);
+              controller.abort();
+            }
+            await bounded(entered.promise);
+          }
+          await bounded(Promise.all(api.terminations));
+          if (boundary !== 'headers_deadline')
+            await bounded(nativeClosed.promise);
+          expect(done).toBe(false);
+          expect(await host.planRetry({})).toEqual({
+            status: 'error',
+            code: 'SubmissionBusy',
+          });
+          const blocked = await host.createIndexingTask({
+            mode: 'submit',
+            searchEngine: 'google',
+            requestId: 'blocked-during-settlement',
+            urls: [A],
+          });
+          expect(blocked.error?.code).toBe('SubmissionBusy');
+          expect(api.wires).toHaveLength(1);
+          release.resolve();
+          tail.resolve();
+          const result = await bounded(operation);
+          expect(result).toMatchObject({
+            status: 'error',
+            code:
+              boundary === 'headers_deadline'
+                ? 'DeadlineExceeded'
+                : 'Cancelled',
+          });
+          expectSafeFailure(result);
+          expect(clock.handles.size).toBe(0);
+          expect(signal.active.size).toBe(0);
+          if (boundary !== 'headers_deadline')
+            expect(nativeClosedCount).toBe(1);
+          expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+          // Actual settled failure permits this same host to plan again.
+          const recovery = host.planRetry({ searchEngine: 'yandex' });
+          api.operations.push(recovery);
+          expect((await bounded(recovery)).status).toBe('ready');
+        },
+        (response) => {
+          if (boundary === 'headers_deadline' || !once) return response;
+          const body = response.body;
+          if (!body) return response;
+          const decorated = new Proxy(body, {
+            get(target, field) {
+              if (field === 'getReader')
+                return () => {
+                  const reader = target.getReader();
+                  void reader.closed.then(
+                    () => {
+                      nativeClosedCount++;
+                      nativeClosed.resolve();
+                    },
+                    () => {
+                      nativeClosedCount++;
+                      nativeClosed.resolve();
+                    },
+                  );
+                  return new Proxy(reader, {
+                    get(actual, key) {
+                      if (key === 'read')
+                        return async () => {
+                          const reading = actual.read();
+                          if (++nativeReadCalls === 2) pendingRead.resolve();
+                          const value = await reading;
+                          if (boundary === 'eof_cancel' && value.done)
+                            controller.abort();
+                          return value;
+                        };
+                      const value = Reflect.get(actual, key, actual) as unknown;
+                      return typeof value === 'function'
+                        ? value.bind(actual)
+                        : value;
+                    },
+                  });
+                };
+              const value = Reflect.get(target, field, target) as unknown;
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          const wrapped = new Proxy(response, {
+            get(target, field) {
+              if (field === 'body') return decorated;
+              const value = Reflect.get(target, field, target) as unknown;
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          return holdCancellation(wrapped, entered, release);
+        },
+      );
+    } finally {
+      signal.restore();
+    }
+  });
+
+for (const cleanupFailure of [false, true])
+  test(`P1C-10 actual ${cleanupFailure ? 'unverified cleanup poisons new work until restart' : 'clean domain failure permits reuse'} and preserves preview/exact replay`, async () => {
+    const source = singleSource('yandex');
+    const replayParent = task('replay-parent', {
+      size: 1,
+      processed_count: 1,
+      indexed_count: 1,
+      created_at: '2026-09-01T00:00:00Z',
+    });
+    const clock = new NativeOwnerClock(),
+      normal = script({
+        ...source,
+        google: [[replayParent]],
+        statuses: { ...source?.statuses, 'google:replay-parent': replayParent },
+      });
+    let once = false;
+    await withProductionReceiver(
+      (wire, req, res) => {
+        if (!once) {
+          once = true;
+          clock.breakClear = cleanupFailure;
+          res.statusCode = 503;
+          return 'PRIVATE_BODY_SENTINEL /PRIVATE_PATH_SENTINEL';
+        }
+        return normal(wire, req, res);
+      },
+      async (api) => {
+        const config = fixtureConfiguration(api, allCreatePolicy),
+          beforeSeed = logicalProjection(config);
+        seedStandalone(config, 'replay-parent', [
+          'https://example.test/replay-source',
+        ]);
+        const before = p1cProjection(api, config, 'before');
+        expect(before).not.toEqual(beforeSeed);
+        const host = b1Host(api, config, clock);
+        const first = host.planRetry({ searchEngine: 'yandex' });
+        api.operations.push(first);
+        const result = await bounded(first);
+        if (cleanupFailure)
+          expect(result).toMatchObject({
+            status: 'error',
+            code: 'InternalError',
+          });
+        else
+          expect(result).toMatchObject({
+            status: 'error',
+            code: 'ReadFailed',
+            cause: 'http',
+          });
+        expectSafeFailure(result);
+        expect(clock.handles.size).toBe(0);
+        const count = api.wires.length;
+        expect(
+          await host.createIndexingTask({
+            mode: 'preview',
+            searchEngine: 'google',
+            urls: [A],
+          }),
+        ).toMatchObject({ status: 'preview' });
+        const replay = await host.createIndexingTask({
+          mode: 'submit',
+          searchEngine: 'google',
+          requestId: 'seed-replay-parent',
+          urls: ['https://example.test/replay-source'],
+        });
+        expect(replay).toMatchObject({ status: 'accepted', replayed: true });
+        expect('dispatchCapability' in replay).toBe(false);
+        if (cleanupFailure) {
+          expect(await host.planRetry({})).toMatchObject({
+            status: 'error',
+            code: 'InternalError',
+          });
+          await expectAllFreshBlocked(host, 'StateUnavailable');
+          expect(api.wires.length).toBe(count);
+          expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+          const replacement = b1Host(api, config, clock),
+            next = replacement.planRetry({ searchEngine: 'yandex' });
+          api.operations.push(next);
+          expect((await bounded(next)).status).toBe('ready');
+        } else {
+          const next = host.planRetry({ searchEngine: 'yandex' });
+          api.operations.push(next);
+          expect((await bounded(next)).status).toBe('ready');
+        }
+        expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+        expect(clock.handles.size).toBe(0);
+      },
+    );
+  });
+
+for (const boundary of ['result_expiry', 'close_day'] as const)
+  test(`P1C-06 production candidate path invalidates its own ${boundary} before handoff`, async () => {
+    await withProductionReceiver(
+      script(singleSource('yandex')),
+      async (api) => {
+        const config = fixtureConfiguration(api),
+          clock = new NativeOwnerClock();
+        const before = p1cProjection(api, config, 'before'),
+          phases: string[] = [];
+        const composition = composeVerifiedRetryAdmission({
+          configuration: config,
+          transport: { fetch: api.fetch },
+          clock,
+          owner: {
+            runtime: clock,
+            hooks: {
+              onOwnerPhase(phase) {
+                phases.push(phase);
+                if (
+                  boundary === 'result_expiry' &&
+                  phase === 'after_serialization'
+                )
+                  clock.mono += 60000;
+                if (boundary === 'close_day' && phase === 'before_close')
+                  queueMicrotask(() => {
+                    clock.wall += 86400000;
+                  });
+              },
+            },
+          },
+        });
+        const operation = composition.collectLatest(
+          { searchEngine: 'yandex' },
+          'private-candidate-expiry',
+        );
+        api.operations.push(operation);
+        const result = await bounded(operation);
+        expectSafeFailure(result);
+        expect(phases).toContain('after_serialization');
+        expect(phases).toContain('after_close');
+        if (boundary === 'close_day')
+          expect(result).toEqual({
+            status: 'blocked',
+            blockers: ['StalePeriodContext'],
+          });
+        else
+          expect(result).toMatchObject({
+            status: 'error',
+            code: 'DeadlineExceeded',
+          });
+        expect(composition.isNewWorkAvailable()).toBe(true);
+        expect(clock.handles.size).toBe(0);
+        expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+        writeFileSync(
+          join(api.root, 'p1c-result.json'),
+          JSON.stringify({ result, phases }),
+        );
+      },
+    );
+  });
+
+test('P1C-10 owning production writer retains exact replay after real cleanup poison and denies all new admission', async () => {
+  const clock = new NativeOwnerClock(),
+    normal = script(singleSource('yandex'));
+  let fail = false;
+  await withProductionReceiver(
+    (wire, req, res) => {
+      if (fail) {
+        fail = false;
+        clock.breakClear = true;
+        res.statusCode = 503;
+        return 'PRIVATE_ORIGINAL_HTTP_CAUSE';
+      }
+      return normal(wire, req, res);
+    },
+    async (api) => {
+      const config = fixtureConfiguration(api),
+        before = p1cProjection(api, config, 'before');
+      const composition = composeVerifiedRetryAdmission({
+        configuration: config,
+        transport: { fetch: api.fetch },
+        clock,
+        owner: { runtime: clock },
+      });
+      const collecting = composition.collectLatest(
+        { searchEngine: 'yandex' },
+        'private-replay-before-poison',
+      );
+      api.operations.push(collecting);
+      const candidate = await bounded(collecting);
+      if (!('kind' in candidate))
+        throw new Error('Expected real owning candidate before poison.');
+      expect(
+        p1cProjection(api, config, 'after-collection-before-prepare'),
+      ).toEqual(before);
+      const writer = composition.open();
+      try {
+        expect(
+          writer.prepareVerifiedRetryIntent(candidate.input, candidate.proof)
+            .kind,
+        ).toBe('created');
+      } finally {
+        writer.close();
+      }
+      const stored = p1cProjection(api, config, 'after-explicit-prepare');
+      fail = true;
+      const poisoning = composition.collectLatest(
+        { searchEngine: 'yandex' },
+        'private-poisoning-collection',
+      );
+      api.operations.push(poisoning);
+      expect(await bounded(poisoning)).toMatchObject({
+        status: 'error',
+        code: 'InternalError',
+      });
+      expect(composition.isNewWorkAvailable()).toBe(false);
+      expect(clock.handles.size).toBe(0);
+      clock.mono += 60000;
+      const replayWriter = composition.open();
+      try {
+        expect(
+          replayWriter.readIntent(fingerprint, candidate.input.intent.requestId)
+            ?.state,
+        ).toBe('prepared');
+        const replay = replayWriter.prepareVerifiedRetryIntent(candidate.input);
+        expect(replay.kind).toBe('replay');
+        expect('dispatchCapability' in replay).toBe(false);
+        let refusal: unknown;
+        try {
+          replayWriter.prepareVerifiedRetryIntent(
+            {
+              ...candidate.input,
+              intent: {
+                ...candidate.input.intent,
+                requestId: 'private-unavailable-new-id',
+              },
+            },
+            candidate.proof,
+          );
+        } catch (error) {
+          refusal = error;
+        }
+        expect(refusal).toMatchObject({ code: 'LedgerUnavailable' });
+      } finally {
+        replayWriter.close();
+      }
+      const reads = api.wires.length;
+      expect(
+        await composition.collectLatest({}, 'private-still-unavailable'),
+      ).toMatchObject({ status: 'error', code: 'InternalError' });
+      expect(api.wires).toHaveLength(reads);
+      expect(logicalProjection(config)).toEqual(stored);
+      expect(api.wires).toHaveLength(11);
+    },
+  );
+});
+
+function withP1cReadDb<T>(
+  config: ConfiguredSubmission,
+  inspect: (db: Database) => T,
+): T {
+  const db = new Database(
+    join(config.stateDirectory, 'ledger.sqlite'),
+    constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_NOFOLLOW,
+  );
+  try {
+    return inspect(db);
+  } finally {
+    db.close();
+  }
+}
+
+function cooperatingP1cCommit(config: ConfiguredSubmission) {
+  const writer = openLedger({ stateDirectory: config.stateDirectory });
+  try {
+    expect(
+      writer.prepareIntent(
+        intent(config, 'cooperating-disjoint', [
+          'https://example.test/cooperating-disjoint',
+        ]),
+      ).kind,
+    ).toBe('created');
+  } finally {
+    writer.close();
+  }
+}
+
+test('P1C-05 final native reader refuses an actual disjoint cooperating revision commit without rescan', async () => {
+  await withProductionReceiver(script(singleSource('yandex')), async (api) => {
+    const config = fixtureConfiguration(api),
+      clock = new NativeOwnerClock();
+    const before = p1cProjection(api, config, 'before');
+    let cooperating: ReturnType<typeof logicalProjection> | undefined;
+    const host = b1Host(api, config, clock, {
+      hooks: {
+        onOwnerPhase(phase) {
+          if (phase === 'before_final_read') {
+            expect(api.wires).toHaveLength(10);
+            cooperatingP1cCommit(config);
+            cooperating = p1cProjection(
+              api,
+              config,
+              'after-cooperating-commit',
+            );
+          }
+        },
+      },
+    });
+    const planning = host.planRetry({ searchEngine: 'yandex' });
+    api.operations.push(planning);
+    const result = await bounded(planning);
+    expect(result).toEqual({
+      status: 'blocked',
+      blockers: ['SnapshotConflict'],
+    });
+    expectSafeFailure(result);
+    expect(cooperating).toBeDefined();
+    expect(cooperating).not.toEqual(before);
+    expect(
+      p1cProjection(api, config, 'unchanged-after-cooperating-commit'),
+    ).toEqual(cooperating!);
+    expect(
+      withP1cReadDb(config, (db) =>
+        db.query('SELECT request_id,state FROM intents').all(),
+      ),
+    ).toEqual([{ request_id: 'cooperating-disjoint', state: 'prepared' }]);
+    expect(api.wires).toHaveLength(10);
+    expect(clock.handles.size).toBe(0);
+  });
+});
+
+test('P1C-05 actual current Yandex indexer exposure leaves insufficient remaining units', async () => {
+  const opts = singleSource('yandex')!;
+  const used = task('unit-use', {
+    size: 1,
+    processed_count: 1,
+    indexed_count: 1,
+    pay_per_indexed: undefined,
+    created_at: '2026-09-01T00:00:00Z',
+  });
+  opts.yandex![0]!.push(used);
+  opts.statuses!['yandex:unit-use'] = used;
+  await withProductionReceiver(script(opts), async (api) => {
+    const config = fixtureConfiguration(api, {
+      caps: { tokens: 10000, indexer: 2, checker: 100 },
+    });
+    seedStandalone(
+      config,
+      'unit-use',
+      ['https://example.test/used-unit'],
+      'yandex/indexer',
+    );
+    const usage = withP1cReadDb(config, (db) =>
+      db
+        .query(
+          "SELECT CAST(SUM(reserved_indexer) AS TEXT) AS indexer,CAST(SUM(reserved_tokens) AS TEXT) AS tokens FROM intents WHERE credential_fp=? AND budget_scope=? AND period_id=? AND state='accepted'",
+        )
+        .get(
+          fingerprint,
+          config.snapshot.policy.budgetScope,
+          'utc-day:2026-10-21',
+        ),
+    );
+    expect(usage).toEqual({ indexer: '1', tokens: '20' });
+    expect(1 + 2).toBeGreaterThan(config.snapshot.policy.caps.indexer);
+    const before = p1cProjection(api, config, 'before'),
+      clock = new NativeOwnerClock();
+    const operation = b1Host(api, config, clock).planRetry({
+      searchEngine: 'yandex',
+    });
+    api.operations.push(operation);
+    const result = await bounded(operation);
+    expect(result).toMatchObject({
+      status: 'blocked',
+      blockers: ['BudgetExceeded'],
+    });
+    expectSafeFailure(result);
+    expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+    expect(api.wires).toHaveLength(10);
+    expect(clock.handles.size).toBe(0);
+    writeFileSync(
+      join(api.root, 'p1c-integer-oracle.json'),
+      JSON.stringify({ usage, proposedIndexer: '2', capIndexer: '2' }),
+    );
+  });
+});
+
+test('P1C-05 exact-parent lifetime counts real cancelled and rejected attempts across old scope and UTC period', async () => {
+  await withProductionReceiver(script(singleSource('yandex')), async (api) => {
+    const config = fixtureConfiguration(api, {
+      retry: {
+        enabled: true,
+        allowUnattributedParents: true,
+        maxAttemptsPerSource: 2,
+      },
+    });
+    const oldPath = join(api.root, 'old-scope-policy.json');
+    writeFileSync(
+      oldPath,
+      JSON.stringify({
+        ...config.snapshot.policy,
+        budgetScope: 'old-scope',
+        policyRevision: 'old-policy',
+        retry: { ...config.snapshot.policy.retry, maxAttemptsPerSource: 3 },
+      }),
+      { mode: 0o600 },
+    );
+    const old = loadSubmissionConfiguration({
+      apiKey: fixtureKey,
+      policyPath: oldPath,
+      stateDirectory: config.stateDirectory,
+    });
+    if (old.state !== 'configured')
+      throw new Error('Expected old synthetic configuration.');
+    for (const state of ['cancelled', 'rejected'] as const)
+      await seedExternalChild(
+        old,
+        { family: 'yandex/indexer', taskId: 'parent' },
+        state,
+        [C, A, B],
+        { requestId: 'old-' + state, utcMs: utc - 86400000 },
+      );
+    const attempts = withP1cReadDb(config, (db) =>
+      db
+        .query(
+          "SELECT i.request_id,i.state,i.budget_scope,i.period_id,c.parent_family,c.parent_task_id FROM intents i JOIN intent_context c USING(credential_fp,request_id) WHERE c.origin_kind='retry' AND c.parent_family=? AND c.parent_task_id=? ORDER BY i.request_id",
+        )
+        .all('yandex/indexer', 'parent'),
+    );
+    expect(attempts).toEqual(
+      ['cancelled', 'rejected'].map((state) => ({
+        request_id: 'old-' + state,
+        state,
+        budget_scope: 'old-scope',
+        period_id: 'utc-day:2026-10-20',
+        parent_family: 'yandex/indexer',
+        parent_task_id: 'parent',
+      })),
+    );
+    const count = withP1cReadDb(config, (db) =>
+      db
+        .query(
+          "SELECT CAST(COUNT(*) AS TEXT) AS attempts FROM intent_context WHERE credential_fp=? AND origin_kind='retry' AND parent_family=? AND parent_task_id=?",
+        )
+        .get(fingerprint, 'yandex/indexer', 'parent'),
+    );
+    expect(count).toEqual({ attempts: '2' });
+    const before = p1cProjection(api, config, 'before'),
+      clock = new NativeOwnerClock();
+    const operation = b1Host(api, config, clock).planRetry({
+      searchEngine: 'yandex',
+    });
+    api.operations.push(operation);
+    const result = await bounded(operation);
+    expect(result).toMatchObject({
+      status: 'blocked',
+      blockers: ['RetryAllowanceExceeded'],
+    });
+    expectSafeFailure(result);
+    expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+    expect(api.wires).toHaveLength(10);
+    expect(clock.handles.size).toBe(0);
+    writeFileSync(
+      join(api.root, 'p1c-integer-oracle.json'),
+      JSON.stringify({ attempts, count, currentMaxAttempts: 2 }),
+    );
+  });
+});
+
+for (const kind of ['empty', 'unfinished', 'no_source_revision'] as const)
+  test(`P1C-11 complete ${kind} uses actual final same-ledger snapshot without invented parent/quote`, async () => {
+    const opts =
+      kind === 'unfinished'
+        ? singleSource('yandex', {
+            is_completed: false,
+            status: undefined,
+            check_after: undefined,
+            processed_count: 1,
+            indexed_count: 0,
+          })
+        : {};
+    await withProductionReceiver(script(opts), async (api) => {
+      const config = fixtureConfiguration(api),
+        clock = new NativeOwnerClock(),
+        phases: string[] = [];
+      const before = p1cProjection(api, config, 'before');
+      let changed: ReturnType<typeof logicalProjection> | undefined;
+      const host = b1Host(api, config, clock, {
+        hooks: {
+          onOwnerPhase(phase) {
+            phases.push(phase);
+            if (
+              kind === 'no_source_revision' &&
+              phase === 'before_final_read'
+            ) {
+              cooperatingP1cCommit(config);
+              changed = p1cProjection(api, config, 'after-cooperating-commit');
+            }
+          },
+        },
+      });
+      const operation = host.planRetry({});
+      api.operations.push(operation);
+      const result = await bounded(operation);
+      expect(result).toEqual(
+        kind === 'no_source_revision'
+          ? { status: 'blocked', blockers: ['SnapshotConflict'] }
+          : { status: 'no_source' },
+      );
+      expectSafeFailure(result);
+      expect('source' in result).toBe(false);
+      expect('quote' in result).toBe(false);
+      expect(phases).toContain('after_final_read');
+      expect(phases).toContain('after_close');
+      expect(api.wires.filter((w) => w.path.endsWith('/report'))).toEqual([]);
+      expect(api.wires).toHaveLength(kind === 'unfinished' ? 8 : 6);
+      expect(
+        p1cProjection(
+          api,
+          config,
+          kind === 'no_source_revision'
+            ? 'unchanged-after-cooperating-commit'
+            : 'unchanged',
+        ),
+      ).toEqual(changed ?? before);
+      expect(localSnapshot(config).acceptedManifests).toEqual([]);
+      expect(localSnapshot(config).retryChildren).toEqual([]);
+      expect(clock.handles.size).toBe(0);
+      writeFileSync(join(api.root, 'p1c-phases.json'), JSON.stringify(phases));
+    });
+  });
+
+for (const provenance of ['external', 'migrated_legacy'] as const)
+  for (const allowed of [false, true])
+    test(`P1C-11 ${provenance} actual private permission ${allowed} preserves attribution and no planning writes`, async () => {
+      const engine = provenance === 'external' ? 'yandex' : 'google';
+      await withProductionReceiver(
+        script(singleSource(engine)),
+        async (api) => {
+          const config = fixtureConfiguration(
+            api,
+            {
+              retry: {
+                enabled: true,
+                allowUnattributedParents: allowed,
+                maxAttemptsPerSource: 3,
+              },
+            },
+            provenance === 'external' ? 2 : 1,
+          );
+          if (provenance === 'migrated_legacy') {
+            seedStandalone(config, 'parent', [A, B, C]);
+            const core = () =>
+              withP1cReadDb(config, (db) =>
+                [
+                  'intents',
+                  'intent_urls',
+                  'intent_events',
+                  'budget_periods',
+                ].map((name) => [
+                  name,
+                  db.query(`SELECT * FROM ${name} ORDER BY rowid`).all(),
+                ]),
+              );
+            const original = core();
+            expect(
+              migrateLedgerV2({
+                stateDirectory: config.stateDirectory,
+                backupDirectory: join(api.root, 'v1-backup'),
+              }),
+            ).toEqual({
+              migrated: true,
+              schemaVersion: 2,
+              backupVerified: true,
+            });
+            expect(core()).toEqual(original);
+            expect(
+              withP1cReadDb(config, (db) =>
+                db
+                  .query(
+                    'SELECT origin_kind,parent_family,parent_task_id,source_manifest_digest,plan_fingerprint FROM intent_context',
+                  )
+                  .all(),
+              ),
+            ).toEqual([
+              {
+                origin_kind: 'legacy_unattributed',
+                parent_family: null,
+                parent_task_id: null,
+                source_manifest_digest: null,
+                plan_fingerprint: null,
+              },
+            ]);
+          }
+          const before = p1cProjection(api, config, 'before'),
+            clock = new NativeOwnerClock();
+          const operation = b1Host(api, config, clock).planRetry({
+            searchEngine: engine,
+          });
+          api.operations.push(operation);
+          const result = await bounded(operation);
+          if (allowed) {
+            expect(result).toMatchObject({
+              status: 'ready',
+              eligibleUrls: [A, B],
+              source: {
+                provenance:
+                  provenance === 'external'
+                    ? 'external_unattributed'
+                    : 'legacy_unattributed',
+                originalManifestKnown: provenance !== 'external',
+                manifestProvenance:
+                  provenance === 'external'
+                    ? 'provider_report_observed_corpus'
+                    : 'durable_local_intent_ack',
+                manifestDigest:
+                  provenance === 'external'
+                    ? H('speedyindex-provider-report-url-manifest-v1', [
+                        'yandex/indexer',
+                        'parent',
+                        [C, A, B],
+                      ])
+                    : H('speedyindex-intent-url-manifest-v1', [
+                        'google/indexer',
+                        [A, B, C],
+                      ]),
+              },
+            });
+            for (const privateField of [
+              'proof',
+              'input',
+              'kind',
+              'ledgerId',
+              'dispatchCapability',
+            ])
+              expect(privateField in result).toBe(false);
+          } else {
+            expect(result).toEqual({
+              status: 'blocked',
+              blockers: ['UnattributedParentPermissionRequired'],
+            });
+            expectSafeFailure(result);
+          }
+          expect(localSnapshot(config).acceptedManifests).toHaveLength(
+            provenance === 'external' ? 0 : 1,
+          );
+          expect(localSnapshot(config).retryChildren).toEqual([]);
+          expect(p1cProjection(api, config, 'unchanged')).toEqual(before);
+          expectProductionWires(api, engine);
+          expect(clock.handles.size).toBe(0);
+        },
+      );
+    });

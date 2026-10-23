@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   linkSync,
@@ -57,6 +59,7 @@ import {
   fixtureRetryVerifier,
   retryFixtureUtc,
   retryFixtureBinding,
+  retryFixtureKey,
 } from './fixtures/retry-verifier';
 import type { SubmissionPolicy } from '../src/submission-policy';
 import { submittedUrlSchema } from '../src/submission-contract';
@@ -4131,7 +4134,7 @@ test('V2-08 asynchronous trusted phase result is rejected and rolled back withou
     );
   }));
 
-interface RetryProcessSetup {
+interface LegacyRetryProcessSetup {
   role:
     | 'verified'
     | 'verified_lock_wait'
@@ -4150,6 +4153,19 @@ interface RetryProcessSetup {
   verifiedUrls?: string[];
   clockAfterWait?: 'expiry' | 'utc';
 }
+type RetryProcessSetup =
+  | LegacyRetryProcessSetup
+  | {
+      role: 'production_lock_wait';
+      stateDirectory: string;
+      pauseAt?: never;
+      production: {
+        origin: string;
+        boundary: 'expiry' | 'utc' | 'cancel';
+        inspectOnly?: boolean;
+        journal?: { nonce: string; path: string; parentPid: number };
+      };
+    };
 interface RetryProcessMessage {
   event: 'ready' | 'phase' | 'result';
   phase?:
@@ -4157,7 +4173,11 @@ interface RetryProcessMessage {
     | 'claim_committed'
     | 'locked'
     | 'lock_waited'
-    | 'prepare_attempt';
+    | 'prepare_attempt'
+    | 'collected'
+    | 'parent_locked'
+    | 'admission_locked'
+    | 'abort_observed';
   kind?:
     | 'created'
     | 'replay'
@@ -4165,10 +4185,14 @@ interface RetryProcessMessage {
     | 'cancelled'
     | 'lost'
     | 'accepted'
+    | 'collected'
     | 'error';
   code?: string;
   unit?: 'tokens' | 'indexer' | 'checker';
   capability?: boolean;
+  nativeEpochMs?: number;
+  nativeCode?: string;
+  clock?: number[];
 }
 function spawnRetryProcess(home: string) {
   return Bun.spawn(
@@ -4220,7 +4244,7 @@ async function retryProcessDeadline<T>(promise: Promise<T>): Promise<T> {
 }
 async function retryControl(
   child: OwnedRetryProcess,
-  command: 'GO' | 'RECORD' | 'RETRY',
+  command: 'GO' | 'RECORD' | 'RETRY' | 'ABORT',
   end = true,
 ) {
   await retryProcessDeadline(
@@ -4294,6 +4318,9 @@ async function startRetryProcess(
                   'code',
                   'unit',
                   'capability',
+                  'nativeEpochMs',
+                  'nativeCode',
+                  'clock',
                 ].includes(key),
             ) ||
             !['ready', 'phase', 'result'].includes(message.event) ||
@@ -4307,6 +4334,10 @@ async function startRetryProcess(
                 'locked',
                 'lock_waited',
                 'prepare_attempt',
+                'collected',
+                'parent_locked',
+                'admission_locked',
+                'abort_observed',
               ].includes(message.phase)) ||
             (message.kind !== undefined &&
               ![
@@ -4316,6 +4347,7 @@ async function startRetryProcess(
                 'cancelled',
                 'lost',
                 'accepted',
+                'collected',
                 'error',
               ].includes(message.kind)) ||
             (message.code !== undefined &&
@@ -4345,7 +4377,14 @@ async function startRetryProcess(
             (message.unit !== undefined &&
               !['tokens', 'indexer', 'checker'].includes(message.unit)) ||
             (message.capability !== undefined &&
-              typeof message.capability !== 'boolean')
+              typeof message.capability !== 'boolean') ||
+            (message.nativeEpochMs !== undefined &&
+              !Number.isFinite(message.nativeEpochMs)) ||
+            (message.nativeCode !== undefined &&
+              message.nativeCode !== 'SQLITE_BUSY') ||
+            (message.clock !== undefined &&
+              (message.clock.length !== 3 ||
+                message.clock.some((n) => !Number.isFinite(n))))
           )
             throw new Error('Unexpected retry child protocol.');
           child.messages.push(message);
@@ -4398,6 +4437,7 @@ async function retryProcessCase(
     f: ReturnType<typeof fixture>,
     children: OwnedRetryProcess[],
   ) => Promise<void>,
+  preserveRoot = false,
 ) {
   const f = fixture();
   const children: OwnedRetryProcess[] = [];
@@ -4410,7 +4450,7 @@ async function retryProcessCase(
     failures.push(error);
   } finally {
     try {
-      await closeRetryProcessFixture(f, children, verified);
+      await closeRetryProcessFixture(f, children, verified, preserveRoot);
     } catch (error) {
       failures.push(error);
     }
@@ -4426,6 +4466,7 @@ async function closeRetryProcessFixture(
   f: ReturnType<typeof fixture>,
   children: OwnedRetryProcess[],
   verified: boolean,
+  preserveRoot = false,
 ) {
   const failures: unknown[] = [];
   const reaped = await Promise.allSettled(children.map(reapRetryProcess));
@@ -4473,12 +4514,12 @@ async function closeRetryProcessFixture(
   for (const result of settled)
     if (result.status === 'rejected') failures.push(result.reason);
   try {
-    f.cleanup(verified && failures.length === 0);
+    f.cleanup(!preserveRoot && verified && failures.length === 0);
   } catch (error) {
     failures.push(error);
   }
   const removed = !existsSync(f.root);
-  if (verified && failures.length === 0 && !removed)
+  if (!preserveRoot && verified && failures.length === 0 && !removed)
     failures.push(new Error('Owned retry root was not removed.'));
   console.info(
     'V2-RETRY_CLEANUP ' +
@@ -4489,6 +4530,38 @@ async function closeRetryProcessFixture(
         failures: failures.length,
       }),
   );
+  if (preserveRoot) {
+    writeFileSync(
+      join(f.root, 'p1c-processes.json'),
+      JSON.stringify(
+        children.map((c) => ({
+          pid: c.process.pid,
+          role: c.role,
+          exitResult: c.exitResult,
+          signal: c.process.signalCode,
+          inputClosed: c.inputClosed,
+          outputEnded: c.outputEnded,
+          messages: c.messages,
+        })),
+      ),
+    );
+    writeFileSync(
+      join(f.root, 'p1c-resource-status.json'),
+      JSON.stringify({
+        passed: verified,
+        settled: failures.length === 0,
+        pid: process.pid,
+      }),
+    );
+    console.info(
+      'P1C_FIXTURE ' +
+        JSON.stringify({
+          root: f.root,
+          passed: verified,
+          settled: failures.length === 0,
+        }),
+    );
+  }
   if (failures.length)
     throw new AggregateError(
       failures,
@@ -7553,3 +7626,344 @@ test('P0-02 caller cancellation after collection consumes no new hold or replace
     const fresh = candidate(await h.composition.collect(h.selection));
     expect(fresh.proof).not.toBe(c.proof);
   }));
+
+// P1C09 journal helper begin. Private preparation checks extract these exact bytes.
+function appendP1cParentJournal(
+  path: string,
+  nonce: string,
+  phase: 'parent_abort_flushed' | 'parent_lock_released',
+) {
+  const line =
+    JSON.stringify([
+      'p1c09-native-phase-v1',
+      nonce,
+      'parent',
+      phase,
+      1,
+      process.pid,
+    ]) + '\n';
+  if (
+    Buffer.byteLength(line) > 256 ||
+    lstatSync(path).size > 4096 - Buffer.byteLength(line)
+  )
+    throw new Error('Production parent journal bound.');
+  appendFileSync(path, line, 'utf8');
+  const bytes = readFileSync(path);
+  const text = bytes.toString('utf8');
+  if (
+    bytes.length > 4096 ||
+    !Buffer.from(text).equals(bytes) ||
+    !text.endsWith('\n') ||
+    !text.includes(line) ||
+    text.indexOf(line) !== text.lastIndexOf(line)
+  )
+    throw new Error('Production parent journal readback failed.');
+}
+function readP1cCancelJournal(
+  path: string,
+  nonce: string,
+  parentPid: number,
+  childPid: number,
+) {
+  const info = lstatSync(path);
+  if (
+    !info.isFile() ||
+    info.isSymbolicLink() ||
+    info.nlink !== 1 ||
+    info.uid !== process.getuid?.() ||
+    (info.mode & 0o777) !== 0o600 ||
+    info.size > 4096
+  )
+    throw new Error('Invalid production journal file.');
+  const bytes = readFileSync(path);
+  const text = bytes.toString('utf8');
+  if (
+    bytes.length > 4096 ||
+    !Buffer.from(text).equals(bytes) ||
+    !text.endsWith('\n')
+  )
+    throw new Error('Invalid production journal bytes.');
+  const lines = text.slice(0, -1).split('\n');
+  const phases = [
+    ['child', 'collected', 0, childPid],
+    ['child', 'first_attempt', 1, childPid],
+    ['parent', 'parent_abort_flushed', 1, parentPid],
+    ['child', 'first_begin_busy_returned', 1, childPid],
+    ['child', 'child_abort_observed', 1, childPid],
+    ['parent', 'parent_lock_released', 1, parentPid],
+    ['child', 'second_attempt', 2, childPid],
+    ['child', 'actual_admission_lock_witness', 2, childPid],
+    ['child', 'RetryCancelled', 2, childPid],
+  ];
+  if (lines.length !== phases.length)
+    throw new Error('Incomplete or excess production journal.');
+  const records: unknown[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const record: unknown = JSON.parse(lines[i]!);
+    if (
+      lines[i] !== JSON.stringify(record) ||
+      lines[i] !==
+        JSON.stringify(['p1c09-native-phase-v1', nonce, ...phases[i]!])
+    )
+      throw new Error('Malformed, foreign or out-of-order production journal.');
+    records.push(record);
+  }
+  return records;
+}
+// P1C09 journal helper end.
+
+for (const boundary of ['expiry', 'utc', 'cancel'] as const)
+  test(
+    `P1C-09 production child original ${boundary} refuses after witnessed busy and later native lock acquisition`,
+    () =>
+      retryProcessCase(async (f, children) => {
+        const state = join(f.root, 'production-state');
+        f.init(state);
+        const db = f.raw(state);
+        const journalNonce = `p1c09-${crypto.randomUUID()}`;
+        const journalPath = join(f.root, 'p1c-native-phases.jsonl');
+        if (boundary === 'cancel')
+          writeFileSync(journalPath, '', { mode: 0o600, flag: 'wx' });
+        const wires: { path: string; method: string; body: string }[] = [];
+        const pending: Promise<void>[] = [],
+          terminations: Promise<void>[] = [],
+          errors: unknown[] = [];
+        const parent = {
+          id: 'production-parent',
+          size: 3,
+          processed_count: 3,
+          indexed_count: 1,
+          is_completed: true,
+          status: 'completed',
+          created_at: '2026-10-01T00:00:00Z',
+          check_after: '2026-10-08T00:00:00Z',
+        };
+        const urls = [
+          'https://example.test/production-indexed',
+          'https://example.test/production-A',
+          'https://example.test/production-B',
+        ];
+        // Own cleanup is registered before listen or child startup. No global fetch is used here.
+        const server = createServer((req, res) => {
+          terminations.push(
+            new Promise<void>((done) => res.once('close', done)),
+          );
+          pending.push(
+            (async () => {
+              let body = '';
+              for await (const chunk of req) body += String(chunk);
+              const path = req.url!;
+              wires.push({ path, method: req.method!, body });
+              expect(req.headers.authorization).toBe(retryFixtureKey);
+              let payload: unknown;
+              if (path.includes('/list/')) {
+                expect(req.method).toBe('GET');
+                expect(body).toBe('');
+                expect([
+                  '/v2/task/google/indexer/list/0',
+                  '/v2/task/google/indexer/list/0?filter=drip_feed',
+                  '/v2/task/yandex/indexer/list/0',
+                ]).toContain(path);
+                payload = {
+                  code: 0,
+                  page: 0,
+                  last_page: 0,
+                  result: path.includes('/yandex/') ? [parent] : [],
+                };
+              } else {
+                expect(req.method).toBe('POST');
+                expect([
+                  '/v2/task/yandex/indexer/status',
+                  '/v2/task/yandex/indexer/report',
+                ]).toContain(path);
+                expect(body).toBe(
+                  path.endsWith('/status')
+                    ? '{"task_ids":["production-parent"]}'
+                    : '{"task_id":"production-parent"}',
+                );
+                payload = {
+                  code: 0,
+                  result: path.endsWith('/status')
+                    ? [parent]
+                    : {
+                        ...parent,
+                        type: 'indexer',
+                        title: 'SYNTHETIC_PRODUCTION_REPORT',
+                        indexed_links: urls.slice(0, 1),
+                        unindexed_links: urls.slice(1),
+                      },
+                };
+              }
+              res.setHeader('content-type', 'application/json');
+              res.end(JSON.stringify(payload));
+            })().catch((error) => {
+              errors.push(error);
+              res.destroy();
+            }),
+          );
+        });
+        let started = false,
+          locked = false;
+        const outcomeErrors: unknown[] = [];
+        try {
+          await retryProcessDeadline(
+            new Promise<void>((done, reject) => {
+              server.once('error', reject);
+              server.listen(0, '127.0.0.1', () => {
+                started = true;
+                done();
+              });
+            }),
+          );
+          const address = server.address();
+          if (!address || typeof address === 'string')
+            throw new Error('Expected owned production receiver.');
+          const before = snapshot(db);
+          writeFileSync(
+            join(f.root, 'p1c-logical-before.json'),
+            JSON.stringify(before),
+          );
+          const child = await startRetryProcess(f, children, {
+            role: 'production_lock_wait',
+            stateDirectory: state,
+            production: {
+              origin: `http://127.0.0.1:${address.port}`,
+              boundary,
+              ...(boundary === 'cancel'
+                ? {
+                    journal: {
+                      nonce: journalNonce,
+                      path: journalPath,
+                      parentPid: process.pid,
+                    },
+                  }
+                : {}),
+            },
+          });
+          const collected = child.messages.find(
+            (m) => m.phase === 'collected',
+          )!.clock!;
+          expect(collected[1]!).toBeGreaterThan(collected[0]!);
+          expect(collected[1]! - collected[0]!).toBeLessThan(collected[2]!);
+          expect(snapshot(db)).toEqual(before); // Collection itself wrote no application rows.
+          expect(wires).toHaveLength(10);
+          db.run('BEGIN IMMEDIATE');
+          locked = true;
+          let queuedEpochMs: number | undefined;
+          await retryControl(child, 'GO', false);
+          await waitRetryMessage(child, (m) => m.phase === 'prepare_attempt');
+          if (boundary === 'cancel') {
+            await retryControl(child, 'ABORT', false); // OS pipe flush while JS is blocked in the first native BEGIN.
+            appendP1cParentJournal(
+              journalPath,
+              journalNonce,
+              'parent_abort_flushed',
+            );
+            // Diagnostic only: separate processes' performance epochs do not prove order.
+            queuedEpochMs = performance.timeOrigin + performance.now();
+          }
+          await waitRetryMessage(child, (m) => m.phase === 'lock_waited');
+          expect(
+            child.messages.find((m) => m.phase === 'parent_locked')?.nativeCode,
+          ).toBe('SQLITE_BUSY');
+          if (boundary === 'cancel') {
+            await waitRetryMessage(child, (m) => m.phase === 'abort_observed');
+          }
+          db.run('ROLLBACK');
+          locked = false;
+          if (boundary === 'cancel')
+            appendP1cParentJournal(
+              journalPath,
+              journalNonce,
+              'parent_lock_released',
+            );
+          await retryControl(child, 'RETRY');
+          const result = await retryProcessResult(child);
+          expect(
+            child.messages.find((m) => m.phase === 'admission_locked')
+              ?.nativeCode,
+          ).toBe('SQLITE_BUSY');
+          expect(
+            child.messages.filter((m) => m.phase === 'prepare_attempt'),
+          ).toHaveLength(2);
+          expect(result).toMatchObject({
+            kind: 'error',
+            capability: false,
+            code:
+              boundary === 'expiry'
+                ? 'RetryProofExpired'
+                : boundary === 'utc'
+                  ? 'StalePeriodContext'
+                  : 'RetryCancelled',
+          });
+          expect(snapshot(db)).toEqual(before);
+          expect(wires).toHaveLength(10);
+          const journal =
+            boundary === 'cancel'
+              ? readP1cCancelJournal(
+                  journalPath,
+                  journalNonce,
+                  process.pid,
+                  child.process.pid,
+                )
+              : undefined;
+          if (boundary === 'cancel') expect(journal).toHaveLength(9);
+          writeFileSync(
+            join(f.root, 'p1c-logical-unchanged.json'),
+            JSON.stringify(snapshot(db)),
+          );
+          writeFileSync(
+            join(f.root, 'p1c-native-control.json'),
+            JSON.stringify({
+              boundary,
+              collected,
+              queuedEpochMs,
+              journal,
+              messages: child.messages,
+            }),
+          );
+        } catch (error) {
+          outcomeErrors.push(error);
+        } finally {
+          try {
+            if (locked) db.run('ROLLBACK');
+          } catch (error) {
+            outcomeErrors.push(error);
+          }
+          const requests = await Promise.allSettled([
+            retryProcessDeadline(Promise.all(pending)),
+            retryProcessDeadline(Promise.all(terminations)),
+          ]);
+          for (const request of requests)
+            if (request.status === 'rejected')
+              outcomeErrors.push(request.reason);
+          try {
+            if (started) {
+              server.closeIdleConnections();
+              await retryProcessDeadline(
+                new Promise<void>((done, reject) =>
+                  server.close((e) => (e ? reject(e) : done())),
+                ),
+              );
+            }
+          } catch (error) {
+            outcomeErrors.push(error);
+          }
+          try {
+            writeFileSync(
+              join(f.root, 'p1c-wires.json'),
+              JSON.stringify(wires),
+            );
+          } catch (error) {
+            outcomeErrors.push(error);
+          }
+          outcomeErrors.push(...errors);
+        }
+        if (outcomeErrors.length)
+          throw new AggregateError(
+            outcomeErrors,
+            'Production case or receiver failed.',
+          );
+      }, true),
+    10000,
+  );
