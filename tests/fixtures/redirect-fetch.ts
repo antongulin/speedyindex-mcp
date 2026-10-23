@@ -40,11 +40,15 @@ globalThis.fetch = ((
     method === 'POST' && statusPaths.has(target.pathname);
   const supportedReportPost =
     method === 'POST' && reportPaths.has(target.pathname);
+  const supportedDripQuery =
+    method === 'GET' &&
+    /^\/v2\/task\/google\/indexer\/list\/\d+$/.test(target.pathname) &&
+    target.search === '?filter=drip_feed';
   const supportedTarget =
     target.origin === 'https://api.speedyindex.com' &&
     !target.username &&
     !target.password &&
-    !target.search &&
+    (!target.search || supportedDripQuery) &&
     !target.hash &&
     (supportedGet ||
       supportedStatusPost ||

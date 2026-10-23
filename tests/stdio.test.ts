@@ -14,6 +14,11 @@ import {
   fixture,
 } from './helpers';
 import { verifyEof } from './stdio-eof';
+import { verifyPlanRetrySdk } from './plan-retry-sdk';
+
+test('P2-06 SOURCE SDK: strict advertised plan_retry and genuine local/external ready', async () => {
+  await verifyPlanRetrySdk('src/cli.ts');
+}, 30000);
 
 type SchemaBranch = {
   type?: string;
@@ -115,6 +120,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       'create_indexing_task',
       'create_index_check',
       'create_backlink_check',
+      'plan_retry',
     ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
@@ -641,7 +647,7 @@ test('F02: direct stdin EOF after initialize exits successfully', async () => {
   await verifyEof('src/cli.ts');
 });
 
-test('IC10/C15 SOURCE SDK: seven tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
+test('IC10/C15 SOURCE SDK: eight tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
   const api = await fixture((_request, response) => response.end('unexpected'));
   let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
@@ -655,6 +661,7 @@ test('IC10/C15 SOURCE SDK: seven tools expose strict schemas, paid annotations, 
       'create_indexing_task',
       'create_index_check',
       'create_backlink_check',
+      'plan_retry',
     ]);
     await verifyUnconfiguredReads(session.client);
     const checker = tools[5]!;
