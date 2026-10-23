@@ -1,5 +1,5 @@
-import { writeSync } from 'node:fs';
-import { join } from 'node:path';
+import { appendFileSync, lstatSync, readFileSync, writeSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import type {
   DispatchCapability,
   PrepareIntentInput,
@@ -10,6 +10,7 @@ import type {
 function denyNetwork(): never {
   throw new Error('Retry child network access is forbidden.');
 }
+const nativeFetch = globalThis.fetch;
 globalThis.fetch = Object.assign(denyNetwork, { preconnect: denyNetwork });
 
 interface Setup {
@@ -30,6 +31,16 @@ interface Setup {
   pauseAt?: RetryLedgerPhase;
   verifiedUrls?: string[];
   clockAfterWait?: 'expiry' | 'utc';
+}
+interface ProductionSetup {
+  role: 'production_lock_wait';
+  stateDirectory: string;
+  production: {
+    origin: string;
+    boundary: 'expiry' | 'utc' | 'cancel';
+    inspectOnly?: boolean;
+    journal?: { nonce: string; path: string; parentPid: number };
+  };
 }
 function send(message: object, fd = 1) {
   const bytes = Buffer.from(JSON.stringify(message) + '\n');
@@ -65,10 +76,299 @@ function stop(phase: RetryLedgerPhase | 'locked' | 'claim_committed') {
   send({ event: 'phase', phase });
   process.kill(process.pid, 'SIGSTOP'); // Synchronous barrier; parent only kills/reaps this PID.
 }
+async function productionMain(config: ProductionSetup) {
+  const origin = new URL(config.production.origin);
+  if (
+    Object.keys(process.env).some((key) => key !== 'HOME') ||
+    origin.protocol !== 'http:' ||
+    origin.hostname !== '127.0.0.1' ||
+    !origin.port ||
+    origin.href !== origin.origin + '/' ||
+    !['expiry', 'utc', 'cancel'].includes(config.production.boundary)
+  )
+    throw new Error('Invalid production child setup.');
+  const journal = config.production.journal;
+  if (config.production.boundary === 'cancel') {
+    if (
+      !journal ||
+      Object.keys(journal).sort().join(',') !== 'nonce,parentPid,path' ||
+      !/^p1c09-[a-f0-9-]{36}$/.test(journal.nonce) ||
+      journal.path !==
+        join(resolve(process.env.HOME!, '..'), 'p1c-native-phases.jsonl') ||
+      !Number.isSafeInteger(journal.parentPid) ||
+      journal.parentPid < 1
+    )
+      throw new Error('Invalid production child journal.');
+    const info = lstatSync(journal.path);
+    if (
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      info.nlink !== 1 ||
+      info.uid !== process.getuid?.() ||
+      (info.mode & 0o777) !== 0o600 ||
+      info.size !== 0
+    )
+      throw new Error('Invalid production child journal file.');
+  } else if (journal) throw new Error('Unexpected production child journal.');
+  const record = (phase: string, attempt: 0 | 1 | 2) => {
+    if (!journal) return;
+    const line =
+      JSON.stringify([
+        'p1c09-native-phase-v1',
+        journal.nonce,
+        'child',
+        phase,
+        attempt,
+        process.pid,
+      ]) + '\n';
+    if (
+      Buffer.byteLength(line) > 256 ||
+      lstatSync(journal.path).size > 4096 - Buffer.byteLength(line)
+    )
+      throw new Error('Production child journal bound.');
+    appendFileSync(journal.path, line, 'utf8');
+    const bytes = readFileSync(journal.path);
+    const text = bytes.toString('utf8');
+    if (
+      bytes.length > 4096 ||
+      !Buffer.from(text).equals(bytes) ||
+      !text.endsWith('\n') ||
+      !text.includes(line) ||
+      text.indexOf(line) !== text.lastIndexOf(line)
+    )
+      throw new Error('Production child journal readback failed.');
+  };
+  const { Database, constants, SQLiteError } = await import('bun:sqlite');
+  const {
+    composeVerifiedRetryAdmission,
+    RetryLedgerError,
+    SubmissionLedgerError,
+  } = await import('../../src/submission-ledger');
+  const { fixtureRetryConfiguration, retryFixtureKey, retryFixtureUtc } =
+    await import('./retry-verifier');
+  const handles: { close(): void }[] = [];
+  const failures: unknown[] = [];
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const nativeAborted = Object.getOwnPropertyDescriptor(
+    AbortSignal.prototype,
+    'aborted',
+  )!.get!;
+  let result: object | undefined;
+  try {
+    const configuration = fixtureRetryConfiguration(
+      join(process.env.HOME!, 'synthetic-production-policy.json'),
+      config.stateDirectory,
+    );
+    // Default network denial is installed before this narrowly bound transport exists.
+    const guardedFetch = Object.assign(
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        const list = /^\/v2\/task\/(google|yandex)\/indexer\/list\/0$/.exec(
+          url.pathname,
+        );
+        const read = /^\/v2\/task\/yandex\/indexer\/(status|report)$/.exec(
+          url.pathname,
+        );
+        const headers = new Headers(init?.headers);
+        const body = String(init?.body ?? '');
+        const expectedBody = read
+          ? read[1] === 'report'
+            ? '{"task_id":"production-parent"}'
+            : '{"task_ids":["production-parent"]}'
+          : '';
+        const expectedHeaders = list
+          ? ['accept', 'authorization', 'user-agent']
+          : ['accept', 'authorization', 'content-type', 'user-agent'];
+        if (
+          url.origin !== 'https://api.speedyindex.com' ||
+          url.username + url.password + url.hash !== '' ||
+          (!list && !read) ||
+          !(
+            url.search === '' ||
+            (list?.[1] === 'google' && url.search === '?filter=drip_feed')
+          ) ||
+          init?.method !== (list ? 'GET' : 'POST') ||
+          init?.redirect !== 'error' ||
+          headers.get('authorization') !== retryFixtureKey ||
+          headers.get('accept') !== 'application/json' ||
+          headers.get('user-agent') !== 'speedyindex-mcp/0.1.0' ||
+          JSON.stringify([...headers.keys()].sort()) !==
+            JSON.stringify(expectedHeaders) ||
+          (read && headers.get('content-type') !== 'application/json') ||
+          body !== expectedBody
+        )
+          throw new Error('Production child wire guard.');
+        return nativeFetch(new URL(url.pathname + url.search, origin), init);
+      },
+      { preconnect: denyNetwork },
+    ) as typeof fetch;
+    const nativeOrigin = performance.now();
+    let firstMono: number | undefined;
+    let dayOffset = 0;
+    const mono = () => {
+      const value = 100 + performance.now() - nativeOrigin;
+      firstMono ??= value;
+      return value;
+    };
+    const horizonMs = config.production.boundary === 'expiry' ? 1000 : 60000;
+    const composition = composeVerifiedRetryAdmission({
+      configuration,
+      transport: { fetch: guardedFetch },
+      clock: { utcMs: () => retryFixtureUtc + dayOffset, monotonicMs: mono },
+      owner: { limits: { horizonMs } },
+    });
+    const candidate = await composition.collectLatest(
+      { searchEngine: 'yandex' },
+      'production-child-' + config.production.boundary,
+      signal,
+    );
+    if (!('kind' in candidate))
+      throw new Error('Production child collection failed.');
+    record('collected', 0);
+    send({
+      event: 'phase',
+      phase: 'collected',
+      clock: [firstMono, mono(), horizonMs],
+    });
+    const writer = composition.open();
+    handles.push(writer);
+    const probe = new Database(
+      join(config.stateDirectory, 'ledger.sqlite'),
+      constants.SQLITE_OPEN_READWRITE | constants.SQLITE_OPEN_NOFOLLOW,
+    );
+    handles.push({ close: () => probe.close(true) });
+    probe.run('PRAGMA busy_timeout = 0');
+    const witnessLock = () => {
+      try {
+        probe.run('BEGIN IMMEDIATE');
+        probe.run('ROLLBACK');
+      } catch (error) {
+        if (
+          error instanceof SQLiteError &&
+          error.code?.startsWith('SQLITE_BUSY')
+        )
+          return error.code;
+        throw error;
+      }
+      throw new Error('Expected actual native writer lock.');
+    };
+    let enteringAdmission = false;
+    Object.defineProperty(signal, 'aborted', {
+      configurable: true,
+      get() {
+        const actual = nativeAborted.call(signal) as boolean;
+        if (enteringAdmission) {
+          enteringAdmission = false;
+          // This native signal read occurs inside the real acquired writer transaction.
+          const nativeCode = witnessLock();
+          record('actual_admission_lock_witness', 2);
+          send({
+            event: 'phase',
+            phase: 'admission_locked',
+            nativeCode,
+          });
+        }
+        return actual;
+      },
+    });
+    send({ event: 'ready' });
+    await control('GO');
+    if (config.production.inspectOnly) {
+      result = { event: 'result', kind: 'collected', capability: false };
+    } else {
+      send({
+        event: 'phase',
+        phase: 'parent_locked',
+        nativeCode: witnessLock(),
+      });
+      const aborting =
+        config.production.boundary === 'cancel'
+          ? control('ABORT').then(() => {
+              controller.abort();
+              record('child_abort_observed', 1);
+              send({
+                event: 'phase',
+                phase: 'abort_observed',
+                nativeEpochMs: performance.timeOrigin + performance.now(),
+              });
+            })
+          : undefined;
+      void aborting?.catch(() => {});
+      record('first_attempt', 1);
+      send({
+        event: 'phase',
+        phase: 'prepare_attempt',
+        nativeEpochMs: performance.timeOrigin + performance.now(),
+      });
+      try {
+        writer.prepareVerifiedRetryIntent(candidate.input, candidate.proof);
+        throw new Error('Expected first failed native BEGIN.');
+      } catch (error) {
+        if (
+          !(error instanceof SubmissionLedgerError) ||
+          error.code !== 'LedgerBusy'
+        )
+          throw error;
+      }
+      record('first_begin_busy_returned', 1);
+      send({
+        event: 'phase',
+        phase: 'lock_waited',
+        nativeEpochMs: performance.timeOrigin + performance.now(),
+      });
+      await aborting; // Failed BEGIN owns no transaction. This is a real stdin/I/O opportunity.
+      await control('RETRY');
+      if (config.production.boundary === 'utc') dayOffset = 86400000;
+      enteringAdmission = true;
+      record('second_attempt', 2);
+      send({ event: 'phase', phase: 'prepare_attempt' });
+      try {
+        const prepared = writer.prepareVerifiedRetryIntent(
+          candidate.input,
+          candidate.proof,
+        );
+        result = {
+          event: 'result',
+          kind: prepared.kind,
+          capability: prepared.kind === 'created',
+        };
+      } catch (error) {
+        if (
+          !(error instanceof RetryLedgerError) &&
+          !(error instanceof SubmissionLedgerError)
+        )
+          throw error;
+        result = {
+          event: 'result',
+          kind: 'error',
+          code: error.code,
+          capability: false,
+        };
+        if (error.code === 'RetryCancelled') record('RetryCancelled', 2);
+      }
+    }
+  } catch (error) {
+    failures.push(error);
+  } finally {
+    Reflect.deleteProperty(signal, 'aborted');
+    for (const handle of handles.reverse()) {
+      try {
+        handle.close();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+  }
+  if (failures.length || !result)
+    throw new Error('Production child or close failed.');
+  send(result);
+}
 async function main() {
   const first = await lines.next();
   if (first.done) throw new Error('Missing child setup.');
-  const config = JSON.parse(first.value) as Setup;
+  const config = JSON.parse(first.value) as Setup | ProductionSetup;
+  if (config.role === 'production_lock_wait') return productionMain(config);
   if (
     ![
       'verified',

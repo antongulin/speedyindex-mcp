@@ -47,6 +47,7 @@ import {
 } from '../src/submission-policy';
 import {
   initializeLedger,
+  initializeLedgerV2,
   openLedger,
   type IntentState,
   type PrepareIntentInput,
@@ -726,7 +727,7 @@ async function makeHarness() {
       fences.push(fence);
       return fence;
     },
-    async close() {
+    async close(preserveRoot = false) {
       const errors: unknown[] = [];
       for (const release of locks) {
         try {
@@ -802,7 +803,7 @@ async function makeHarness() {
       }
       allowedOrigins.delete(api.origin);
       errors.push(...handlerErrors);
-      if (settled && errors.length === 0) {
+      if (!preserveRoot && settled && errors.length === 0) {
         try {
           rmSync(root, { recursive: true, force: true });
         } catch (error) {
@@ -4937,3 +4938,144 @@ test('BC06 SOURCE SDK: current caller ACK accepts backlink once; next-day contro
     );
   });
 }, 30_000);
+
+test('P1C-03 actual paid index-check pending HTTP excludes planner while preview and exact replay precede guard', async () => {
+  const h = await makeHarness();
+  let passed = false,
+    settled = false;
+  try {
+    initializeLedgerV2({ stateDirectory: h.stateDirectory }).close();
+    const config = h.config({
+      allowIndexChecks: true,
+      indexCheckReservations: { google: { tokens: 3, indexer: 0, checker: 0 } },
+      retry: {
+        enabled: true,
+        allowUnattributedParents: true,
+        maxAttemptsPerSource: 3,
+      },
+    });
+    const fence = h.fence();
+    h.handler = async (record, response) => {
+      if (record.method === 'GET') {
+        response.end(
+          JSON.stringify({ code: 0, page: 0, last_page: 0, result: [] }),
+        );
+        return;
+      }
+      expect(record.path).toBe('/v2/task/google/checker/create');
+      expect(record.method).toBe('POST');
+      expect(record.auth).toBe(key);
+      expect(record.body).toBe(
+        '{"urls":["https://example.test/reverse-check"]}',
+      );
+      await fence.promise;
+      response.end(
+        JSON.stringify({
+          code: 0,
+          task_id: 'reverse-check-job',
+          type: 'google/checker',
+        }),
+      );
+    };
+    const phases: string[] = [];
+    const readAndCreate = Object.assign(
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        const target = new URL(String(input));
+        if (init?.method !== 'GET') {
+          expect(target.origin).toBe('https://api.speedyindex.com');
+          expect(target.pathname + target.search + target.hash).toBe(
+            '/v2/task/google/checker/create',
+          );
+          expect(init?.method).toBe('POST');
+          expect(init?.redirect).toBe('error');
+          expect(new Headers(init?.headers).get('authorization')).toBe(key);
+          expect(init?.body).toBe(
+            '{"urls":["https://example.test/reverse-check"]}',
+          );
+          return h.fetchRequest(input, init);
+        }
+        expect(target.origin).toBe('https://api.speedyindex.com');
+        expect(target.username + target.password + target.hash).toBe('');
+        expect([
+          '/v2/task/google/indexer/list/0',
+          '/v2/task/yandex/indexer/list/0',
+        ]).toContain(target.pathname);
+        expect(
+          target.search === '' ||
+            (target.pathname.includes('/google/') &&
+              target.search === '?filter=drip_feed'),
+        ).toBe(true);
+        expect(init.redirect).toBe('error');
+        expect(init.body).toBeUndefined();
+        expect(new Headers(init.headers).get('authorization')).toBe(key);
+        return guardedFetch(
+          new URL(target.pathname + target.search, h.api.origin),
+          init,
+        );
+      },
+      {
+        preconnect() {
+          throw new Error('Unexpected preconnect');
+        },
+      },
+    ) as typeof fetch;
+    const host = h.host(config, {
+      fetchRequest: readAndCreate,
+      retry: {
+        hooks: {
+          onOwnerPhase(phase) {
+            phases.push(phase);
+          },
+        },
+      },
+    });
+    const input = {
+      mode: 'submit',
+      searchEngine: 'google',
+      requestId: 'reverse-check',
+      urls: ['https://example.test/reverse-check'],
+    };
+    const operation = h.check(host, input);
+    await bounded(h.received.promise);
+    const before = h.rows('SELECT * FROM intents ORDER BY request_id');
+    expect(await host.planRetry({})).toEqual({
+      status: 'error',
+      code: 'SubmissionBusy',
+    });
+    expect(phases).toEqual([]);
+    expect(
+      await h.check(host, {
+        mode: 'preview',
+        searchEngine: 'google',
+        urls: input.urls,
+      }),
+    ).toMatchObject({ status: 'preview' });
+    expect(await h.check(host, input)).toMatchObject({
+      status: 'dispatching',
+      replayed: true,
+    });
+    expect(h.rows('SELECT * FROM intents ORDER BY request_id')).toEqual(before);
+    expect(h.records).toHaveLength(1);
+    expect(h.attempts).toBe(1);
+    fence.resolve();
+    expect((await operation).status).toBe('accepted');
+    expect(await host.planRetry({})).toEqual({ status: 'no_source' });
+    expect(phases).toContain('before_initial_read');
+    expect(h.records).toHaveLength(7);
+    passed = true;
+  } finally {
+    try {
+      await h.close(true);
+      settled = true;
+    } finally {
+      writeFileSync(join(h.root, 'p1c-wires.json'), JSON.stringify(h.records));
+      writeFileSync(
+        join(h.root, 'p1c-resource-status.json'),
+        JSON.stringify({ passed, settled, pid: process.pid }),
+      );
+      console.error(
+        'P1C_FIXTURE ' + JSON.stringify({ root: h.root, passed, settled }),
+      );
+    }
+  }
+});

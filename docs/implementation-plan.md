@@ -29,7 +29,7 @@ Standalone create uses immutable policy snapshots, UTC reservation periods, loca
 
 ## Planned retry workflow
 
-The internal observation and comparison slice below is implemented. The public workflow and production proof composition remain unimplemented and inactive. The current `get_task_report` tool returns validated provider fields but does not establish report completeness or fresh indexing truth; the internal core adds finality and completeness checks above that public read contract. The intended behavior is:
+The internal observation/comparison core and production owner composition are implemented. Public retry tools and the one-shot workflow remain unimplemented and inactive. The current `get_task_report` tool returns validated provider fields but does not establish report completeness or fresh indexing truth; the internal core adds finality and completeness checks above that public read contract. The intended behavior is:
 
 - Select only the latest completed Pay-Per-Result indexing source. Take candidates only from its final unindexed report; `processed == size` alone does not establish completion or a final report.
 - Deduplicate exact URL strings, preserving query strings and trailing-slash semantics. Exclude any URL already present in any active regular or drip task, and never treat the workflow's own retry child as a new source.
@@ -43,7 +43,7 @@ The internal observation and comparison slice below is implemented. The public w
 
 Robin review automation is installed on the default branch. Substantive changes require a real review of their exact head plus CI and delivery verification. The workflow excludes `synchronize`; later pushes need an authorized manual review within the task budget. Fork PR events lack repository secrets and need an authorized maintainer command through the default-branch workflow. Deployment, scheduling, and releases remain outside this foundation.
 
-The separate internal verified-storage prerequisite now composes immutable trusted configuration, verifier and clocks with opaque per-composition proofs. Synthetic verifier fixtures prove real external child insertion without a parent row, replay-first behavior, locked freshness/count/cap/overlap gates and representative native races. The same boundary still needs its production same-key latest-source/two-pass HTTP verifier before public planning or submission. Pure public-safe identity is available independently of proof collection; public semantic replay validation remains a later feature gate. The storage prerequisite and internal collector do not supply their production proof/reader/guard assembly, shared paid host guard or one-shot integration. See [architecture](architecture.md).
+The internal verified-storage composition retains its parent-first controlled verifier constructor and now also supports production same-key latest-source/two-pass HTTP collection. The actual host guard covers planning and all three create strategies. One original pre-SQL horizon and initial UTC day enclose final readers, identity/serialization, private proof sealing and awaited native settlement/close. Real SQLite/native cases cover local/external proof consumption after measured no-write collection, revision/count/cap refusals, original-context contention and cleanup poison with preview/replay retained. Pure comparison identity grants no authority; public semantic replay validation and retry dispatch remain separate feature gates. See [architecture](architecture.md).
 
 ## Internal read-budget foundation (P1A)
 
@@ -55,8 +55,8 @@ The internal collector and pure core now cover complete same-key three-stream/tw
 
 The remaining planner gates stay open:
 
-- P1C/PR10/PR11: configured production ownership with the same initial/final readers, one original horizon, actual collection/writer exclusion through awaited close, fresh SQL/CPU/UTC checks and sealed proof assembly. Require genuine production-composed local and external ready/proof/no-write journeys.
+- P1C/PR10/PR11: production ownership and native cases are implemented internally. Exact-head review, pinned-runtime CI and delivery acceptance remain required before closing the composed verifier/deadline gate.
 - P2/PR01/PR08/PR09/PR12: strict public error/no_source/blocked/ready and identity variants, application validation including `isError`, the entire text-plus-structured 2 MiB bound and eighth-tool source/built journeys with existing seven-tool regressions.
-- SR-D01..03: later public identity tamper/replay-before-read validation, shared paid guard, one owner dispatch/outcome and deterministic one-shot execution.
+- SR-D01..03: later public identity tamper/replay-before-read validation, retry submission through the shared paid guard, one owner dispatch/outcome and deterministic one-shot execution.
 
-The internal proposal and comparison are not production ready or proof authority. P1B does not close these later gates, register a tool or activate a workflow.
+Proposal/comparison data alone supplies no proof authority. The internal production owner adds private admission evidence without registering a tool or activating a public workflow; it does not close P2, SR or exact-head delivery gates.
