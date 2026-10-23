@@ -15,7 +15,121 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { bounded, fixture } from './helpers';
+
+test('P2-08 preload rejects extra, duplicate, PPR and other-route queries before receiver arrival', async () => {
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), 'speedyindex-p2-query-')),
+  );
+  const api = await fixture((_request, response) =>
+    response.end('unexpected arrival'),
+  );
+  const children: ReturnType<typeof Bun.spawn>[] = [];
+  const reads: Promise<unknown>[] = [];
+  const results: unknown[] = [];
+  const errors: unknown[] = [],
+    cleanup: unknown[] = [];
+  try {
+    for (const suffix of [
+      '/v2/task/google/indexer/list/0?filter=drip_feed&extra=1',
+      '/v2/task/google/indexer/list/0?filter=drip_feed&filter=drip_feed',
+      '/v2/task/google/indexer/list/0?filter=drip_feed&subfilter=pay_per_indexed',
+      '/v2/task/yandex/indexer/list/0?filter=drip_feed',
+    ]) {
+      const script =
+        'try { await fetch(' +
+        JSON.stringify('https://api.speedyindex.com' + suffix) +
+        ', { redirect: "error" }); console.log(JSON.stringify({rejected:false})); process.exitCode=2; }' +
+        ' catch(error) { if (!(error instanceof Error) || error.message !== "Unexpected production URL") throw error;' +
+        ' console.log(JSON.stringify({rejected:true})); }';
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          '--no-env-file',
+          '--preload',
+          './tests/fixtures/redirect-fetch.ts',
+          '--eval',
+          script,
+        ],
+        {
+          cwd: process.cwd(),
+          env: { HOME: root, TEST_ACCOUNT_ORIGIN: api.origin },
+          stdin: 'ignore',
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      );
+      children.push(child);
+      const reading = Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      reads.push(reading);
+      const [code, stdout, stderr] = await bounded(reading, 5000);
+      results.push({ suffix, code, stdout, stderr });
+      expect(code).toBe(0);
+      expect(JSON.parse(stdout)).toEqual({ rejected: true });
+      expect(stderr).toBe('Test network isolation violation.\n');
+      expect(api.requests).toEqual([]);
+    }
+  } catch (error) {
+    errors.push(error);
+  } finally {
+    const stopped = await Promise.allSettled(
+      children.map(async (child) => {
+        if (child.exitCode === null && child.signalCode === null)
+          child.kill('SIGKILL');
+        await bounded(child.exited, 5000);
+      }),
+    );
+    for (const item of stopped)
+      if (item.status === 'rejected') cleanup.push(item.reason);
+    const settled = await Promise.allSettled(reads);
+    for (const item of settled)
+      if (item.status === 'rejected') cleanup.push(item.reason);
+    try {
+      await api.close();
+    } catch (error) {
+      cleanup.push(error);
+    }
+  }
+  const result = {
+    root,
+    results,
+    requests: api.requests,
+    passed: errors.length === 0 && cleanup.length === 0,
+    settled: cleanup.length === 0,
+    children: children.map((child) => ({
+      pid: child.pid,
+      code: child.exitCode,
+      signal: child.signalCode,
+    })),
+    errors: [...errors, ...cleanup].map((error) => String(error)),
+  };
+  writeFileSync(
+    join(root, 'query-guard.json'),
+    JSON.stringify(result, null, 2) + '\n',
+    {
+      mode: 0o600,
+      flag: 'wx',
+    },
+  );
+  console.error(
+    'P2_QUERY_FIXTURE ' +
+      JSON.stringify({
+        root,
+        passed: result.passed,
+        settled: result.settled,
+      }),
+  );
+  if (errors.length || cleanup.length)
+    throw new AggregateError(
+      [...errors, ...cleanup],
+      'Query guard failed; preserving ' + root,
+    );
+});
 
 for (const arg of ['--help', '--version', '--unsupported']) {
   test(`F08: ${arg} needs no credentials/network, respects stdout/stderr`, async () => {
@@ -36,6 +150,7 @@ for (const arg of ['--help', '--version', '--unsupported']) {
             'get_task_status',
             'get_task_report',
             'create_indexing_task',
+            'plan_retry',
           ])
             expect(stdout).toContain(tool);
       }

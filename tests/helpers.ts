@@ -161,6 +161,7 @@ export function loopbackFetch(origin: string): typeof fetch {
 export interface ConnectionOptions {
   args?: string[];
   environment?: Record<string, string>;
+  onStdout?: (chunk: Uint8Array) => void;
   onStderr?: (chunk: string) => void;
   register?: (close: () => Promise<void>) => void;
 }
@@ -212,6 +213,7 @@ export async function connectOwnedStdio(
           while (true) {
             const chunk = await output.read();
             if (chunk.done) break;
+            options.onStdout?.(chunk.value);
             buffer.append(Buffer.from(chunk.value));
             let message = buffer.readMessage();
             while (message !== null) {
