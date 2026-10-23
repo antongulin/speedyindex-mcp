@@ -55,6 +55,12 @@ import {
 } from './submission-ledger';
 
 import { parseRetryPlanInput } from './plan-retry';
+import {
+  lowerPlanRetryResultByteLimit,
+  planRetryToolResult,
+  retryPlanResultFromView,
+  type PlanRetryToolResult,
+} from './plan-retry-result';
 import { freezeSnapshot } from './retry-ledger-snapshot';
 
 type PublicError = SubmissionError<CreateIndexCheckErrorCode>;
@@ -390,6 +396,7 @@ export class SubmissionHost {
   private readonly timeoutMs: number;
   private readonly configuration: SubmissionConfiguration;
   private readonly retry: Readonly<ProductionRetryComposition> | undefined;
+  private readonly publicResultBytes: number;
 
   constructor(
     configuration: SubmissionConfiguration = loadSubmissionConfiguration(),
@@ -400,6 +407,9 @@ export class SubmissionHost {
     this.clock = options.clock?.bind(options) ?? Date.now;
     this.open = options.openLedger?.bind(options) ?? openLedger;
     this.timeoutMs = options.timeoutMs ?? 10_000;
+    this.publicResultBytes = lowerPlanRetryResultByteLimit(
+      options.retry?.publicResultBytes,
+    );
     if (
       !Number.isSafeInteger(this.timeoutMs) ||
       this.timeoutMs < 1 ||
@@ -424,7 +434,10 @@ export class SubmissionHost {
               options.retry?.monotonicMs?.bind(options.retry) ??
               performance.now.bind(performance),
           },
-          ...(options.retry ? { owner: options.retry } : {}),
+          owner: {
+            ...options.retry,
+            publicResultBytes: this.publicResultBytes,
+          },
         });
       } catch {
         // Invalid retry wiring blocks planning, without breaking pure previews.
@@ -438,39 +451,80 @@ export class SubmissionHost {
     value: unknown,
     signal?: AbortSignal,
   ): Promise<RetryPlanView> {
+    return this.planRetryOwned(value, signal, 'view');
+  }
+
+  async planRetryToolResult(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<PlanRetryToolResult> {
+    return this.planRetryOwned(value, signal, 'public');
+  }
+
+  private planRetryOwned(
+    value: unknown,
+    signal: AbortSignal | undefined,
+    output: 'view',
+  ): Promise<RetryPlanView>;
+  private planRetryOwned(
+    value: unknown,
+    signal: AbortSignal | undefined,
+    output: 'public',
+  ): Promise<PlanRetryToolResult>;
+  private async planRetryOwned(
+    value: unknown,
+    signal: AbortSignal | undefined,
+    output: 'view' | 'public',
+  ): Promise<RetryPlanView | PlanRetryToolResult> {
+    let engine: 'google' | 'yandex' = 'google';
+    const early = (view: RetryPlanView) =>
+      output === 'public'
+        ? planRetryToolResult(retryPlanResultFromView(engine, view), {
+            maxBytes: this.publicResultBytes,
+          })
+        : view;
     let args: ReturnType<typeof parseRetryPlanInput>;
     try {
       args = parseRetryPlanInput(value);
+      engine = args.searchEngine;
     } catch {
-      return Object.freeze({ status: 'error', code: 'InvalidInput' });
+      return early(Object.freeze({ status: 'error', code: 'InvalidInput' }));
     }
     if (signal?.aborted)
-      return Object.freeze({ status: 'error', code: 'Cancelled' });
+      return early(Object.freeze({ status: 'error', code: 'Cancelled' }));
     const config = this.configuration;
     if (config.state !== 'configured')
-      return freezeSnapshot({
-        status: 'blocked',
-        blockers: ['StateUnavailable'],
-      });
+      return early(
+        freezeSnapshot({
+          status: 'blocked',
+          blockers: ['StateUnavailable'],
+        }),
+      );
     if (!config.snapshot.policy.enabled)
-      return freezeSnapshot({
-        status: 'blocked',
-        blockers: ['WritesDisabled'],
-      });
+      return early(
+        freezeSnapshot({
+          status: 'blocked',
+          blockers: ['WritesDisabled'],
+        }),
+      );
     if (!config.snapshot.policy.retry?.enabled)
-      return freezeSnapshot({
-        status: 'blocked',
-        blockers: ['RetryPolicyRequired'],
-      });
+      return early(
+        freezeSnapshot({
+          status: 'blocked',
+          blockers: ['RetryPolicyRequired'],
+        }),
+      );
     if (this.busy)
-      return Object.freeze({ status: 'error', code: 'SubmissionBusy' });
+      return early(Object.freeze({ status: 'error', code: 'SubmissionBusy' }));
     if (!this.retry || !this.retry.isNewWorkAvailable())
-      return Object.freeze({ status: 'error', code: 'InternalError' });
+      return early(Object.freeze({ status: 'error', code: 'InternalError' }));
     this.busy = true;
     try {
-      return await this.retry.planLatest(args, signal);
+      return output === 'public'
+        ? await this.retry.planLatestToolResult(args, signal)
+        : await this.retry.planLatest(args, signal);
     } catch {
-      return Object.freeze({ status: 'error', code: 'InternalError' });
+      return early(Object.freeze({ status: 'error', code: 'InternalError' }));
     } finally {
       this.busy = false;
     }

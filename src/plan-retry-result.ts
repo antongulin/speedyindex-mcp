@@ -524,13 +524,10 @@ function createFallbacks() {
 function fixedFallbacks() {
   return (cachedFallbacks ??= createFallbacks());
 }
-/** Trusted lower-only construction seam. Measure the actual duplicated application envelope. */
-export function planRetryToolResult(
-  value: unknown,
-  construction: { maxBytes?: number } = {},
-): PlanRetryToolResult {
+/** Capture the unchanged lower-only limit once in a trusted owner constructor. */
+export function lowerPlanRetryResultByteLimit(lower?: number): number {
   const fallbacks = fixedFallbacks();
-  const maxBytes = construction.maxBytes ?? productionBytes;
+  const maxBytes = lower ?? productionBytes;
   if (
     !Number.isSafeInteger(maxBytes) ||
     maxBytes > productionBytes ||
@@ -541,6 +538,15 @@ export function planRetryToolResult(
       )
   )
     throw new RangeError('Invalid retry-plan result limit.');
+  return maxBytes;
+}
+/** Trusted lower-only construction seam. Measure the actual duplicated application envelope. */
+export function planRetryToolResult(
+  value: unknown,
+  construction: { maxBytes?: number } = {},
+): PlanRetryToolResult {
+  const fallbacks = fixedFallbacks();
+  const maxBytes = lowerPlanRetryResultByteLimit(construction.maxBytes);
   try {
     const parsed = planRetryResultSchema.safeParse(value);
     if (!parsed.success) return fallbacks.InternalError.result;

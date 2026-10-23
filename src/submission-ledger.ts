@@ -44,6 +44,12 @@ import {
   type RetryCollectorLimits,
 } from './retry-observation';
 import {
+  lowerPlanRetryResultByteLimit,
+  planRetryToolResult,
+  retryPlanResultFromView,
+  type PlanRetryToolResult,
+} from './plan-retry-result';
+import {
   providerTaskIdSchema,
   submittedUrlSchema,
   titleSchema,
@@ -281,6 +287,7 @@ export interface RetryOwnerOptions {
   >['limits'];
   readonly collectorLimits?: RetryCollectorLimits;
   readonly combinedBytes?: number;
+  readonly publicResultBytes?: number;
   readonly hooks?: Readonly<{ onOwnerPhase(phase: RetryOwnerPhase): void }>;
 }
 export interface TrustedRetryProductionDependencies {
@@ -330,6 +337,10 @@ export interface ProductionRetryComposition {
     signal?: AbortSignal,
   ): Promise<RetryLatestCollection>;
   planLatest(input: unknown, signal?: AbortSignal): Promise<RetryPlanView>;
+  planLatestToolResult(
+    input: unknown,
+    signal?: AbortSignal,
+  ): Promise<PlanRetryToolResult>;
   isNewWorkAvailable(): boolean;
   open(): VerifiedRetryLedger;
 }
@@ -762,6 +773,9 @@ export function composeVerifiedRetryAdmission(
     'combinedBytes',
     owner?.combinedBytes,
   );
+  const publicResultBytes = lowerPlanRetryResultByteLimit(
+    owner?.publicResultBytes,
+  );
   const nativeArm = globalThis.setTimeout.bind(globalThis);
   const nativeDisarm = globalThis.clearTimeout.bind(globalThis);
   const immediate = globalThis.setImmediate.bind(globalThis);
@@ -943,37 +957,102 @@ export function composeVerifiedRetryAdmission(
             : 'StateUnavailable',
       ],
     });
-  const collectLatest = async (
+  const publicResult = (view: RetryPlanView, engine: 'google' | 'yandex') =>
+    planRetryToolResult(retryPlanResultFromView(engine, view), {
+      maxBytes: publicResultBytes,
+    });
+  const publicRepresentations = (
+    view: RetryPlanView,
+    engine: 'google' | 'yandex',
+  ) => {
+    const projection = retryPlanResultFromView(engine, view);
+    const envelope = planRetryToolResult(projection, {
+      maxBytes: publicResultBytes,
+    });
+    return freezeSnapshot({
+      projection,
+      envelope,
+      serialized: JSON.stringify(envelope),
+    });
+  };
+  function collectLatestOwned(
     value: unknown,
     requestId: string,
-    signal?: AbortSignal,
-  ): Promise<RetryLatestCollection> => {
+    signal: AbortSignal | undefined,
+    output: 'candidate',
+  ): Promise<RetryLatestCollection>;
+  function collectLatestOwned(
+    value: unknown,
+    requestId: string,
+    signal: AbortSignal | undefined,
+    output: 'public',
+  ): Promise<PlanRetryToolResult>;
+  async function collectLatestOwned(
+    value: unknown,
+    requestId: string,
+    signal: AbortSignal | undefined,
+    output: 'candidate' | 'public',
+  ): Promise<RetryLatestCollection | PlanRetryToolResult> {
+    const early = (
+      view: Exclude<RetryPlanView, RetryPlanReady>,
+      engine: 'google' | 'yandex' = 'google',
+    ) => (output === 'public' ? publicResult(view, engine) : view);
     let args: ReturnType<typeof parseRetryPlanInput>;
     try {
       args = parseRetryPlanInput(value);
       validateRequestId(requestId);
     } catch {
-      return Object.freeze({ status: 'error', code: 'InvalidInput' });
+      return early(Object.freeze({ status: 'error', code: 'InvalidInput' }));
     }
     if (signal?.aborted)
-      return Object.freeze({ status: 'error', code: 'Cancelled' });
+      return early(Object.freeze({ status: 'error', code: 'Cancelled' }));
     if (!collector)
-      return Object.freeze({ status: 'error', code: 'InternalError' });
+      return early(Object.freeze({ status: 'error', code: 'InternalError' }));
     if (!policy.retry?.enabled)
-      return freezeSnapshot({
-        status: 'blocked',
-        blockers: ['RetryPolicyRequired'],
-      });
+      return early(
+        freezeSnapshot({
+          status: 'blocked',
+          blockers: ['RetryPolicyRequired'],
+        }),
+        args.searchEngine,
+      );
     if (collecting || writerOpen)
-      return Object.freeze({ status: 'error', code: 'SubmissionBusy' });
+      return early(Object.freeze({ status: 'error', code: 'SubmissionBusy' }));
     if (unavailable)
-      return Object.freeze({ status: 'error', code: 'InternalError' });
+      return early(Object.freeze({ status: 'error', code: 'InternalError' }));
     collecting = true;
     let budget: InvocationReadBudget | undefined;
     let horizon: RetryFreshness | undefined;
     let sealed: RetryProof | undefined;
     let firstFailure: Exclude<RetryPlanView, RetryPlanReady> | undefined;
     let result: RetryLatestCollection;
+    let publication: ReturnType<typeof publicRepresentations> | undefined;
+    let publicationFor: RetryLatestCollection | undefined;
+    let publicRetained: unknown[] | undefined =
+      output === 'public' ? [] : undefined;
+    const stagePublic = (
+      view: RetryPlanView,
+    ): Exclude<RetryPlanView, RetryPlanReady> | undefined => {
+      publication = publicRepresentations(view, args.searchEngine);
+      // This contains the independently validated structured copy, JSON text,
+      // projection and serialized envelope, not just the provider body or safe view.
+      if (retryLogicalBytes([publicRetained, publication]) > combinedBytes)
+        throw new ReadBudgetError('ResourceLimitExceeded');
+      const payload = publication.envelope.structuredContent;
+      if (view.status !== 'error' && payload.status === 'error') {
+        const error = payload.error;
+        if (error.code === 'SubmissionBusy')
+          return Object.freeze({ status: 'error', code: error.code });
+        return freezeSnapshot({
+          status: 'error',
+          code: error.code,
+          ...(error.phase === undefined ? {} : { phase: error.phase }),
+          ...('cause' in error && error.cause !== undefined
+            ? { cause: error.cause }
+            : {}),
+        });
+      }
+    };
     const checkpoint = () => {
       budget!.checkpoint();
       return checkTime(horizon!);
@@ -1010,6 +1089,7 @@ export function composeVerifiedRetryAdmission(
       };
       phase('before_initial_read');
       const initial = readRetrySnapshot(options, binding);
+      if (publicRetained) publicRetained = [initial];
       phase('after_initial_read');
       if (initial.availability !== 'available')
         result = snapshotFailure(initial.reason);
@@ -1027,6 +1107,7 @@ export function composeVerifiedRetryAdmission(
           },
           signal,
         );
+        if (publicRetained) publicRetained = [initial, observed];
         if (observed.status !== 'complete')
           firstFailure = freezeSnapshot(observed);
         phase('after_observation');
@@ -1039,6 +1120,7 @@ export function composeVerifiedRetryAdmission(
             policy,
             { combinedBytes },
           );
+          if (publicRetained) publicRetained = [initial, observed, proposed];
           phase('after_assessment');
           if (proposed.status === 'blocked') result = proposed;
           else if (proposed.status === 'no_source') {
@@ -1056,13 +1138,25 @@ export function composeVerifiedRetryAdmission(
                       blockers: ['SnapshotConflict'],
                     })
                   : Object.freeze({ status: 'no_source' });
+            if (publicRetained) {
+              publicRetained = [
+                initial,
+                observed.observations.facts,
+                proposed,
+                final,
+                result,
+              ];
+              const failure = stagePublic(result);
+              if (failure) result = firstFailure = failure;
+            }
             assertRetryCombinedBytes(
               initial,
               observed.observations.facts,
-              [proposed, final, result],
+              [proposed, final, result, ...(publication ? [publication] : [])],
               combinedBytes,
             );
             phase('after_serialization');
+            if (output === 'public') publicationFor = result;
           } else {
             const request = buildCreateIndexingRequest({
               mode: 'submit',
@@ -1181,53 +1275,82 @@ export function composeVerifiedRetryAdmission(
                 authorization: { ...context.authorization, stateChecked: true },
                 identity,
               });
-              // Include the safe view and every retained/copied private serialization.
-              // No caller receives the observations, ledger identity or private intent.
+              const retained = [
+                proposed,
+                final,
+                identity,
+                request,
+                input,
+                privateIdentity,
+                adapted,
+                evidence,
+                source,
+                view,
+              ];
+              if (publicRetained) {
+                publicRetained = [
+                  initial,
+                  observed.observations.facts,
+                  ...retained,
+                ];
+                const failure = stagePublic(view);
+                if (failure) firstFailure = failure;
+              }
+              // The private path retains its original admission cap and tuple.
               assertRetryCombinedBytes(
                 initial,
                 observed.observations.facts,
-                [
-                  proposed,
-                  final,
-                  identity,
-                  request,
-                  input,
-                  privateIdentity,
-                  adapted,
-                  evidence,
-                  source,
-                  view,
-                ],
+                publication ? [...retained, publication] : retained,
                 combinedBytes,
               );
               phase('after_serialization');
-              sealed = Object.freeze({}) as RetryProof;
-              records.set(
-                sealed,
-                Object.freeze({
-                  ledgerId: initial.ledgerId,
+              if (firstFailure) result = firstFailure;
+              else {
+                sealed = Object.freeze({}) as RetryProof;
+                records.set(
+                  sealed,
+                  Object.freeze({
+                    ledgerId: initial.ledgerId,
+                    input,
+                    identity: privateIdentity,
+                    request,
+                    evidence,
+                    source,
+                    ...horizon,
+                  }),
+                );
+                result = Object.freeze({
+                  kind: 'candidate',
                   input,
-                  identity: privateIdentity,
                   request,
-                  evidence,
-                  source,
-                  ...horizon,
-                }),
-              );
-              result = Object.freeze({
-                kind: 'candidate',
-                input,
-                request,
-                proof: sealed,
-                view,
-              });
-              checkpoint();
+                  proof: sealed,
+                  view,
+                });
+                checkpoint();
+              }
+              if (output === 'public') publicationFor = result;
             }
           }
         }
       }
     } catch (error) {
       result = firstFailure ?? latestFailure(error);
+    }
+    // Non-success domain/read results also serialize while this invocation still
+    // owns the budget/guard. Ready and no_source were staged before their phase.
+    if (output === 'public' && publicationFor !== result) {
+      try {
+        if (horizon) checkpoint();
+        const failure = stagePublic('kind' in result ? result.view : result);
+        if (failure) result = firstFailure ?? failure;
+        publicationFor = result;
+        if (horizon) checkpoint();
+      } catch (error) {
+        result = firstFailure ?? latestFailure(error);
+        publicRetained = undefined;
+        publication = publicRepresentations(result, args.searchEngine);
+        publicationFor = result;
+      }
     }
     // Never return from inside the try: cleanup and the post-close original-day
     // fence must be able to invalidate a just-sealed proof and the safe result.
@@ -1264,14 +1387,49 @@ export function composeVerifiedRetryAdmission(
           result = latestFailure(error);
       }
       if (sealed && !('kind' in result)) records.delete(sealed);
+      if (output === 'public') {
+        if ('kind' in result) {
+          const record = records.get(result.proof);
+          records.delete(result.proof);
+          try {
+            if (!record || unavailable)
+              throw new RetryLedgerError('RetryProofInvalid');
+            checkTime({ ...record });
+          } catch (error) {
+            result = latestFailure(error);
+          }
+        }
+        // A changed control result invalidates a cached success. Late failures
+        // get only the small fixed validated/measured envelope; no proof escapes.
+        return publication && publicationFor === result
+          ? publication.envelope
+          : publicResult(
+              'kind' in result ? result.view : result,
+              args.searchEngine,
+            );
+      }
       return result;
     } finally {
-      if (sealed && unavailable) records.delete(sealed);
+      if (sealed && (unavailable || output === 'public'))
+        records.delete(sealed);
       collecting = false;
     }
-  };
+  }
+  const collectLatest = (
+    value: unknown,
+    requestId: string,
+    signal?: AbortSignal,
+  ) => collectLatestOwned(value, requestId, signal, 'candidate');
   return Object.freeze({
     collectLatest,
+    planLatestToolResult(value: unknown, signal?: AbortSignal) {
+      return collectLatestOwned(
+        value,
+        'retry-read-only-inspection',
+        signal,
+        'public',
+      );
+    },
     async planLatest(
       value: unknown,
       signal?: AbortSignal,

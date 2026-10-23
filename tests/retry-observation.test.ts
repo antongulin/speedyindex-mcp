@@ -18,6 +18,11 @@ import type {
   RetryPlanFingerprintInput,
 } from '../src/submission-ledger';
 import {
+  planRetryResultSchema,
+  type PlanRetryResult,
+  type PlanRetryToolResult,
+} from '../src/plan-retry-result';
+import {
   createInvocationReadBudget,
   ReadBudgetError,
   type InvocationReadBudget,
@@ -2582,9 +2587,10 @@ function productionOracle(
   return { body, preimage, planFingerprint, source };
 }
 function expectProductionReady(
-  view: RetryPlanReady,
+  view: RetryPlanReady | Extract<PlanRetryResult, { status: 'ready' }>,
   oracle: ReturnType<typeof productionOracle>,
   config: ConfiguredSubmission,
+  publicOutput = false,
 ) {
   expect(view.source).toEqual(oracle.source);
   expect(view.eligibleUrls).toEqual([A, B]);
@@ -2649,17 +2655,25 @@ function expectProductionReady(
     }
   };
   inspect(view);
-  expect(Object.keys(view).sort()).toEqual([
-    'authorization',
-    'counts',
-    'eligibleUrls',
-    'excluded',
-    'identity',
-    'quote',
-    'request',
-    'source',
-    'status',
-  ]);
+  if (publicOutput)
+    expect(
+      'searchEngine' in view &&
+        view.searchEngine === oracle.preimage.parent.family.split('/')[0],
+    ).toBe(true);
+  expect(Object.keys(view).sort()).toEqual(
+    [
+      'authorization',
+      'counts',
+      'eligibleUrls',
+      'excluded',
+      'identity',
+      'quote',
+      'request',
+      'source',
+      'status',
+      ...(publicOutput ? ['searchEngine'] : []),
+    ].sort(),
+  );
   for (const privateValue of [
     fixtureKey,
     fingerprint,
@@ -4358,3 +4372,520 @@ for (const provenance of ['external', 'migrated_legacy'] as const)
         },
       );
     });
+
+function expectPublicEnvelope(result: PlanRetryToolResult) {
+  expect(
+    planRetryResultSchema.safeParse(result.structuredContent).success,
+  ).toBe(true);
+  expect(result.isError).toBe(result.structuredContent.status === 'error');
+  expect(result.content).toHaveLength(1);
+  expect(result.content[0]!.type).toBe('text');
+  expect(JSON.parse(result.content[0]!.text)).toEqual(result.structuredContent);
+  expect(Buffer.byteLength(JSON.stringify(result), 'utf8')).toBeLessThanOrEqual(
+    2_097_152,
+  );
+  expect(Object.isFrozen(result)).toBe(true);
+  expect(Object.isFrozen(result.structuredContent)).toBe(true);
+  expectSafeFailure(result);
+}
+
+function observePublicSerialization() {
+  const original = JSON.stringify;
+  const observed: { status: string; bytes: number }[] = [];
+  JSON.stringify = ((...args: Parameters<typeof JSON.stringify>) => {
+    const text = Reflect.apply(original, JSON, args) as string;
+    const value: unknown = args[0];
+    if (
+      value &&
+      typeof value === 'object' &&
+      'isError' in value &&
+      'structuredContent' in value &&
+      value.structuredContent &&
+      typeof value.structuredContent === 'object' &&
+      'status' in value.structuredContent
+    )
+      observed.push({
+        status: String(value.structuredContent.status),
+        bytes: Buffer.byteLength(text, 'utf8'),
+      });
+    return text;
+  }) as typeof JSON.stringify;
+  // Exact transparent entry sanity before any owner/native verification.
+  expect(JSON.stringify({ value: 'é"\\' })).toBe(original({ value: 'é"\\' }));
+  expect(observed).toEqual([]);
+  return {
+    observed,
+    restore() {
+      JSON.stringify = original;
+    },
+  };
+}
+
+test('P2-01 direct public host rejects authority/preabort/inactive before state or HTTP and normalizes Google', async () => {
+  await withProductionReceiver(script(singleSource()), async (api) => {
+    const config = fixtureConfiguration(api),
+      clock = new NativeOwnerClock();
+    seedStandalone(config, 'parent', [A, B, C]);
+    const before = p1cProjection(api, config, 'p2-before');
+    let opens = 0,
+      reads = 0,
+      fetches = 0;
+    const options: SubmissionHostOptions = {
+      fetchRequest: Object.assign(
+        () => {
+          fetches++;
+          throw new Error('PRIVATE_UNEXPECTED_FETCH');
+        },
+        {
+          preconnect() {
+            throw new Error('PRIVATE_PRECONNECT');
+          },
+        },
+      ) as typeof fetch,
+      clock: () => clock.wall,
+      openLedger() {
+        opens++;
+        throw new Error('PRIVATE_UNEXPECTED_WRITER');
+      },
+      retry: {
+        monotonicMs: () => clock.mono,
+        runtime: clock,
+        hooks: {
+          onOwnerPhase() {
+            reads++;
+            throw new Error('PRIVATE_UNEXPECTED_STATE');
+          },
+        },
+      },
+    };
+    const host = new SubmissionHost(config, options);
+    const invalid = await host.planRetryToolResult({
+      expectedPlan: { proof: 'PRIVATE_ASSERTED_AUTHORITY' },
+    });
+    expectPublicEnvelope(invalid);
+    expect(invalid.structuredContent).toMatchObject({
+      status: 'error',
+      error: { code: 'InvalidInput' },
+    });
+    const abort = new AbortController();
+    abort.abort();
+    const cancelled = await host.planRetryToolResult({}, abort.signal);
+    expectPublicEnvelope(cancelled);
+    expect(cancelled.structuredContent).toMatchObject({
+      status: 'error',
+      error: { code: 'Cancelled' },
+    });
+    const inactive = await new SubmissionHost(
+      loadSubmissionConfiguration({ apiKey: '' }),
+      options,
+    ).planRetryToolResult({ searchEngine: 'yandex' });
+    expectPublicEnvelope(inactive);
+    expect(inactive.structuredContent).toMatchObject({
+      status: 'blocked',
+      searchEngine: 'yandex',
+      blockers: [{ code: 'StateUnavailable' }],
+    });
+    expect({ opens, reads, fetches }).toEqual({
+      opens: 0,
+      reads: 0,
+      fetches: 0,
+    });
+    expect(api.wires).toEqual([]);
+    expect(p1cProjection(api, config, 'p2-rejected')).toEqual(before);
+    const operation = b1Host(api, config, clock).planRetryToolResult({});
+    api.operations.push(operation);
+    const result = await bounded(operation);
+    expectPublicEnvelope(result);
+    expect(result.structuredContent.status).toBe('ready');
+    if (result.structuredContent.status !== 'ready')
+      throw new Error('Expected real default Google ready.');
+    expectProductionReady(
+      result.structuredContent,
+      productionOracle(config, 'google'),
+      config,
+      true,
+    );
+    expectProductionWires(api, 'google');
+    expect(p1cProjection(api, config, 'p2-unchanged')).toEqual(before);
+    expect(clock.handles.size).toBe(0);
+  });
+});
+
+for (const engine of ['google', 'yandex'] as const)
+  test(`P2-05 actual public owner ${engine} ready preserves independent identity and logical state`, async () => {
+    await withProductionReceiver(script(singleSource(engine)), async (api) => {
+      const config = fixtureConfiguration(api, {
+        retry: {
+          enabled: true,
+          allowUnattributedParents: engine === 'yandex',
+          maxAttemptsPerSource: 3,
+        },
+      });
+      if (engine === 'google') seedStandalone(config, 'parent', [A, B, C]);
+      const before = p1cProjection(api, config, 'p2-before'),
+        oracle = productionOracle(config, engine),
+        clock = new NativeOwnerClock();
+      const operation = b1Host(api, config, clock).planRetryToolResult(
+        engine === 'google' ? {} : { searchEngine: engine },
+      );
+      api.operations.push(operation);
+      const result = await bounded(operation);
+      expectPublicEnvelope(result);
+      if (result.structuredContent.status !== 'ready')
+        throw new Error('Expected actual public owner ready.');
+      expectProductionReady(result.structuredContent, oracle, config, true);
+      expectProductionWires(api, engine);
+      expect(p1cProjection(api, config, 'p2-unchanged')).toEqual(before);
+      expect(localSnapshot(config).retryChildren).toEqual([]);
+      if (engine === 'yandex')
+        expect(localSnapshot(config).acceptedManifests).toEqual([]);
+      expect(clock.handles.size).toBe(0);
+    });
+  });
+
+test('P2-05 immutable constructor output cap rejects real public overflow and leaves private view available', async () => {
+  await withProductionReceiver(script(singleSource('yandex')), async (api) => {
+    const config = fixtureConfiguration(api),
+      clock = new NativeOwnerClock(),
+      before = p1cProjection(api, config, 'p2-before');
+    const baseline = b1Host(api, config, clock).planRetryToolResult({
+      searchEngine: 'yandex',
+    });
+    api.operations.push(baseline);
+    const ready = await bounded(baseline);
+    expect(ready.structuredContent.status).toBe('ready');
+    const n = Buffer.byteLength(JSON.stringify(ready), 'utf8');
+    const options = {
+      monotonicMs: () => clock.mono,
+      runtime: clock,
+      publicResultBytes: n - 1,
+    };
+    const host = new SubmissionHost(config, {
+      fetchRequest: api.fetch,
+      clock: () => clock.wall,
+      retry: options,
+    });
+    options.publicResultBytes = 2_097_152;
+    const overflow = host.planRetryToolResult({ searchEngine: 'yandex' });
+    api.operations.push(overflow);
+    const result = await bounded(overflow);
+    expectPublicEnvelope(result);
+    expect(result.structuredContent).toMatchObject({
+      status: 'error',
+      error: { code: 'ResourceLimitExceeded' },
+    });
+    expect(
+      Buffer.byteLength(JSON.stringify(result), 'utf8'),
+    ).toBeLessThanOrEqual(n - 1);
+    const privateView = host.planRetry({ searchEngine: 'yandex' });
+    api.operations.push(privateView);
+    expect((await bounded(privateView)).status).toBe('ready');
+    const ownerOptions = { runtime: clock, publicResultBytes: n - 1 };
+    const composition = composeVerifiedRetryAdmission({
+      configuration: config,
+      transport: { fetch: api.fetch },
+      clock,
+      owner: ownerOptions,
+    });
+    ownerOptions.publicResultBytes = 2_097_152;
+    const publicCall = composition.planLatestToolResult({
+      searchEngine: 'yandex',
+    });
+    api.operations.push(publicCall);
+    const direct = await bounded(publicCall);
+    expectPublicEnvelope(direct);
+    expect(direct.structuredContent).toMatchObject({
+      status: 'error',
+      error: { code: 'ResourceLimitExceeded' },
+    });
+    const oldView = composition.planLatest({ searchEngine: 'yandex' });
+    api.operations.push(oldView);
+    expect((await bounded(oldView)).status).toBe('ready');
+    expect(
+      () =>
+        new SubmissionHost(config, { retry: { publicResultBytes: 2_097_153 } }),
+    ).toThrow(RangeError);
+    expect(() =>
+      composeVerifiedRetryAdmission({
+        configuration: config,
+        transport: { fetch: api.fetch },
+        clock,
+        owner: { publicResultBytes: 2_097_153 },
+      }),
+    ).toThrow(RangeError);
+    expect(api.wires).toHaveLength(50);
+    expect(p1cProjection(api, config, 'p2-unchanged')).toEqual(before);
+    expect(clock.handles.size).toBe(0);
+    writeFileSync(
+      join(api.root, 'p2-output-cap.json'),
+      JSON.stringify({
+        n,
+        cap: n - 1,
+        publicBytes: Buffer.byteLength(JSON.stringify(result)),
+        wires: api.wires.length,
+      }),
+    );
+  });
+});
+
+test('P2-05 original horizon expires after actual public serialization before publication', async () => {
+  await withProductionReceiver(script(singleSource('yandex')), async (api) => {
+    const config = fixtureConfiguration(api),
+      clock = new NativeOwnerClock(),
+      before = p1cProjection(api, config, 'p2-before'),
+      phases: string[] = [];
+    const observer = observePublicSerialization();
+    try {
+      const host = b1Host(api, config, clock, {
+        hooks: {
+          onOwnerPhase(phase) {
+            phases.push(phase);
+            if (phase === 'after_serialization') {
+              expect(
+                observer.observed.some((item) => item.status === 'ready'),
+              ).toBe(true);
+              clock.mono += 60_000;
+            }
+          },
+        },
+      });
+      const operation = host.planRetryToolResult({ searchEngine: 'yandex' });
+      api.operations.push(operation);
+      const result = await bounded(operation);
+      expectPublicEnvelope(result);
+      expect(result.structuredContent).toMatchObject({
+        status: 'error',
+        error: { code: 'DeadlineExceeded' },
+      });
+      expect(result.structuredContent).not.toHaveProperty('identity');
+      expect(phases.indexOf('after_serialization')).toBeLessThan(
+        phases.indexOf('before_close'),
+      );
+      expect(phases).toContain('after_close');
+      expect(api.wires).toHaveLength(10);
+      expect(clock.handles.size).toBe(0);
+      expect(p1cProjection(api, config, 'p2-unchanged')).toEqual(before);
+      writeFileSync(
+        join(api.root, 'p2-serialization.json'),
+        JSON.stringify({ phases, observed: observer.observed }),
+      );
+    } finally {
+      observer.restore();
+    }
+  });
+});
+
+for (const kind of ['ready', 'no_source'] as const)
+  test(`P2-05 close continuation cancellation invalidates prepared public ${kind}`, async () => {
+    await withProductionReceiver(
+      script(kind === 'ready' ? singleSource('yandex') : {}),
+      async (api) => {
+        const config = fixtureConfiguration(api),
+          clock = new NativeOwnerClock(),
+          controller = new AbortController();
+        const before = p1cProjection(api, config, 'p2-before'),
+          phases: string[] = [],
+          observer = observePublicSerialization();
+        try {
+          const host = b1Host(api, config, clock, {
+            hooks: {
+              onOwnerPhase(phase) {
+                phases.push(phase);
+                if (phase === 'after_serialization')
+                  expect(
+                    observer.observed.some((item) => item.status === kind),
+                  ).toBe(true);
+                if (phase === 'before_close')
+                  queueMicrotask(() => controller.abort());
+              },
+            },
+          });
+          const operation = host.planRetryToolResult(
+            { searchEngine: 'yandex' },
+            controller.signal,
+          );
+          api.operations.push(operation);
+          const result = await bounded(operation);
+          expectPublicEnvelope(result);
+          expect(result.structuredContent).toMatchObject({
+            status: 'error',
+            error: { code: 'Cancelled' },
+          });
+          expect(result.structuredContent).not.toHaveProperty('source');
+          expect(result.structuredContent).not.toHaveProperty('identity');
+          expect(phases).toContain('after_close');
+          expect(api.wires).toHaveLength(kind === 'ready' ? 10 : 6);
+          expect(clock.handles.size).toBe(0);
+          expect(p1cProjection(api, config, 'p2-unchanged')).toEqual(before);
+          writeFileSync(
+            join(api.root, 'p2-close.json'),
+            JSON.stringify({ kind, phases, observed: observer.observed }),
+          );
+        } finally {
+          observer.restore();
+        }
+      },
+    );
+  });
+
+test('P2-05 native pending cancel receipt holds actual shared guard and clean settlement permits public recovery', async () => {
+  const arrived = deferred(),
+    tail = deferred(),
+    entered = deferred(),
+    release = deferred(),
+    nativeClosed = deferred(),
+    pendingRead = deferred();
+  const controller = new AbortController(),
+    signal = trackOwnerSignal(controller.signal),
+    clock = new NativeOwnerClock(),
+    normal = script(singleSource('yandex'));
+  let once = false,
+    decorated = false,
+    done = false,
+    readCalls = 0,
+    closedCount = 0;
+  try {
+    await withProductionReceiver(
+      async (wire, req, res) => {
+        if (!once) {
+          once = true;
+          arrived.resolve();
+          res.writeHead(200);
+          res.write('{"code":0,');
+          await tail.promise;
+          return undefined;
+        }
+        return normal(wire, req, res);
+      },
+      async (api) => {
+        api.releases.push(
+          () => tail.resolve(),
+          () => release.resolve(),
+        );
+        const config = fixtureConfiguration(api),
+          before = p1cProjection(api, config, 'p2-before'),
+          host = b1Host(api, config, clock);
+        const operation = host.planRetryToolResult(
+          { searchEngine: 'yandex' },
+          controller.signal,
+        );
+        api.operations.push(operation);
+        void operation.then(() => {
+          done = true;
+        });
+        await bounded(arrived.promise);
+        await bounded(pendingRead.promise);
+        controller.abort();
+        await bounded(entered.promise);
+        await bounded(Promise.all(api.terminations));
+        await bounded(nativeClosed.promise);
+        expect(done).toBe(false);
+        const busy = await host.planRetryToolResult({});
+        expectPublicEnvelope(busy);
+        expect(busy.structuredContent).toMatchObject({
+          status: 'error',
+          error: { code: 'SubmissionBusy' },
+        });
+        const create = await host.createIndexingTask({
+          mode: 'submit',
+          searchEngine: 'google',
+          requestId: 'p2-blocked-during-settlement',
+          urls: [A],
+        });
+        expect(create.error?.code).toBe('SubmissionBusy');
+        expect(api.wires).toHaveLength(1);
+        expect(p1cProjection(api, config, 'p2-held')).toEqual(before);
+        release.resolve();
+        tail.resolve();
+        const result = await bounded(operation);
+        expectPublicEnvelope(result);
+        expect(result.structuredContent).toMatchObject({
+          status: 'error',
+          error: { code: 'Cancelled' },
+        });
+        expect(closedCount).toBe(1);
+        expect(clock.handles.size).toBe(0);
+        expect(signal.active.size).toBe(0);
+        const recovery = host.planRetryToolResult({ searchEngine: 'yandex' });
+        api.operations.push(recovery);
+        const recovered = await bounded(recovery);
+        expectPublicEnvelope(recovered);
+        if (recovered.structuredContent.status !== 'ready')
+          throw new Error('Expected real public recovery.');
+        expectProductionReady(
+          recovered.structuredContent,
+          productionOracle(config, 'yandex'),
+          config,
+          true,
+        );
+        expect(api.wires).toHaveLength(11);
+        expect(p1cProjection(api, config, 'p2-unchanged')).toEqual(before);
+        expect(clock.handles.size).toBe(0);
+        expect(signal.active.size).toBe(0);
+        writeFileSync(
+          join(api.root, 'p2-native.json'),
+          JSON.stringify({
+            peerTerminated: true,
+            closedCount,
+            readCalls,
+            settled: done,
+            timers: clock.handles.size,
+            listeners: signal.active.size,
+            wires: api.wires.length,
+          }),
+        );
+      },
+      (response) => {
+        if (decorated || !response.body) return response;
+        decorated = true;
+        const body = new Proxy(response.body, {
+          get(target, field) {
+            if (field === 'getReader')
+              return () => {
+                const reader = target.getReader();
+                void reader.closed.then(
+                  () => {
+                    closedCount++;
+                    nativeClosed.resolve();
+                  },
+                  () => {
+                    closedCount++;
+                    nativeClosed.resolve();
+                  },
+                );
+                return new Proxy(reader, {
+                  get(actual, key) {
+                    if (key === 'read')
+                      return async () => {
+                        const reading = actual.read();
+                        if (++readCalls === 2) pendingRead.resolve();
+                        return await reading;
+                      };
+                    const value = Reflect.get(actual, key, actual) as unknown;
+                    return typeof value === 'function'
+                      ? value.bind(actual)
+                      : value;
+                  },
+                });
+              };
+            const value = Reflect.get(target, field, target) as unknown;
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        return holdCancellation(
+          new Proxy(response, {
+            get(target, field) {
+              if (field === 'body') return body;
+              const value = Reflect.get(target, field, target) as unknown;
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          }),
+          entered,
+          release,
+        );
+      },
+    );
+  } finally {
+    signal.restore();
+  }
+});
