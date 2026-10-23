@@ -3,7 +3,13 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'bun:test';
@@ -16,6 +22,7 @@ import type {
   RetryPlanReady,
   RetryProof,
   RetryPlanFingerprintInput,
+  RetryCreatedOwner,
 } from '../src/submission-ledger';
 import {
   planRetryResultSchema,
@@ -344,6 +351,7 @@ import {
   openLedger,
   readRetrySnapshot,
   readRetryPlanningState,
+  readRetryReplay,
   type PrepareIntentInput,
   type SubmissionLedger,
   type PrepareResult,
@@ -3990,6 +3998,776 @@ function withP1cReadDb<T>(
     db.close();
   }
 }
+
+for (const engine of ['google', 'yandex'] as const)
+  test(`SR-A2-L01 actual ${engine} created-only owner retains original time, units and historical replay`, async () => {
+    await withProductionReceiver(script(singleSource(engine)), async (api) => {
+      const config = fixtureConfiguration(api, {
+        retry: {
+          enabled: true,
+          allowUnattributedParents: engine === 'yandex',
+          maxAttemptsPerSource: 3,
+        },
+      });
+      if (engine === 'google') seedStandalone(config, 'parent', [A, B, C]);
+      const clock = new NativeOwnerClock(),
+        controller = new AbortController(),
+        listeners = trackOwnerSignal(controller.signal),
+        phases: string[] = [],
+        oracle = productionOracle(config, engine),
+        before = p1cProjection(api, config, 'sr-l01-before');
+      const composition = composeVerifiedRetryAdmission({
+        configuration: config,
+        transport: { fetch: api.fetch },
+        clock,
+        owner: {
+          runtime: clock,
+          hooks: {
+            onOwnerPhase(phase) {
+              phases.push(phase);
+              if (phase === 'after_close') clock.mono = 200;
+            },
+          },
+        },
+      });
+      const pending = composition.collectLatest(
+        { searchEngine: engine },
+        'sr-l01-child',
+        controller.signal,
+      );
+      api.operations.push(pending);
+      try {
+        const candidate = await bounded(pending);
+        if (!('kind' in candidate))
+          throw new Error('SR-L01 requires a real production candidate.');
+        expectProductionReady(candidate.view, oracle, config);
+        expectProductionWires(api, engine);
+        expect(p1cProjection(api, config, 'sr-l01-collected')).toEqual(before);
+        expect(phases.at(-1)).toBe('after_close');
+        expect(clock.handles.size).toBe(0);
+        expect(listeners.active.size).toBe(0);
+        const readTimerCount = clock.arms.length;
+        clock.mono = 230;
+        composition.checkpointCandidate(candidate.proof);
+        const writer = composition.openForSubmission();
+        let owner: RetryCreatedOwner | undefined;
+        try {
+          expect(() => composition.open()).toThrow(
+            'Submission ledger is busy.',
+          );
+          expect(await composition.collectLatest({}, 'sr-l01-busy')).toEqual({
+            status: 'error',
+            code: 'SubmissionBusy',
+          });
+          clock.mono = 250;
+          const prepared = writer.prepare(candidate.input, candidate.proof);
+          expect(prepared.kind).toBe('created');
+          if (prepared.kind !== 'created')
+            throw new Error('SR-L01 created owner missing.');
+          owner = prepared.owner;
+          expect(Object.keys(prepared).sort()).toEqual(['kind', 'owner']);
+          expect(Object.isFrozen(owner)).toBe(true);
+          composition.discardCandidate(candidate.proof);
+          expect(() =>
+            composition.checkpointCandidate(candidate.proof),
+          ).toThrow('Retry admission proof is unavailable or mismatched.');
+          const preparedReceipt = owner.lastObservedIntent();
+          expect(Object.isFrozen(preparedReceipt)).toBe(true);
+          expect(Object.isFrozen(preparedReceipt.reservation)).toBe(true);
+          expect('credentialFingerprint' in preparedReceipt).toBe(false);
+          expect(preparedReceipt).toMatchObject({
+            requestId: 'sr-l01-child',
+            state: 'prepared',
+            stateVersion: 0,
+            taskFamily: `${engine}/indexer`,
+            payloadDigest: oracle.preimage.payloadDigest,
+            quoteFingerprint: oracle.preimage.quoteFingerprint,
+            reservation:
+              engine === 'google'
+                ? { tokens: 200, indexer: 0, checker: 0 }
+                : { tokens: 40, indexer: 2, checker: 0 },
+            urlCount: 2,
+            periodId: 'utc-day:2026-10-21',
+            createdAtMs: utc,
+          });
+          expect(localSnapshot(config).revision).not.toBe(
+            candidate.input.expectedRevision,
+          );
+          expect(owner.checkpoint()).toBe(59850); // Origin 100, never the writer's 250.
+          const sql = withP1cReadDb(config, (db) => ({
+            core: db
+              .query(
+                `SELECT state,state_version,reserved_tokens,reserved_indexer,reserved_checker,provider_task_id,provider_type FROM intents WHERE request_id='sr-l01-child'`,
+              )
+              .get(),
+            context: db
+              .query(
+                `SELECT origin_kind,parent_family,parent_task_id,source_manifest_digest,plan_fingerprint FROM intent_context WHERE request_id='sr-l01-child'`,
+              )
+              .get(),
+            urls: db
+              .query(
+                `SELECT ordinal,url_text FROM intent_urls WHERE request_id='sr-l01-child' ORDER BY ordinal`,
+              )
+              .all(),
+            events: db
+              .query(
+                `SELECT event_kind AS state,state_version FROM intent_events WHERE request_id='sr-l01-child' ORDER BY state_version`,
+              )
+              .all(),
+            counts: db
+              .query(
+                `SELECT (SELECT COUNT(*) FROM intents) AS intents,(SELECT COUNT(*) FROM intent_context) AS contexts`,
+              )
+              .get(),
+          }));
+          expect(sql.core).toEqual({
+            state: 'prepared',
+            state_version: 0,
+            reserved_tokens: engine === 'google' ? 200 : 40,
+            reserved_indexer: engine === 'google' ? 0 : 2,
+            reserved_checker: 0,
+            provider_task_id: null,
+            provider_type: null,
+          });
+          expect(sql.context).toEqual({
+            origin_kind: 'retry',
+            parent_family: `${engine}/indexer`,
+            parent_task_id: 'parent',
+            source_manifest_digest: oracle.source.manifestDigest,
+            plan_fingerprint: oracle.planFingerprint,
+          });
+          expect(sql.urls).toEqual([
+            { ordinal: 0, url_text: A },
+            { ordinal: 1, url_text: B },
+          ]);
+          expect(sql.events).toEqual([{ state: 'prepared', state_version: 0 }]);
+          expect(sql.counts).toEqual({
+            intents: engine === 'google' ? 2 : 1,
+            contexts: engine === 'google' ? 2 : 1,
+          });
+          expect(owner.refreshIntent()).toEqual(preparedReceipt);
+          if (engine === 'google')
+            expect(owner.cancelPrepared()).toEqual({
+              kind: 'cancelled',
+              stateVersion: 1,
+            });
+          else {
+            expect(owner.claim()).toEqual({ kind: 'claimed', stateVersion: 1 });
+            expect(owner.beginPost()).toBe(59850);
+            expect(() => owner!.beginPost()).toThrow(
+              'Submission dispatch claim is no longer available.',
+            );
+            // This tests only the one-attempt entry fence. No fetch is entered.
+            expect(owner.recordOutcome({ kind: 'rejected' })).toMatchObject({
+              state: 'rejected',
+              stateVersion: 2,
+            });
+          }
+          const terminal = owner.refreshIntent();
+          if (terminal === null)
+            throw new Error(
+              'SR-L01 requires an actual stored terminal intent.',
+            );
+          expect(terminal).toMatchObject({
+            state: engine === 'google' ? 'cancelled' : 'rejected',
+            stateVersion: engine === 'google' ? 1 : 2,
+          });
+          owner.finish();
+          expect(owner.lastObservedIntent()).toEqual(terminal);
+          expect(() => owner!.refreshIntent()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.checkpoint()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.claim()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.beginPost()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.cancelPrepared()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.recordOutcome({ kind: 'rejected' })).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          const after = p1cProjection(api, config, 'sr-l01-terminal');
+          expect(
+            withP1cReadDb(config, (db) =>
+              db
+                .query(
+                  `SELECT COUNT(*) AS n FROM intent_context WHERE origin_kind='retry' AND parent_task_id='parent'`,
+                )
+                .get(),
+            ),
+          ).toEqual({ n: 1 });
+          clock.mono += 60000;
+          clock.wall += 86400000;
+          const replayWriter = composition.openForSubmission();
+          let replay;
+          try {
+            replay = replayWriter.prepare(candidate.input, candidate.proof);
+            expect(replay).toEqual({ kind: 'replay', intent: terminal });
+            expect('owner' in replay || 'dispatchCapability' in replay).toBe(
+              false,
+            );
+          } finally {
+            replayWriter.close();
+          }
+          expect(p1cProjection(api, config, 'sr-l01-replay')).toEqual(after);
+          expect(clock.arms.length).toBe(readTimerCount); // The closed read budget was never reopened.
+          expect(clock.handles.size).toBe(0);
+          expect(api.wires).toHaveLength(10);
+          writeFileSync(
+            join(api.root, 'sr-a2-l01-receipt.json'),
+            JSON.stringify({
+              engine,
+              phases,
+              origin: 100,
+              preparedAtMono: 250,
+              remaining: 59850,
+              readTimerCount,
+              sql,
+              terminal,
+              replay,
+              closedReadTimers: clock.handles.size,
+              listeners: listeners.active.size,
+              createRequests: 0,
+            }),
+          );
+        } finally {
+          writer.close();
+        }
+      } finally {
+        listeners.restore();
+      }
+    });
+  });
+
+for (const refusal of [
+  'discarded',
+  'mismatch',
+  'open_failure',
+  'begin_busy',
+  'before_context',
+  'clock_regression',
+] as const)
+  test(`SR-A2-L02 actual ${refusal} retires its supplied proof without restoring rows or ownership`, async () => {
+    await withProductionReceiver(
+      script(singleSource('yandex')),
+      async (api) => {
+        const config = fixtureConfiguration(api),
+          clock = new NativeOwnerClock();
+        let beforeContext = 0;
+        const composition = composeVerifiedRetryAdmission({
+          configuration: config,
+          transport: { fetch: api.fetch },
+          clock,
+          owner: { runtime: clock },
+          hooks: {
+            onPhase(phase) {
+              if (phase === 'before_context') {
+                beforeContext++;
+                if (refusal === 'before_context')
+                  throw new Error('SYNTHETIC_ROLLBACK_BEFORE_CONTEXT');
+              }
+            },
+          },
+        });
+        const before = p1cProjection(api, config, 'sr-l02-before');
+        const pending = composition.collectLatest(
+          { searchEngine: 'yandex' },
+          'sr-l02-child',
+        );
+        api.operations.push(pending);
+        const candidate = await bounded(pending);
+        if (!('kind' in candidate))
+          throw new Error('SR-L02 requires a real production candidate.');
+        expectProductionWires(api, 'yandex');
+        let actualFailure: unknown;
+        if (refusal === 'open_failure') {
+          chmodSync(config.stateDirectory, 0o755);
+          try {
+            try {
+              composition.openForSubmission();
+            } catch (error) {
+              actualFailure = error;
+            }
+          } finally {
+            // Open has no proof argument. This caller owns disposal even here.
+            composition.discardCandidate(candidate.proof);
+            chmodSync(config.stateDirectory, 0o700);
+          }
+        } else {
+          const writer = composition.openForSubmission();
+          let blocker: Database | undefined;
+          try {
+            if (refusal === 'discarded') {
+              composition.discardCandidate(candidate.proof);
+              composition.discardCandidate(candidate.proof);
+              composition.discardCandidate(Object.freeze({}) as RetryProof);
+            }
+            if (refusal === 'clock_regression') {
+              clock.mono = 300;
+              composition.checkpointCandidate(candidate.proof);
+              clock.mono = 250;
+              expect(() =>
+                composition.checkpointCandidate(candidate.proof),
+              ).toThrow('Retry admission observation has expired.');
+            }
+            if (refusal === 'begin_busy') {
+              blocker = new Database(
+                join(config.stateDirectory, 'ledger.sqlite'),
+              );
+              blocker.exec('BEGIN IMMEDIATE');
+            }
+            const input =
+              refusal === 'mismatch'
+                ? {
+                    ...candidate.input,
+                    intent: {
+                      ...candidate.input.intent,
+                      requestId: 'sr-l02-impostor',
+                    },
+                  }
+                : candidate.input;
+            try {
+              writer.prepare(input, candidate.proof);
+            } catch (error) {
+              actualFailure = error;
+            }
+          } finally {
+            try {
+              if (blocker) {
+                try {
+                  blocker.exec('ROLLBACK');
+                } finally {
+                  blocker.close();
+                }
+              }
+            } finally {
+              writer.close();
+            }
+          }
+        }
+        const expectedCode =
+          refusal === 'begin_busy'
+            ? 'LedgerBusy'
+            : refusal === 'open_failure' || refusal === 'before_context'
+              ? 'LedgerUnavailable'
+              : refusal === 'clock_regression'
+                ? 'RetryProofExpired'
+                : 'RetryProofInvalid';
+        expect(actualFailure).toMatchObject({ code: expectedCode });
+        expect(p1cProjection(api, config, 'sr-l02-refused')).toEqual(before);
+        expect(beforeContext).toBe(refusal === 'before_context' ? 1 : 0);
+        // Use the unchanged raw entry to distinguish disposal from a writer's
+        // one-attempt latch. Even a native failed BEGIN cannot reuse this proof.
+        const verifier = composition.open();
+        try {
+          expect(() =>
+            verifier.prepareVerifiedRetryIntent(
+              candidate.input,
+              candidate.proof,
+            ),
+          ).toThrow('Retry admission proof is unavailable or mismatched.');
+        } finally {
+          verifier.close();
+        }
+        expect(p1cProjection(api, config, 'sr-l02-proof-retired')).toEqual(
+          before,
+        );
+        expect(api.wires).toHaveLength(10);
+        expect(composition.isNewWorkAvailable()).toBe(true);
+        if (refusal === 'open_failure') {
+          const next = composition.collectLatest(
+            { searchEngine: 'yandex' },
+            'sr-l02-independent',
+          );
+          api.operations.push(next);
+          const fresh = await bounded(next);
+          expect('kind' in fresh).toBe(true);
+          if ('kind' in fresh) composition.discardCandidate(fresh.proof);
+          expect(api.wires).toHaveLength(20);
+        }
+        expect(clock.handles.size).toBe(0);
+        writeFileSync(
+          join(api.root, 'sr-a2-l02-receipt.json'),
+          JSON.stringify({
+            refusal,
+            actualFailure,
+            beforeContext,
+            retainedRows: 0,
+            restoredProof: false,
+            readRequests: api.wires.length,
+            closedReadTimers: clock.handles.size,
+            createRequests: 0,
+          }),
+        );
+      },
+    );
+  });
+
+for (const stage of ['prepared', 'claimed'] as const)
+  for (const boundary of ['abort', 'expiry', 'day'] as const)
+    test(`SR-A2-L03 actual ${stage} ownership survives controlled ${boundary} and records legitimate no-send SQL`, async () => {
+      await withProductionReceiver(
+        script(singleSource('yandex')),
+        async (api) => {
+          const config = fixtureConfiguration(api),
+            clock = new NativeOwnerClock(),
+            controller = new AbortController(),
+            listeners = trackOwnerSignal(controller.signal);
+          let committed: unknown;
+          const composition = composeVerifiedRetryAdmission({
+            configuration: config,
+            transport: { fetch: api.fetch },
+            clock,
+            owner: { runtime: clock },
+            hooks: {
+              onPhase(phase) {
+                if (phase !== 'after_prepare_commit') return;
+                committed = withP1cReadDb(config, (db) =>
+                  db
+                    .query(
+                      `SELECT state,state_version,reserved_tokens,reserved_indexer,reserved_checker FROM intents WHERE request_id='sr-l03-child'`,
+                    )
+                    .get(),
+                );
+                if (stage === 'prepared') {
+                  if (boundary === 'abort') controller.abort();
+                  if (boundary === 'expiry') clock.mono += 60000;
+                  if (boundary === 'day') clock.wall += 86400000;
+                }
+              },
+            },
+          });
+          const pending = composition.collectLatest(
+            { searchEngine: 'yandex' },
+            'sr-l03-child',
+            controller.signal,
+          );
+          api.operations.push(pending);
+          try {
+            const candidate = await bounded(pending);
+            if (!('kind' in candidate))
+              throw new Error('SR-L03 requires a real production candidate.');
+            const writer = composition.openForSubmission();
+            try {
+              const prepared = writer.prepare(candidate.input, candidate.proof);
+              expect(prepared.kind).toBe('created');
+              if (prepared.kind !== 'created')
+                throw new Error('SR-L03 lost actual committed ownership.');
+              const owner = prepared.owner;
+              expect(committed).toEqual({
+                state: 'prepared',
+                state_version: 0,
+                reserved_tokens: 40,
+                reserved_indexer: 2,
+                reserved_checker: 0,
+              });
+              expect(owner.lastObservedIntent()).toMatchObject({
+                state: 'prepared',
+                stateVersion: 0,
+              });
+              if (stage === 'claimed') {
+                expect(owner.claim()).toEqual({
+                  kind: 'claimed',
+                  stateVersion: 1,
+                });
+                expect(owner.lastObservedIntent()).toMatchObject({
+                  state: 'dispatching',
+                  stateVersion: 1,
+                });
+                expect(owner.claim()).toEqual({ kind: 'lost' });
+                if (boundary === 'abort') controller.abort();
+                if (boundary === 'expiry') clock.mono += 60000;
+                if (boundary === 'day') clock.wall += 86400000;
+              }
+              const expectedCode =
+                boundary === 'abort'
+                  ? 'RetryCancelled'
+                  : boundary === 'expiry'
+                    ? 'RetryProofExpired'
+                    : 'StalePeriodContext';
+              let fenceFailure: unknown;
+              try {
+                if (stage === 'prepared') owner.checkpoint();
+                else owner.beginPost();
+              } catch (error) {
+                fenceFailure = error;
+              }
+              expect(fenceFailure).toMatchObject({ code: expectedCode });
+              if (stage === 'prepared')
+                expect(owner.cancelPrepared()).toEqual({
+                  kind: 'cancelled',
+                  stateVersion: 1,
+                });
+              else {
+                expect(() => owner.beginPost()).toThrow(
+                  'Submission dispatch claim is no longer available.',
+                );
+                const held = p1cProjection(api, config, 'sr-l03-held');
+                expect(() => owner.recordOutcome({ kind: 'unknown' })).toThrow(
+                  'Invalid submission ledger input.',
+                );
+                expect(
+                  p1cProjection(api, config, 'sr-l03-invalid-outcome'),
+                ).toEqual(held);
+                expect(owner.recordOutcome({ kind: 'rejected' })).toMatchObject(
+                  { state: 'rejected', stateVersion: 2 },
+                );
+                expect(() => owner.recordOutcome({ kind: 'rejected' })).toThrow(
+                  'Submission outcome claim is no longer available.',
+                );
+              }
+              const final = owner.refreshIntent();
+              if (final === null)
+                throw new Error(
+                  'SR-L03 requires an actual stored final intent.',
+                );
+              const sql = withP1cReadDb(config, (db) => ({
+                core: db
+                  .query(
+                    `SELECT state,state_version,reserved_tokens,reserved_indexer,reserved_checker,claim_token_digest,dispatch_outcome_token_digest,provider_task_id,provider_type FROM intents WHERE request_id='sr-l03-child'`,
+                  )
+                  .get(),
+                events: db
+                  .query(
+                    `SELECT event_kind AS state,state_version FROM intent_events WHERE request_id='sr-l03-child' ORDER BY state_version`,
+                  )
+                  .all(),
+                lifetime: db
+                  .query(
+                    `SELECT COUNT(*) AS n FROM intent_context WHERE origin_kind='retry' AND parent_task_id='parent'`,
+                  )
+                  .get(),
+                held: db
+                  .query(
+                    `SELECT COALESCE(SUM(CASE WHEN state IN ('prepared','dispatching','unknown') THEN reserved_tokens ELSE 0 END),0) AS tokens,COALESCE(SUM(CASE WHEN state IN ('prepared','dispatching','unknown') THEN reserved_indexer ELSE 0 END),0) AS indexer,COALESCE(SUM(CASE WHEN state IN ('prepared','dispatching','unknown') THEN reserved_checker ELSE 0 END),0) AS checker FROM intents WHERE request_id='sr-l03-child'`,
+                  )
+                  .get(),
+              }));
+              expect(sql.core).toEqual({
+                state: stage === 'prepared' ? 'cancelled' : 'rejected',
+                state_version: stage === 'prepared' ? 1 : 2,
+                reserved_tokens: 40,
+                reserved_indexer: 2,
+                reserved_checker: 0,
+                claim_token_digest: null,
+                dispatch_outcome_token_digest: null,
+                provider_task_id: null,
+                provider_type: null,
+              });
+              expect(sql.events).toEqual(
+                stage === 'prepared'
+                  ? [
+                      { state: 'prepared', state_version: 0 },
+                      { state: 'cancelled', state_version: 1 },
+                    ]
+                  : [
+                      { state: 'prepared', state_version: 0 },
+                      { state: 'dispatching', state_version: 1 },
+                      { state: 'rejected', state_version: 2 },
+                    ],
+              );
+              expect(sql.lifetime).toEqual({ n: 1 });
+              expect(sql.held).toEqual({ tokens: 0, indexer: 0, checker: 0 });
+              let finishFailure: unknown;
+              try {
+                owner.finish();
+              } catch (error) {
+                finishFailure = error;
+              }
+              expect(finishFailure).toMatchObject({ code: expectedCode });
+              expect(owner.lastObservedIntent()).toEqual(final);
+              expect(() => owner.refreshIntent()).toThrow(
+                'Submission ledger is unavailable.',
+              );
+              expect(() => owner.checkpoint()).toThrow(
+                'Submission ledger is unavailable.',
+              );
+              owner.finish(); // Retired finish is idempotent, with no second close/read.
+              expect(composition.isNewWorkAvailable()).toBe(true);
+              const after = p1cProjection(api, config, 'sr-l03-after-close');
+              expect(
+                withP1cReadDb(config, (db) =>
+                  db.query('PRAGMA integrity_check').get(),
+                ),
+              ).toEqual({ integrity_check: 'ok' });
+              expect(clock.handles.size).toBe(0);
+              expect(listeners.active.size).toBe(0);
+              expectProductionWires(api, 'yandex');
+              writeFileSync(
+                join(api.root, 'sr-a2-l03-receipt.json'),
+                JSON.stringify({
+                  stage,
+                  boundary,
+                  controlledClockAndSignal: true,
+                  queuedIONativeDelayProven: false,
+                  committed,
+                  fenceFailure,
+                  finishFailure,
+                  sql,
+                  final,
+                  after,
+                  readRequests: 10,
+                  createRequests: 0,
+                  closedReadTimers: clock.handles.size,
+                  listeners: listeners.active.size,
+                }),
+              );
+            } finally {
+              writer.close();
+            }
+          } finally {
+            listeners.restore();
+          }
+        },
+      );
+    });
+
+test('SR-A2-L04 fixed private poison denies actual new collection/admission but preserves replay, preview and independent composition', async () => {
+  await withProductionReceiver(script(singleSource('yandex')), async (api) => {
+    const config = fixtureConfiguration(api),
+      clock = new NativeOwnerClock(),
+      phases: string[] = [];
+    const composition = composeVerifiedRetryAdmission({
+      configuration: config,
+      transport: { fetch: api.fetch },
+      clock,
+      owner: {
+        runtime: clock,
+        hooks: {
+          onOwnerPhase(phase) {
+            phases.push(phase);
+          },
+        },
+      },
+    });
+    const pending = composition.collectLatest(
+      { searchEngine: 'yandex' },
+      'sr-l04-stored',
+    );
+    api.operations.push(pending);
+    const candidate = await bounded(pending);
+    if (!('kind' in candidate))
+      throw new Error('SR-L04 requires a real production candidate.');
+    const writer = composition.openForSubmission();
+    try {
+      const prepared = writer.prepare(candidate.input, candidate.proof);
+      if (prepared.kind !== 'created')
+        throw new Error('SR-L04 requires real created history.');
+      expect(prepared.owner.cancelPrepared()).toEqual({
+        kind: 'cancelled',
+        stateVersion: 1,
+      });
+      prepared.owner.finish();
+    } finally {
+      writer.close();
+    }
+    const next = composition.collectLatest(
+      { searchEngine: 'yandex' },
+      'sr-l04-new',
+    );
+    api.operations.push(next);
+    const fresh = await bounded(next);
+    if (!('kind' in fresh))
+      throw new Error('SR-L04 requires a real unused candidate before poison.');
+    const stored = p1cProjection(api, config, 'sr-l04-before-poison'),
+      reads = api.wires.length,
+      phaseCount = phases.length;
+    composition.poisonNewWork('writer_close');
+    composition.poisonNewWork('paid_settlement');
+    expect(
+      await composition.collectLatest(
+        { searchEngine: 'yandex' },
+        'sr-l04-refused',
+      ),
+    ).toEqual({ status: 'error', code: 'InternalError' });
+    expect(phases).toHaveLength(phaseCount); // Refusal precedes the initial SQL owner phase.
+    expect(api.wires).toHaveLength(reads);
+    expect(() => composition.checkpointCandidate(fresh.proof)).toThrow(
+      'Submission ledger is unavailable.',
+    );
+    const blockedWriter = composition.openForSubmission();
+    try {
+      expect(() => blockedWriter.prepare(fresh.input, fresh.proof)).toThrow(
+        'Submission ledger is unavailable.',
+      );
+    } finally {
+      blockedWriter.close();
+    }
+    expect(p1cProjection(api, config, 'sr-l04-refused')).toEqual(stored);
+    const identity = {
+      intent: candidate.input.intent,
+      parent: candidate.input.parent,
+      sourceManifestDigest: candidate.input.sourceManifestDigest,
+      planFingerprint: candidate.input.planFingerprint,
+    };
+    const narrow = readRetryReplay(
+      { stateDirectory: config.stateDirectory },
+      fingerprint,
+      identity,
+    );
+    expect(narrow).toMatchObject({
+      availability: 'available',
+      kind: 'replay',
+      intent: { state: 'cancelled', stateVersion: 1 },
+    });
+    const replayWriter = composition.openForSubmission();
+    let replay;
+    try {
+      replay = replayWriter.prepare(candidate.input, candidate.proof);
+      expect(replay).toMatchObject({
+        kind: 'replay',
+        intent: { state: 'cancelled', stateVersion: 1 },
+      });
+      expect('owner' in replay || 'dispatchCapability' in replay).toBe(false);
+    } finally {
+      replayWriter.close();
+    }
+    expect(
+      await retryHost(api, config, clock).createIndexingTask({
+        mode: 'preview',
+        searchEngine: 'google',
+        urls: [A],
+      }),
+    ).toMatchObject({ status: 'preview' });
+    expect(api.wires).toHaveLength(reads);
+    const independent = productionComposition(api, config, clock);
+    const observing = independent.collectLatest(
+      { searchEngine: 'yandex' },
+      'sr-l04-independent',
+    );
+    api.operations.push(observing);
+    const replacement = await bounded(observing);
+    expect('kind' in replacement).toBe(true);
+    if ('kind' in replacement) independent.discardCandidate(replacement.proof);
+    expect(composition.isNewWorkAvailable()).toBe(false);
+    expect(api.wires).toHaveLength(reads + 10);
+    expect(p1cProjection(api, config, 'sr-l04-final')).toEqual(stored);
+    expect(clock.handles.size).toBe(0);
+    writeFileSync(
+      join(api.root, 'sr-a2-l04-receipt.json'),
+      JSON.stringify({
+        poisonMethodOnly: true,
+        actualNativeCleanupFaultProven: false,
+        phases,
+        refusedBeforeInitialSqlPhase: phaseCount,
+        readsBeforePoison: reads,
+        readsAfterIndependent: api.wires.length,
+        narrow,
+        replay,
+        newRows: 0,
+        createRequests: 0,
+        closedReadTimers: clock.handles.size,
+      }),
+    );
+  });
+});
 
 function cooperatingP1cCommit(config: ConfiguredSubmission) {
   const writer = openLedger({ stateDirectory: config.stateDirectory });
