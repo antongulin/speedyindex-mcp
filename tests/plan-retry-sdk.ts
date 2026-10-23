@@ -1,4 +1,6 @@
 import { expect } from 'bun:test';
+import { z } from 'zod';
+import { SdkError, SdkErrorCode } from '@modelcontextprotocol/client';
 import { Database, constants } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
@@ -16,7 +18,13 @@ import {
   loadSubmissionConfiguration,
   type ConfiguredSubmission,
 } from '../src/submission-policy';
-import { bounded, connectOwnedStdio, dummyKey, fixture } from './helpers';
+import {
+  bounded,
+  connectOwnedStdio,
+  deferred,
+  dummyKey,
+  fixture,
+} from './helpers';
 
 type Engine = 'google' | 'yandex';
 type Schema = {
@@ -405,6 +413,158 @@ function oracle(config: ConfiguredSubmission, engine: Engine, now: number) {
     identity: { status: 'comparison', preimage, fingerprint },
   };
 }
+const retryPhaseSchema = z.discriminatedUnion('event', [
+  z.strictObject({ event: z.literal('BOOT_READY') }),
+  z.strictObject({
+    event: z.literal('SIGNAL_ABORTED'),
+    operation: z.number().int().min(1).max(2),
+  }),
+  z.strictObject({
+    event: z.literal('AFTER_CLOSE'),
+    operation: z.number().int().min(1).max(2),
+  }),
+  z.strictObject({
+    event: z.literal('OWNER_SETTLED'),
+    operation: z.number().int().min(1).max(2),
+    aborted: z.boolean(),
+    status: z.enum(['ready', 'no_source', 'blocked', 'error']),
+    code: z
+      .enum([
+        'InvalidInput',
+        'MissingCredentials',
+        'SubmissionBusy',
+        'Cancelled',
+        'DeadlineExceeded',
+        'ReadFailed',
+        'ResourceLimitExceeded',
+        'InternalError',
+      ])
+      .nullable(),
+  }),
+  z.strictObject({ event: z.literal('FIXTURE_ERROR') }),
+  z.strictObject({ event: z.literal('PROTOCOL_ERROR') }),
+]);
+type RetryPhase = z.infer<typeof retryPhaseSchema>;
+export function createPlanRetryPhaseReceiver(
+  onPhase?: (phase: RetryPhase) => void,
+) {
+  const messages: RetryPhase[] = [],
+    errors: string[] = [];
+  const waiters: {
+    event: RetryPhase['event'];
+    operation?: number;
+    resolve: (phase: RetryPhase) => void;
+    reject: (error: Error) => void;
+  }[] = [];
+  let buffer = '',
+    raw = '',
+    bytes = 0,
+    finished = false;
+  function fail() {
+    if (!errors.length) errors.push('Invalid retry fixture phase stream.');
+    for (const waiter of waiters.splice(0)) waiter.reject(new Error(errors[0]));
+  }
+  const matches = (
+    phase: RetryPhase,
+    event: RetryPhase['event'],
+    operation?: number,
+  ) =>
+    phase.event === event &&
+    (operation === undefined ||
+      ('operation' in phase && phase.operation === operation));
+  return {
+    get messages() {
+      return messages.slice();
+    },
+    get errors() {
+      return errors.slice();
+    },
+    get raw() {
+      return raw;
+    },
+    receive(chunk: string) {
+      if (finished || errors.length) {
+        fail();
+        return;
+      }
+      bytes += Buffer.byteLength(chunk, 'utf8');
+      if (bytes > 8192) {
+        fail();
+        return;
+      }
+      raw += chunk;
+      buffer += chunk;
+      while (buffer.includes('\n')) {
+        const end = buffer.indexOf('\n'),
+          line = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        if (Buffer.byteLength(line) > 512 || !line.startsWith('RETRY_PHASE ')) {
+          fail();
+          return;
+        }
+        let value: unknown;
+        try {
+          value = JSON.parse(line.slice('RETRY_PHASE '.length));
+        } catch {
+          fail();
+          return;
+        }
+        const parsed = retryPhaseSchema.safeParse(value);
+        if (!parsed.success) {
+          fail();
+          return;
+        }
+        const phase = parsed.data;
+        if (
+          phase.event === 'FIXTURE_ERROR' ||
+          phase.event === 'PROTOCOL_ERROR' ||
+          (phase.event === 'OWNER_SETTLED' &&
+            (phase.status === 'error') !== (phase.code !== null)) ||
+          messages.length >= 12 ||
+          messages.some((m) =>
+            matches(
+              m,
+              phase.event,
+              'operation' in phase ? phase.operation : undefined,
+            ),
+          )
+        ) {
+          fail();
+          return;
+        }
+        messages.push(phase);
+        onPhase?.(phase);
+        for (let i = waiters.length - 1; i >= 0; i--) {
+          const waiter = waiters[i];
+          if (waiter && matches(phase, waiter.event, waiter.operation)) {
+            waiters.splice(i, 1);
+            waiter.resolve(phase);
+          }
+        }
+      }
+    },
+    wait(event: RetryPhase['event'], operation?: number) {
+      const found = messages.find((m) => matches(m, event, operation));
+      if (errors.length) return Promise.reject(new Error(errors[0]));
+      if (found) return Promise.resolve(found);
+      if (finished || waiters.length >= 8)
+        return Promise.reject(new Error('Missing retry fixture phase.'));
+      return new Promise<RetryPhase>((resolve, reject) =>
+        waiters.push({
+          event,
+          ...(operation === undefined ? {} : { operation }),
+          resolve,
+          reject,
+        }),
+      );
+    },
+    finish() {
+      finished = true;
+      if (buffer.length || waiters.length) fail();
+      return errors.slice();
+    },
+  };
+}
 export const planRetryFiniteCases = [
   'no_source',
   'permission',
@@ -451,7 +611,12 @@ function finiteExpected(kind: FiniteCase, engine: Engine): unknown {
         knownMissingLocalUrls: null,
       };
 }
-async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
+async function journey(
+  entry: string,
+  engine: Engine,
+  finiteCase?: FiniteCase,
+  cancellation = false,
+) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'speedyindex-p2-sdk-')));
   const home = join(root, 'home');
   mkdirSync(home, { mode: 0o700 });
@@ -466,6 +631,30 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
   const children: ReturnType<typeof Bun.spawn>[] = [];
   const stdout: Buffer[] = [];
   let firstReadFailure = finiteCase === 'read_error_recovery';
+  const cancellationEvents: string[] = [];
+  const phaseReceiver = cancellation
+    ? createPlanRetryPhaseReceiver((phase) => {
+        cancellationEvents.push(
+          'phase:' +
+            phase.event +
+            ':' +
+            ('operation' in phase ? phase.operation : 0),
+        );
+      })
+    : undefined;
+  const arrival = deferred<void>(),
+    peerClosed = deferred<void>();
+  const controller = cancellation ? new AbortController() : undefined;
+  const peer = {
+    arrived: false,
+    closed: false,
+    beforeTeardown: false,
+    headersSent: false,
+    responseEnded: false,
+  };
+  let holdFirstRead = cancellation,
+    teardownStarted = false,
+    receiptsComplete = false;
   let api: Awaited<ReturnType<typeof fixture>> | undefined;
   let session: Awaited<ReturnType<typeof connectOwnedStdio>> | undefined;
   try {
@@ -537,6 +726,27 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
             '/v2/task/yandex/indexer/list/0',
           ].includes(wire.path)
         ) {
+          if (holdFirstRead) {
+            holdFirstRead = false;
+            expect(wire).toEqual({
+              method: 'GET',
+              path: '/v2/task/google/indexer/list/0',
+              body: '',
+            });
+            expect(req.headers.authorization).toBe(dummyKey);
+            res.once('close', () => {
+              peer.closed = true;
+              peer.beforeTeardown = !teardownStarted;
+              peer.headersSent = res.headersSent;
+              peer.responseEnded = res.writableEnded;
+              cancellationEvents.push('peer_closed');
+              peerClosed.resolve();
+            });
+            peer.arrived = true;
+            cancellationEvents.push('http_arrived');
+            arrival.resolve();
+            return; // Deliberately no headers, body, end, destroy or teardown.
+          }
           if (firstReadFailure) {
             firstReadFailure = false;
             const body = [
@@ -592,17 +802,35 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
       void receiving.catch(() => res.destroy());
     });
     session = await connectOwnedStdio(
-      [entry, '--submission-policy', policyPath, '--submission-state', state],
+      cancellation
+        ? [entry]
+        : [
+            entry,
+            '--submission-policy',
+            policyPath,
+            '--submission-state',
+            state,
+          ],
       {
         HOME: home,
         SPEEDYINDEX_API_KEY: dummyKey,
         TEST_ACCOUNT_ORIGIN: api.origin,
         TZ: 'UTC',
+        ...(cancellation
+          ? {
+              TMPDIR: root,
+              TEST_SUBMISSION_POLICY: policyPath,
+              TEST_SUBMISSION_STATE: state,
+            }
+          : {}),
       },
       (child) => children.push(child),
       {
         register: (close) => sessions.push(close),
         onStdout: (chunk) => stdout.push(Buffer.from(chunk)),
+        ...(phaseReceiver
+          ? { onStderr: (chunk: string) => phaseReceiver.receive(chunk) }
+          : {}),
       },
     );
     const listed = await bounded(session.client.listTools());
@@ -629,6 +857,89 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
       expect(wires).toEqual([]);
       expect(logicalState(state)).toEqual(before);
       record(root, 'sdk-argument-rejection', rejected);
+    }
+    if (cancellation) {
+      if (!phaseReceiver || !controller)
+        throw new Error('Missing cancellation fixture.');
+      await bounded(phaseReceiver.wait('BOOT_READY'), 8000);
+      expect(wires).toEqual([]);
+      expect(logicalState(state)).toEqual(before);
+      cancellationEvents.push('cancel_call');
+      const cancelled = session.client
+        .callTool(
+          { name: 'plan_retry', arguments: { searchEngine: 'yandex' } },
+          { signal: controller.signal },
+        )
+        .then(
+          () => ({
+            rejected: false,
+            sdkError: false,
+            code: null,
+            aborted: controller.signal.aborted,
+          }),
+          (error: unknown) => {
+            cancellationEvents.push('client_rejected');
+            return {
+              rejected: true,
+              sdkError: error instanceof SdkError,
+              code: error instanceof SdkError ? String(error.code) : null,
+              aborted: controller.signal.aborted,
+            };
+          },
+        );
+      await bounded(arrival.promise, 8000);
+      expect(peer.arrived).toBe(true);
+      cancellationEvents.push('abort_sent');
+      controller.abort();
+      const [clientReceipt, signalReceipt, , closeReceipt, ownerReceipt] =
+        await bounded(
+          Promise.all([
+            cancelled,
+            phaseReceiver.wait('SIGNAL_ABORTED', 1),
+            peerClosed.promise,
+            phaseReceiver.wait('AFTER_CLOSE', 1),
+            phaseReceiver.wait('OWNER_SETTLED', 1),
+          ]),
+          8000,
+        );
+      record(root, 'cancel-client', clientReceipt);
+      record(root, 'cancel-receipts', {
+        signalReceipt,
+        closeReceipt,
+        ownerReceipt,
+        peer,
+        events: cancellationEvents.slice(),
+        childPids: children.map((child) => child.pid),
+      });
+      expect(clientReceipt).toEqual({
+        rejected: true,
+        sdkError: true,
+        code: SdkErrorCode.RequestTimeout,
+        aborted: true,
+      });
+      const actualOwner: unknown = ownerReceipt;
+      expect(actualOwner).toEqual({
+        event: 'OWNER_SETTLED',
+        operation: 1,
+        aborted: true,
+        status: 'error',
+        code: 'Cancelled',
+      });
+      expect(peer).toEqual({
+        arrived: true,
+        closed: true,
+        beforeTeardown: true,
+        headersSent: false,
+        responseEnded: false,
+      });
+      expect(wires).toEqual([
+        { method: 'GET', path: '/v2/task/google/indexer/list/0', body: '' },
+      ]);
+      const afterCancel = logicalState(state);
+      record(root, 'after-cancel', afterCancel);
+      expect(afterCancel).toEqual(before);
+      expect(phaseReceiver.errors).toEqual([]);
+      receiptsComplete = true;
     }
     if (finiteCase) {
       const lists = [
@@ -720,6 +1031,7 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
         childPids: children.map((child) => child.pid),
       });
     } else {
+      if (cancellation) cancellationEvents.push('recovery_call');
       const result = await bounded(
         session.client.callTool({
           name: 'plan_retry',
@@ -727,6 +1039,7 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
         }),
         8000,
       );
+      if (cancellation) cancellationEvents.push('recovery_reply');
       record(root, 'result', result);
       record(root, 'expected', expected);
       expect(result.isError).toBe(false);
@@ -772,14 +1085,49 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
           body: JSON.stringify({ task_id: parent }),
         },
       ];
-      expect(wires).toEqual([...pass, ...pass]);
+      expect(wires).toEqual(
+        cancellation
+          ? [
+              {
+                method: 'GET',
+                path: '/v2/task/google/indexer/list/0',
+                body: '',
+              },
+              ...pass,
+              ...pass,
+            ]
+          : [...pass, ...pass],
+      );
       const after = logicalState(state);
       expect(after).toEqual(before);
       record(root, 'after', after);
+      if (cancellation && phaseReceiver) {
+        const ownerReady: unknown = await bounded(
+          phaseReceiver.wait('OWNER_SETTLED', 2),
+          8000,
+        );
+        expect(ownerReady).toEqual({
+          event: 'OWNER_SETTLED',
+          operation: 2,
+          aborted: false,
+          status: 'ready',
+          code: null,
+        });
+        await bounded(phaseReceiver.wait('AFTER_CLOSE', 2), 8000);
+        expect(receiptsComplete).toBe(true);
+        record(root, 'recovery-order', {
+          events: cancellationEvents.slice(),
+          childPids: children.map((child) => child.pid),
+          sameHost: children.length === 1,
+          receiptsBeforeRecovery: receiptsComplete,
+        });
+      }
     }
   } catch (error) {
     errors.push(error);
   } finally {
+    teardownStarted = true;
+    controller?.abort();
     const closed = await Promise.allSettled(sessions.map((close) => close()));
     for (const item of closed)
       if (item.status === 'rejected') cleanup.push(item.reason);
@@ -802,7 +1150,40 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
       if (item.status === 'rejected') cleanup.push(item.reason);
   }
   try {
-    expect(session?.stderr()).toBe('');
+    if (cancellation && phaseReceiver) {
+      const phaseErrors = phaseReceiver.finish();
+      record(root, 'cancellation-phases', {
+        raw: phaseReceiver.raw,
+        messages: phaseReceiver.messages,
+        errors: phaseErrors,
+        events: cancellationEvents,
+        peer,
+        receiptsComplete,
+        teardownStarted,
+      });
+      expect(phaseErrors).toEqual([]);
+      const actualPhases: unknown = phaseReceiver.messages;
+      expect(actualPhases).toEqual([
+        { event: 'BOOT_READY' },
+        { event: 'SIGNAL_ABORTED', operation: 1 },
+        { event: 'AFTER_CLOSE', operation: 1 },
+        {
+          event: 'OWNER_SETTLED',
+          operation: 1,
+          aborted: true,
+          status: 'error',
+          code: 'Cancelled',
+        },
+        { event: 'AFTER_CLOSE', operation: 2 },
+        {
+          event: 'OWNER_SETTLED',
+          operation: 2,
+          aborted: false,
+          status: 'ready',
+          code: null,
+        },
+      ]);
+    } else expect(session?.stderr()).toBe('');
     for (const child of children) {
       expect(child.exitCode).toBe(0);
       expect(child.signalCode).toBeNull();
@@ -821,6 +1202,7 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
     entry,
     engine,
     ...(finiteCase ? { finiteCase } : {}),
+    ...(cancellation ? { cancellation: true } : {}),
     passed: errors.length === 0 && cleanup.length === 0,
     settled: cleanup.length === 0,
     sessionsClosed: sessions.length,
@@ -844,6 +1226,7 @@ async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
         entry,
         engine,
         ...(finiteCase ? { finiteCase } : {}),
+        ...(cancellation ? { cancellation: true } : {}),
         passed: errors.length === 0 && cleanup.length === 0,
         settled: cleanup.length === 0,
       }),
@@ -864,4 +1247,13 @@ export async function verifyPlanRetryFiniteSdk(
   kind: FiniteCase,
 ) {
   await journey(entry, kind === 'no_source' ? 'google' : 'yandex', kind);
+}
+
+export async function verifyPlanRetryCancellationSdk() {
+  await journey(
+    'tests/fixtures/plan-retry-sdk-child.ts',
+    'yandex',
+    undefined,
+    true,
+  );
 }

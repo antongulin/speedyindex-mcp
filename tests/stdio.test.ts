@@ -17,6 +17,7 @@ import { verifyEof } from './stdio-eof';
 import {
   verifyPlanRetrySdk,
   verifyPlanRetryFiniteSdk,
+  verifyPlanRetryCancellationSdk,
   planRetryFiniteCases,
 } from './plan-retry-sdk';
 
@@ -28,6 +29,10 @@ for (const kind of planRetryFiniteCases)
   test(`P2-07 SOURCE finite:${kind}`, async () => {
     await verifyPlanRetryFiniteSdk('src/cli.ts', kind);
   }, 30000);
+
+test('P2-07 SOURCE cancellation owner receipts before same-host recovery', async () => {
+  await verifyPlanRetryCancellationSdk();
+}, 30000);
 
 type SchemaBranch = {
   type?: string;
