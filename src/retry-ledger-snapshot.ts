@@ -33,6 +33,8 @@ const ceilings: Readonly<SnapshotLimits> = Object.freeze({
 // Trusted in-process wiring only. Callbacks receive a fixed phase, never a handle/data.
 export interface SnapshotReadHooks {
   limits?: Partial<SnapshotLimits>;
+  /** Trusted no-argument receipt, only after actual native close and handle clearing. */
+  afterNativeClose?: () => void;
   onPhase?: (
     phase: 'snapshot_fixed' | 'before_projection' | 'before_close',
   ) => void;

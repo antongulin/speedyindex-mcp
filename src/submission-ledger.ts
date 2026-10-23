@@ -3903,6 +3903,7 @@ function guardedRetryRead<T>(
     signalSnapshotPhase(hooks, 'before_close');
     database.close(true);
     database = undefined;
+    notifySnapshotNativeClose(hooks);
     assertStorageIdentity(
       options.stateDirectory,
       uid,
@@ -3931,12 +3932,22 @@ function guardedRetryRead<T>(
     if (database) {
       try {
         database.close(true);
+        database = undefined;
+        notifySnapshotNativeClose(hooks);
       } catch {
         result = { availability: 'unavailable', reason: 'ReadFailure' };
       }
     }
   }
   return freezeSnapshot(result);
+}
+
+function notifySnapshotNativeClose(hooks: SnapshotReadHooks) {
+  const returned: unknown = hooks.afterNativeClose?.();
+  if (returned !== undefined) {
+    void Promise.resolve(returned).catch(() => undefined);
+    throw new SnapshotReadError('ReadFailure');
+  }
 }
 
 export class LedgerMigrationError extends Error {
