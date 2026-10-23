@@ -19,11 +19,20 @@ import { taskStatusResultSchema } from '../src/task-status';
 import { taskReportOutputSchema } from '../src/task-report';
 import { account, bounded, connect, dummyKey, fixture } from './helpers';
 import { verifyEof } from './stdio-eof';
-import { verifyPlanRetrySdk } from './plan-retry-sdk';
+import {
+  verifyPlanRetrySdk,
+  verifyPlanRetryFiniteSdk,
+  planRetryFiniteCases,
+} from './plan-retry-sdk';
 
 test('P2-06 BUILT SDK: strict advertised plan_retry and genuine local/external ready', async () => {
   await verifyPlanRetrySdk('dist/cli.js');
 }, 30000);
+
+for (const kind of planRetryFiniteCases)
+  test(`P2-07 BUILT finite:${kind}`, async () => {
+    await verifyPlanRetryFiniteSdk('dist/cli.js', kind);
+  }, 30000);
 
 test('LT-08: built CLI registers and calls all four read-only tools', async () => {
   const reportBodies: string[] = [];

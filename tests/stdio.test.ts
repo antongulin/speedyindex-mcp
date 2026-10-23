@@ -14,11 +14,20 @@ import {
   fixture,
 } from './helpers';
 import { verifyEof } from './stdio-eof';
-import { verifyPlanRetrySdk } from './plan-retry-sdk';
+import {
+  verifyPlanRetrySdk,
+  verifyPlanRetryFiniteSdk,
+  planRetryFiniteCases,
+} from './plan-retry-sdk';
 
 test('P2-06 SOURCE SDK: strict advertised plan_retry and genuine local/external ready', async () => {
   await verifyPlanRetrySdk('src/cli.ts');
 }, 30000);
+
+for (const kind of planRetryFiniteCases)
+  test(`P2-07 SOURCE finite:${kind}`, async () => {
+    await verifyPlanRetryFiniteSdk('src/cli.ts', kind);
+  }, 30000);
 
 type SchemaBranch = {
   type?: string;

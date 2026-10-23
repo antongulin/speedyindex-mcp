@@ -405,7 +405,53 @@ function oracle(config: ConfiguredSubmission, engine: Engine, now: number) {
     identity: { status: 'comparison', preimage, fingerprint },
   };
 }
-async function journey(entry: string, engine: Engine) {
+export const planRetryFiniteCases = [
+  'no_source',
+  'permission',
+  'omission',
+  'read_error_recovery',
+] as const;
+type FiniteCase = (typeof planRetryFiniteCases)[number];
+function finiteExpected(kind: FiniteCase, engine: Engine): unknown {
+  if (kind === 'no_source')
+    return { status: 'no_source', searchEngine: engine };
+  if (kind === 'read_error_recovery')
+    return {
+      status: 'error',
+      error: {
+        code: 'ReadFailed',
+        message: 'A required provider read failed.',
+        phase: 'list',
+        cause: 'http',
+      },
+    };
+  return kind === 'permission'
+    ? {
+        status: 'blocked',
+        searchEngine: engine,
+        blockers: [
+          {
+            code: 'UnattributedParentPermissionRequired',
+            message:
+              'The source requires explicit private permission for unattributed parents.',
+          },
+        ],
+      }
+    : {
+        status: 'blocked',
+        searchEngine: engine,
+        blockers: [
+          {
+            code: 'SourceReportIncomplete',
+            message:
+              'The selected source report is incomplete. Obtain complete source evidence.',
+          },
+        ],
+        unknownUrlCount: 1,
+        knownMissingLocalUrls: null,
+      };
+}
+async function journey(entry: string, engine: Engine, finiteCase?: FiniteCase) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'speedyindex-p2-sdk-')));
   const home = join(root, 'home');
   mkdirSync(home, { mode: 0o700 });
@@ -419,6 +465,7 @@ async function journey(entry: string, engine: Engine) {
   const sessions: (() => Promise<void>)[] = [];
   const children: ReturnType<typeof Bun.spawn>[] = [];
   const stdout: Buffer[] = [];
+  let firstReadFailure = finiteCase === 'read_error_recovery';
   let api: Awaited<ReturnType<typeof fixture>> | undefined;
   let session: Awaited<ReturnType<typeof connectOwnedStdio>> | undefined;
   try {
@@ -437,7 +484,8 @@ async function journey(entry: string, engine: Engine) {
         caps: { tokens: 10000, indexer: 100, checker: 100 },
         retry: {
           enabled: true,
-          allowUnattributedParents: engine === 'yandex',
+          allowUnattributedParents:
+            engine === 'yandex' && finiteCase !== 'permission',
           maxAttemptsPerSource: 3,
         },
       }),
@@ -451,8 +499,11 @@ async function journey(entry: string, engine: Engine) {
     if (config.state !== 'configured')
       throw new Error('SDK configuration unavailable.');
     const now = Date.now();
-    if (engine === 'google') seedLocal(config, now);
-    const expected = oracle(config, engine, now);
+    if (engine === 'google' && !finiteCase) seedLocal(config, now);
+    const expected =
+      finiteCase && finiteCase !== 'read_error_recovery'
+        ? finiteExpected(finiteCase, engine)
+        : oracle(config, engine, now);
     const before = logicalState(state);
     record(root, 'before', before);
     const task = {
@@ -486,12 +537,28 @@ async function journey(entry: string, engine: Engine) {
             '/v2/task/yandex/indexer/list/0',
           ].includes(wire.path)
         ) {
+          if (firstReadFailure) {
+            firstReadFailure = false;
+            const body = [
+              dummyKey,
+              root,
+              policyPath,
+              'PRIVATE_READ_BODY_SENTINEL',
+            ].join('|');
+            record(root, 'failed-read', { wire, status: 503, body });
+            res.writeHead(503);
+            res.end(body);
+            return;
+          }
           response = {
             code: 0,
             page: 0,
             last_page: 0,
             result:
-              wire.path === '/v2/task/' + family + '/list/0' ? [task] : [],
+              finiteCase !== 'no_source' &&
+              wire.path === '/v2/task/' + family + '/list/0'
+                ? [task]
+                : [],
           };
         } else if (
           wire.method === 'POST' &&
@@ -511,7 +578,11 @@ async function journey(entry: string, engine: Engine) {
               type: 'indexer',
               indexed_links: [C],
               unindexed_links:
-                engine === 'google' ? [A, ASlash, A] : [A, ASlash],
+                finiteCase === 'omission'
+                  ? [A]
+                  : engine === 'google'
+                    ? [A, ASlash, A]
+                    : [A, ASlash],
             },
           };
         } else throw new Error('Unexpected retry SDK HTTP request.');
@@ -543,7 +614,7 @@ async function journey(entry: string, engine: Engine) {
       names: listed.tools.map((item) => item.name),
       planRetry: tool,
     });
-    if (engine === 'google') {
+    if (engine === 'google' && !finiteCase) {
       const rejected = await bounded(
         session.client.callTool({
           name: 'plan_retry',
@@ -559,62 +630,153 @@ async function journey(entry: string, engine: Engine) {
       expect(logicalState(state)).toEqual(before);
       record(root, 'sdk-argument-rejection', rejected);
     }
-    const result = await bounded(
-      session.client.callTool({
-        name: 'plan_retry',
-        arguments: engine === 'google' ? {} : { searchEngine: 'yandex' },
-      }),
-      8000,
-    );
-    record(root, 'result', result);
-    record(root, 'expected', expected);
-    expect(result.isError).toBe(false);
-    expect(result.content).toHaveLength(1);
-    const text = result.content[0];
-    if (text?.type !== 'text') throw new Error('SDK JSON text missing.');
-    expect(text.text).toBe(JSON.stringify(result.structuredContent));
-    expect(JSON.parse(text.text)).toEqual(result.structuredContent);
-    expect(
-      Buffer.byteLength(JSON.stringify(result), 'utf8'),
-    ).toBeLessThanOrEqual(2097152);
-    const actual: unknown = planRetryResultSchema.parse(
-      result.structuredContent,
-    );
-    expect(actual).toEqual(expected);
-    const encoded = JSON.stringify(result);
-    for (const secret of [
-      dummyKey,
-      credential,
-      root,
-      state,
-      policyPath,
-      'PRIVATE_PROVIDER_TITLE_SENTINEL',
-      'retry-read-only-inspection',
-    ])
-      expect(encoded).not.toContain(secret);
-    const pass = [
-      { method: 'GET', path: '/v2/task/google/indexer/list/0', body: '' },
-      {
-        method: 'GET',
-        path: '/v2/task/google/indexer/list/0?filter=drip_feed',
-        body: '',
-      },
-      { method: 'GET', path: '/v2/task/yandex/indexer/list/0', body: '' },
-      {
-        method: 'POST',
-        path: '/v2/task/' + family + '/status',
-        body: JSON.stringify({ task_ids: [parent] }),
-      },
-      {
-        method: 'POST',
-        path: '/v2/task/' + family + '/report',
-        body: JSON.stringify({ task_id: parent }),
-      },
-    ];
-    expect(wires).toEqual([...pass, ...pass]);
-    const after = logicalState(state);
-    expect(after).toEqual(before);
-    record(root, 'after', after);
+    if (finiteCase) {
+      const lists = [
+        { method: 'GET', path: '/v2/task/google/indexer/list/0', body: '' },
+        {
+          method: 'GET',
+          path: '/v2/task/google/indexer/list/0?filter=drip_feed',
+          body: '',
+        },
+        { method: 'GET', path: '/v2/task/yandex/indexer/list/0', body: '' },
+      ];
+      const pass = [
+        ...lists,
+        {
+          method: 'POST',
+          path: '/v2/task/' + family + '/status',
+          body: JSON.stringify({ task_ids: [parent] }),
+        },
+        {
+          method: 'POST',
+          path: '/v2/task/' + family + '/report',
+          body: JSON.stringify({ task_id: parent }),
+        },
+      ];
+      const phases =
+        finiteCase === 'read_error_recovery'
+          ? ['failure', 'recovery']
+          : ['finite'];
+      const order: string[] = [];
+      for (const phase of phases) {
+        order.push(phase + '_call');
+        const phaseExpected: unknown =
+          phase === 'failure' ? finiteExpected(finiteCase, engine) : expected;
+        const result = await bounded(
+          session.client.callTool({
+            name: 'plan_retry',
+            arguments: engine === 'google' ? {} : { searchEngine: 'yandex' },
+          }),
+          8000,
+        );
+        order.push(phase + '_reply');
+        const label = phase === 'finite' ? '' : phase + '-';
+        record(root, label + 'result', result);
+        record(root, label + 'expected', phaseExpected);
+        expect(result.isError).toBe(phase === 'failure');
+        expect(result.content).toHaveLength(1);
+        const text = result.content[0];
+        if (text?.type !== 'text') throw new Error('SDK JSON text missing.');
+        expect(text.text).toBe(JSON.stringify(result.structuredContent));
+        expect(JSON.parse(text.text)).toEqual(result.structuredContent);
+        expect(
+          Buffer.byteLength(JSON.stringify(result), 'utf8'),
+        ).toBeLessThanOrEqual(2097152);
+        const actual: unknown = planRetryResultSchema.parse(
+          result.structuredContent,
+        );
+        expect(actual).toEqual(phaseExpected);
+        const encoded = JSON.stringify(result);
+        for (const secret of [
+          dummyKey,
+          credential,
+          root,
+          state,
+          policyPath,
+          'PRIVATE_PROVIDER_TITLE_SENTINEL',
+          'PRIVATE_READ_BODY_SENTINEL',
+          'retry-read-only-inspection',
+        ])
+          expect(encoded).not.toContain(secret);
+        const after = logicalState(state);
+        record(root, label + 'after', after);
+        expect(after).toEqual(before);
+        expect(api.requests.every((request) => request.auth === dummyKey)).toBe(
+          true,
+        );
+        const expectedWires =
+          phase === 'failure'
+            ? lists.slice(0, 1)
+            : phase === 'recovery'
+              ? [...lists.slice(0, 1), ...pass, ...pass]
+              : finiteCase === 'no_source'
+                ? [...lists, ...lists]
+                : [...pass, ...pass];
+        record(root, label + 'expected-wires', expectedWires);
+        expect(wires).toEqual(expectedWires);
+      }
+      record(root, 'call-order', {
+        order,
+        childPids: children.map((child) => child.pid),
+      });
+    } else {
+      const result = await bounded(
+        session.client.callTool({
+          name: 'plan_retry',
+          arguments: engine === 'google' ? {} : { searchEngine: 'yandex' },
+        }),
+        8000,
+      );
+      record(root, 'result', result);
+      record(root, 'expected', expected);
+      expect(result.isError).toBe(false);
+      expect(result.content).toHaveLength(1);
+      const text = result.content[0];
+      if (text?.type !== 'text') throw new Error('SDK JSON text missing.');
+      expect(text.text).toBe(JSON.stringify(result.structuredContent));
+      expect(JSON.parse(text.text)).toEqual(result.structuredContent);
+      expect(
+        Buffer.byteLength(JSON.stringify(result), 'utf8'),
+      ).toBeLessThanOrEqual(2097152);
+      const actual: unknown = planRetryResultSchema.parse(
+        result.structuredContent,
+      );
+      expect(actual).toEqual(expected);
+      const encoded = JSON.stringify(result);
+      for (const secret of [
+        dummyKey,
+        credential,
+        root,
+        state,
+        policyPath,
+        'PRIVATE_PROVIDER_TITLE_SENTINEL',
+        'retry-read-only-inspection',
+      ])
+        expect(encoded).not.toContain(secret);
+      const pass = [
+        { method: 'GET', path: '/v2/task/google/indexer/list/0', body: '' },
+        {
+          method: 'GET',
+          path: '/v2/task/google/indexer/list/0?filter=drip_feed',
+          body: '',
+        },
+        { method: 'GET', path: '/v2/task/yandex/indexer/list/0', body: '' },
+        {
+          method: 'POST',
+          path: '/v2/task/' + family + '/status',
+          body: JSON.stringify({ task_ids: [parent] }),
+        },
+        {
+          method: 'POST',
+          path: '/v2/task/' + family + '/report',
+          body: JSON.stringify({ task_id: parent }),
+        },
+      ];
+      expect(wires).toEqual([...pass, ...pass]);
+      const after = logicalState(state);
+      expect(after).toEqual(before);
+      record(root, 'after', after);
+    }
   } catch (error) {
     errors.push(error);
   } finally {
@@ -658,6 +820,7 @@ async function journey(entry: string, engine: Engine) {
   record(root, 'resources', {
     entry,
     engine,
+    ...(finiteCase ? { finiteCase } : {}),
     passed: errors.length === 0 && cleanup.length === 0,
     settled: cleanup.length === 0,
     sessionsClosed: sessions.length,
@@ -680,6 +843,7 @@ async function journey(entry: string, engine: Engine) {
         root,
         entry,
         engine,
+        ...(finiteCase ? { finiteCase } : {}),
         passed: errors.length === 0 && cleanup.length === 0,
         settled: cleanup.length === 0,
       }),
@@ -693,4 +857,11 @@ async function journey(entry: string, engine: Engine) {
 export async function verifyPlanRetrySdk(entry: string) {
   for (const engine of ['google', 'yandex'] as const)
     await journey(entry, engine);
+}
+
+export async function verifyPlanRetryFiniteSdk(
+  entry: string,
+  kind: FiniteCase,
+) {
+  await journey(entry, kind === 'no_source' ? 'google' : 'yandex', kind);
 }
