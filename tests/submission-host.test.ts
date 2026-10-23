@@ -2835,7 +2835,7 @@ test('C15 SOURCE SDK: real CLI cancellation after full POST persists unknown, fr
       );
     };
     const session = await h.sdk();
-    expect((await session.client.listTools()).tools).toHaveLength(7);
+    expect((await session.client.listTools()).tools).toHaveLength(8);
     const controller = new AbortController();
     const input = request('sdk-after-receipt');
     const call = h.track(
@@ -3058,7 +3058,7 @@ test('C15 SOURCE CLI: incomplete or malformed trusted configuration disables wri
         state: 'invalid',
         stateChecked: false,
       });
-      expect((await session.client.listTools()).tools).toHaveLength(7);
+      expect((await session.client.listTools()).tools).toHaveLength(8);
       expect(
         (await session.client.callTool({ name: 'get_balance', arguments: {} }))
           .isError,
