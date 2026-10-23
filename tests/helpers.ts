@@ -322,6 +322,7 @@ export async function connect(
         DEFAULT_INHERITED_ENV_VARS.map((name) => [name, '']),
       ),
       HOME: fixtureHome,
+      TMPDIR: fixtureHome,
       SPEEDYINDEX_API_KEY: key,
       TEST_ACCOUNT_ORIGIN: origin,
       TEST_FETCH_MODE: mode,

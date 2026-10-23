@@ -9,6 +9,7 @@ import { registerCreateIndexingTask } from './tools/create-indexing-task';
 import { registerCreateIndexCheck } from './tools/create-index-check';
 import { registerCreateBacklinkCheck } from './tools/create-backlink-check';
 import { registerPlanRetry } from './tools/plan-retry';
+import { registerGetRetryHistory } from './tools/get-retry-history';
 import { SubmissionHost } from './submission-host';
 
 export function createServer(
@@ -24,5 +25,6 @@ export function createServer(
   registerCreateIndexCheck(server, submissionHost);
   registerCreateBacklinkCheck(server, submissionHost);
   registerPlanRetry(server, submissionHost);
+  registerGetRetryHistory(server, submissionHost);
   return server;
 }

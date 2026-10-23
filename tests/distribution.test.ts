@@ -101,6 +101,7 @@ test('LT-08: built CLI registers and calls all four read-only tools', async () =
       'create_index_check',
       'create_backlink_check',
       'plan_retry',
+      'get_retry_history',
     ]);
     const result = await session.client.callTool({
       name: 'get_balance',
@@ -337,7 +338,7 @@ async function withBuiltSubmission(
   if (failures.length) throw failures[0];
 }
 
-test('C15 BUILT: eight-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
+test('C15 BUILT: nine-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
   await withBuiltSubmission(async (h) => {
     const session = await h.open([], '');
     const { tools } = await bounded(session.client.listTools());
@@ -350,6 +351,7 @@ test('C15 BUILT: eight-tool schemas, paid annotations, no-key preview, disabled 
       'create_index_check',
       'create_backlink_check',
       'plan_retry',
+      'get_retry_history',
     ]);
     await verifyUnconfiguredReads(session.client);
     const checker = tools[5]!;
@@ -651,7 +653,7 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
       state,
     ];
     let session = await h.open(args);
-    expect((await bounded(session.client.listTools())).tools).toHaveLength(8);
+    expect((await bounded(session.client.listTools())).tools).toHaveLength(9);
     async function call(input: Record<string, unknown>) {
       const result = await bounded(
         session.client.callTool({

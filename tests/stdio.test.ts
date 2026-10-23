@@ -135,6 +135,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       'create_index_check',
       'create_backlink_check',
       'plan_retry',
+      'get_retry_history',
     ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
@@ -661,7 +662,7 @@ test('F02: direct stdin EOF after initialize exits successfully', async () => {
   await verifyEof('src/cli.ts');
 });
 
-test('IC10/C15 SOURCE SDK: eight tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
+test('IC10/C15 SOURCE SDK: nine tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
   const api = await fixture((_request, response) => response.end('unexpected'));
   let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
@@ -676,6 +677,7 @@ test('IC10/C15 SOURCE SDK: eight tools expose strict schemas, paid annotations, 
       'create_index_check',
       'create_backlink_check',
       'plan_retry',
+      'get_retry_history',
     ]);
     await verifyUnconfiguredReads(session.client);
     const checker = tools[5]!;
