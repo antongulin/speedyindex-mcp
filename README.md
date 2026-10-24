@@ -5,7 +5,7 @@ An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server f
 [![CI](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-This Bun/TypeScript source branch exposes nine tools over stdio: **`get_balance`**, **`list_tasks`**, **`get_task_status`**, **`get_task_report`**, **`create_indexing_task`**, **`create_index_check`**, **`create_backlink_check`**, **`plan_retry`**, and **`get_retry_history`**. Submissions are disabled by default; create previews work without a key or database. Retry planning and local retry history require existing private configuration and V2 state. Index-check and backlink-check reservations require operator-selected policy profiles. `get_balance` returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published; branch implementation is not delivery evidence.
+The Bun/TypeScript server exposes eight tools over stdio: **`get_balance`**, **`list_tasks`**, **`get_task_status`**, **`get_task_report`**, **`create_indexing_task`**, **`create_index_check`**, **`create_backlink_check`**, and **`plan_retry`**. Submissions are disabled by default; create previews work without a key or database. Read-only retry planning requires existing private configuration and V2 state. Index-check and backlink-check reservations require operator-selected policy profiles. `get_balance` returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published.
 
 ## Run from source
 
@@ -21,7 +21,7 @@ bun --no-env-file dist/cli.js --help
 
 Sign in to the [official SpeedyIndex API page](https://app.speedyindex.com/cabinet/api) to obtain your own API key. See the [public API reference](https://en.speedyindex.com/api.php) for provider documentation.
 
-Provide `SPEEDYINDEX_API_KEY` through your process manager's secret environment, then launch `bun --no-env-file dist/cli.js` from the repository directory. It waits for an MCP client on stdin/stdout; it is not an interactive shell command. For development, use `bun --no-env-file src/cli.ts`. Put Bun's `--no-env-file` before the entrypoint to prevent Bun's automatic environment-file loading. The server adds no environment-file loader; your launcher controls its process environment. `.env.example` documents the key variable. A key alone permits account/task reads, with submissions still disabled; planning and history need the configured host described below. Missing keys leave startup and previews usable; account/task reads fail without network access.
+Provide `SPEEDYINDEX_API_KEY` through your process manager's secret environment, then launch `bun --no-env-file dist/cli.js` from the repository directory. It waits for an MCP client on stdin/stdout; it is not an interactive shell command. For development, use `bun --no-env-file src/cli.ts`. Put Bun's `--no-env-file` before the entrypoint to prevent Bun's automatic environment-file loading. The server adds no environment-file loader; your launcher controls its process environment. `.env.example` documents the key variable. A key alone permits reads, with submissions still disabled. Missing keys leave startup and previews usable; read calls fail without network access.
 
 For hosted use, register an upstream through your existing MCP proxy infrastructure. This repository does not provision hosting or register a proxy upstream. The committed `.mcp.json` configures optional **CodeGraph source navigation only**.
 
@@ -152,59 +152,6 @@ Planning creates no jobs, reservations, retry/adoption rows or parent history, a
 
 The shared owner keeps its guard through final local/time/day checks, awaited native settlement and close, then a final freshness check. Clean settled failure permits reuse; unverified cleanup blocks new work in that host until restart while pure previews and exact durable replay remain available. Synchronous SQL/CPU can delay cancellation, and queued JavaScript cancellation needs an I/O opportunity. SDK cancellation may suppress the application reply, so client rejection alone does not establish owner completion. Public `submit_retry` and deterministic one-shot execution remain unimplemented.
 
-## Read-only local retry history
-
-Call `get_retry_history` with `{}` for both Google and Yandex, up to 25 entries. To filter an exact recorded parent and state:
-
-```json
-{
-  "searchEngine": "yandex",
-  "parentTaskId": "parent-task-id",
-  "state": "unknown",
-  "limit": 2
-}
-```
-
-The closed input accepts only these optional fields:
-
-| Field          | Contract                                                                                                                             |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `searchEngine` | `google` or `yandex`; omission selects both.                                                                                         |
-| `parentTaskId` | Requires `searchEngine`. Exact, nonblank safe Unicode ID, at most 4,096 UTF-8 bytes; preserve spaces, case and spelling.             |
-| `state`        | One of `prepared`, `dispatching`, `accepted`, `rejected`, `unknown`, `cancelled`.                                                    |
-| `limit`        | Integer 1 through 25; omission uses 25.                                                                                              |
-| `cursor`       | Canonical unpadded base64url text, at most 512 ASCII characters. Pass the returned cursor unchanged with the same filters and limit. |
-
-Extra fields and null selectors are invalid. There is no caller-selected key, policy, path, proof, clock, byte limit or write authority. The CLI uses the existing `--submission-policy` and `--submission-state` setup with a matching key and valid enabled policy to construct a configured host. History does not require `retry.enabled` or adoption permission and does not apply paid-work eligibility or reserve units. It opens only existing complete V2 state, without HTTP, automatic initialization, migration or repair.
-
-| Application status | Contract                                                                                                                                                                                                      |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ok`               | `snapshot` revision/capture time, `coverage`, `counts`, `page` and ordered `entries`. A valid empty store or empty selection returns zero matching entries and `nextCursor: null`.                            |
-| `blocked`          | Fixed `reason.code`: `ReadConfigurationUnavailable`, `StateMissing`, or `V2Required`. No entries.                                                                                                             |
-| `error`            | Fixed `error.code`: `InvalidInput`, `CursorMismatch`, `SnapshotChanged`, `StateUnavailable`, `HistoryBusy`, `ResourceLimitExceeded`, `Cancelled`, `DeadlineExceeded`, or `InternalError`. No partial entries. |
-
-For example, a configured missing store returns this structured result with `isError: false`:
-
-```json
-{
-  "status": "blocked",
-  "reason": {
-    "code": "StateMissing",
-    "message": "The configured local state does not exist."
-  }
-}
-```
-
-The snapshot validates the selected key's complete local V2 history across families, scopes, policies and periods before filtering. Entries cover recorded Google/Yandex indexer retry contexts. `counts` separates all local retry attempts, matching attempts before pagination, legacy unattributed records and ambiguous local provider references. Legacy records are not asserted to be retries. `source.recordedAttempts` counts all recorded states for the exact parent family and ID. Coverage inception, earlier discarded history, original ancestry and provider-wide coverage remain unknown, including for an empty result. This is a coherent local observation, not the planner's two-pass provider evidence or a guarantee of response-time freshness.
-
-Each entry includes a comparison-only `attemptRef`, family, state/version, nullable provider ID, ambiguity flag, recorded source attribution, nullable timestamps/reservation/URL count, and unresolved-hold flag. Prepared, dispatching and unknown attempts retain available hold details. Unambiguous accepted attempts retain their submitted URL count but have null timestamps and reservation; rejected/cancelled attempts also have null URL counts. Ambiguous accepted references retain available detail. Timestamp and reservation integers use decimal strings. Unknown metadata stays null rather than zero or a reconstructed value. Source attribution distinguishes local standalone, legacy or retry manifests, ambiguous references and unattributed manifests; original ancestry stays unknown. Credentials, raw request IDs, paths, URLs, ledger identity and proof/ownership preimages stay private.
-
-Entries sort by ordinal `attemptRef`, not chronology. `page.nextCursor` binds the exact query, effective limit and snapshot revision. A changed query returns `CursorMismatch` before revision comparison; a changed revision returns `SnapshotChanged`. Start a new query after either refusal. Each call reads a fresh coherent snapshot; continuation never silently recomputes a page on a new revision. A small page cannot bypass whole-store validation or resource limits, and opaque refs/cursors grant no submission authority.
-
-Every application branch has identical JSON text and structured content, with `isError` true exactly for `error`. SDK input rejection is separate and may have no application structured result. The complete application envelope, including `isError`, escaped JSON text and duplicate structured data, fits **2,097,152 UTF-8 bytes inclusively**. Overflow returns fixed `ResourceLimitExceeded` without truncation. SDK JSON-RPC framing/metadata, RSS and hard latency are outside this bound.
-
-History preserves logical SQL rows/schema/versions but can change physical WAL/SHM bookkeeping and needs writable private storage. The owner keeps one pre-SQL monotonic budget and its independent history guard through native close, an actual I/O cancellation opportunity, awaited budget settlement and a final signal/clock check. Synchronous SQL/CPU can delay cancellation; SDK cancellation may suppress the reply. Client rejection alone proves no owner completion. Reuse follows settled owner cleanup; clean refusals/cancellation permit the next call on the same host. An opaque snapshot `ReadFailure` conservatively disables only that host's history reader until restart. History leaves create/planner authority unchanged. See [maintenance](docs/state-maintenance.md#read-only-local-history) for existing-state and recovery boundaries.
-
 ## Optional operator setup
 
 Use only canonical absolute POSIX paths you explicitly select. The state parent must already exist and be trusted. Initialize a new private state directory with this local command, which requires no key, policy, network or MCP session:
@@ -289,7 +236,7 @@ The tests use dummy credentials, loopback HTTP fixtures, the official MCP client
 
 See [architecture](docs/architecture.md), [dependency decisions](docs/dependencies.md), [contributing](CONTRIBUTING.md), [security reporting](SECURITY.md), [agent guidance](AGENTS.md), and the [LLM documentation index](llms.txt).
 
-Three public tools remain in the [roadmap](docs/implementation-plan.md): `submit_retry`, `compare_reports`, and `summarize_campaigns`. Deterministic one-shot execution and scheduling also remain unimplemented. This source branch implements read-only `plan_retry` and `get_retry_history`; implementation and synthetic verification do not establish a release, provider activation or delivery of the remaining workflow.
+Four public tools remain in the [roadmap](docs/implementation-plan.md): `submit_retry`, `compare_reports`, `summarize_campaigns`, and `get_retry_history`. Deterministic one-shot execution and scheduling also remain unimplemented. This source tree implements read-only `plan_retry`; implementation and synthetic verification do not establish a release, provider activation or delivery of the remaining workflow.
 
 The V2 foundation preserves explicit new-state initialization, offline V1 migration, coherent bounded local snapshots, mode-separated exact replay and internal atomic retry admission. Planning inspection reads period/cap/lifetime decisions without creating reservations or periods. The production owner composes same-key two-pass HTTP observations with final coherent readers under the shared host guard. Local accepted manifests and permitted external observed corpora keep distinct provenance, without invented parents. Internal proofs stay private; public comparison data cannot authorize a paid retry. See the [architecture](docs/architecture.md) for bounds, replay and historical-evidence limits, and [state maintenance](docs/state-maintenance.md) for migration and recovery constraints.
 

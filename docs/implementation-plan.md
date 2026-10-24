@@ -1,6 +1,6 @@
 # Implementation plan
 
-The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_task_status`, `get_task_report`, `create_indexing_task`, guarded `create_index_check`, guarded `create_backlink_check`, read-only `plan_retry`, and local `get_retry_history`. Three further public tools remain planned and unimplemented. No package or release is published.
+The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_task_status`, `get_task_report`, `create_indexing_task`, guarded `create_index_check`, guarded `create_backlink_check`, and read-only `plan_retry`. Four further public tools remain planned and unimplemented. No package or release is published.
 
 | Order       | Planned tool            | Intended scope                                       |
 | ----------- | ----------------------- | ---------------------------------------------------- |
@@ -15,9 +15,9 @@ The Bun/TypeScript stdio server implements `get_balance`, `list_tasks`, `get_tas
 | Later       | `submit_retry`          | Submit an explicitly approved retry                  |
 | Later       | `compare_reports`       | Compare task reports                                 |
 | Later       | `summarize_campaigns`   | Summarize related task outcomes                      |
-| Implemented | `get_retry_history`     | Read recorded local V2 retry attempts                |
+| Later       | `get_retry_history`     | Inspect recorded retry activity                      |
 
-The current source tree exposes all nine implemented tools. Branch implementation and synthetic checks are not release or delivery evidence. Writes are disabled by default. Operators explicitly choose private policy/state paths, expected key binding and finite independent token/indexer/checker caps; no active configuration is selected here. Startup/create previews never open state; configured retry planning and history read existing complete V2 state, and only explicit local new-only V1/V2 init commands create it; explicit offline migration never runs at startup. See [README.md](../README.md) for setup and [architecture](architecture.md) for validation, cancellation and persistence boundaries. Synthetic HTTP, real SQLite/process tests and SDK source/built journeys exercise these contracts without live provider calls.
+The current source tree exposes all eight implemented tools. Branch implementation and synthetic checks are not release or delivery evidence. Writes are disabled by default. Operators explicitly choose private policy/state paths, expected key binding and finite independent token/indexer/checker caps; no active configuration is selected here. Startup/create previews never open state; configured retry planning reads existing complete V2 state, and only explicit local new-only V1/V2 init commands create it; explicit offline migration never runs at startup. See [README.md](../README.md) for setup and [architecture](architecture.md) for validation, cancellation and persistence boundaries. Synthetic HTTP, real SQLite/process tests and SDK source/built journeys exercise these contracts without live provider calls.
 
 The optional private retry policy records trusted settings in immutable policy identity. `plan_retry` additionally requires matching enabled configuration and existing complete V2 state; the field alone supplies no verified observations or paid authority. External/legacy corpora need explicit private permission and retain unknown original ancestry. Planning adds no adopted parents, retry rows or reservations.
 
@@ -39,14 +39,6 @@ The internal observation/comparison core, production owner composition and publi
 - Reuse the local SQLite submission ledger for durable request identity, reservations and dispatch state, with separately accepted lineage and retry eligibility. Provider idempotency is not documented; current unknown/dispatching/prepared holds permit no automatic resend, expiry or release. A future retry tool must establish eligibility without bypassing those holds.
 - Observe provider results separately from submission. A terminal provider result records that provider's outcome and does not establish fresh Google indexing truth.
 
-## Local retry history
-
-`get_retry_history` is implemented on this source branch through a pure projection, native query-only owner and ninth adapter on the configured host. The strict optional selectors choose both engines and 25 entries by default; parent requires an exact engine/ID, and cursors bind the query, limit and revision. Each call validates the complete selected-key V2 snapshot across scopes/families/policies/periods before returning recorded indexer retry contexts. The [public contract](../README.md#read-only-local-retry-history) preserves all six local states, counts, nullable terminal details, unknown ancestry/inception/provider-wide history and comparison-only refs. History does no provider observation, paid admission or logical write; the existing CLI loader still requires matching enabled configuration. Absent/disabled retry permission does not block it.
-
-The owner captures one original pre-SQL budget, native closure, actual I/O cancellation delivery and awaited budget settlement before final publication/reuse. Opaque read failure conservatively disables only history until restart. The inclusive 2,097,152-byte application bound counts escaped text and duplicate structured content; logical read-only permits physical WAL/SHM bookkeeping. Missing/V1/empty and cursor refusals preserve their distinct outcomes without automatic init/migration or page recomputation.
-
-Pure/native cases cover projection identity, metadata gaps, complete-audit/filter boundaries, cursor/revision semantics, exact escaped-byte limits, real SQLite close and owner settlement. Two saved protocol/entry preparation cases precede new helper use. Thirteen source/built SDK cases cover the strict nine-tool inventory, genuine six-state history/SQL oracles, finite states and continuation, source-only lower-limit error surfacing and actual queued cancellation/recovery. Built CLI cases retain real framing/EOF/reap/SQL evidence without injected owner phases. These tests do not establish a release or provider activation. Mandatory full candidate checks, exact-head review, pinned-runtime CI and delivery remain separate gates. Public retry dispatch, deterministic one-shot execution and scheduling remain unimplemented.
-
 ## Review and delivery
 
 Robin review automation is installed on the default branch. Substantive changes require a real review of their exact head plus CI and delivery verification. The workflow excludes `synchronize`; later pushes need an authorized manual review within the task budget. Fork PR events lack repository secrets and need an authorized maintainer command through the default-branch workflow. Deployment, scheduling, and releases remain outside this foundation.
@@ -59,7 +51,7 @@ The three internal task-read methods accept one optional trusted budget for shar
 
 ## Internal observation and comparison core (P1B)
 
-The internal collector and pure core now cover complete same-key three-stream/two-pass observations, exact source/corpus/exclusion rules, regular quotes and comparison preimages. Native synthetic HTTP tests cover inclusive pagination, reference/status/raw/request/retained limits, fixed failure mapping and actual collect/cancel/close settlement. Real private configuration and V2 query-only readers produce local and permitted external internal proposals; complete logical projections verify no planning writes or invented external parent. Pure identities use the existing fingerprint and final revision/period/lifetime/three-unit decisions. These internal cases retain their coverage alongside public planning and local history; three public tools remain unfinished.
+The internal collector and pure core now cover complete same-key three-stream/two-pass observations, exact source/corpus/exclusion rules, regular quotes and comparison preimages. Native synthetic HTTP tests cover inclusive pagination, reference/status/raw/request/retained limits, fixed failure mapping and actual collect/cancel/close settlement. Real private configuration and V2 query-only readers produce local and permitted external internal proposals; complete logical projections verify no planning writes or invented external parent. Pure identities use the existing fingerprint and final revision/period/lifetime/three-unit decisions. These internal cases retain their coverage alongside the eighth public tool; four public tools remain unfinished.
 
 Planner implementation and remaining acceptance gates:
 
