@@ -20,10 +20,24 @@ import { taskReportOutputSchema } from '../src/task-report';
 import { account, bounded, connect, dummyKey, fixture } from './helpers';
 import { verifyEof } from './stdio-eof';
 import {
+  verifyRetryHistorySourceSdk,
+  verifyRetryHistoryFiniteSdk,
+  retryHistoryFiniteCases,
+} from './get-retry-history-sdk';
+import {
   verifyPlanRetrySdk,
   verifyPlanRetryFiniteSdk,
   planRetryFiniteCases,
 } from './plan-retry-sdk';
+
+test('GRH-15 BUILT CLI nine tools and genuine selected-key six-state history paginate without writes', async () => {
+  await verifyRetryHistorySourceSdk('dist/cli.js');
+}, 30000);
+
+for (const kind of retryHistoryFiniteCases)
+  test(`GRH-16 BUILT finite ${kind}`, async () => {
+    await verifyRetryHistoryFiniteSdk(kind, 'dist/cli.js');
+  }, 30000);
 
 test('P2-06 BUILT SDK: strict advertised plan_retry and genuine local/external ready', async () => {
   await verifyPlanRetrySdk('dist/cli.js');
@@ -101,6 +115,7 @@ test('LT-08: built CLI registers and calls all four read-only tools', async () =
       'create_index_check',
       'create_backlink_check',
       'plan_retry',
+      'get_retry_history',
     ]);
     const result = await session.client.callTool({
       name: 'get_balance',
@@ -337,7 +352,7 @@ async function withBuiltSubmission(
   if (failures.length) throw failures[0];
 }
 
-test('C15 BUILT: eight-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
+test('C15 BUILT: nine-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
   await withBuiltSubmission(async (h) => {
     const session = await h.open([], '');
     const { tools } = await bounded(session.client.listTools());
@@ -350,6 +365,7 @@ test('C15 BUILT: eight-tool schemas, paid annotations, no-key preview, disabled 
       'create_index_check',
       'create_backlink_check',
       'plan_retry',
+      'get_retry_history',
     ]);
     await verifyUnconfiguredReads(session.client);
     const checker = tools[5]!;
@@ -651,7 +667,7 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
       state,
     ];
     let session = await h.open(args);
-    expect((await bounded(session.client.listTools())).tools).toHaveLength(8);
+    expect((await bounded(session.client.listTools())).tools).toHaveLength(9);
     async function call(input: Record<string, unknown>) {
       const result = await bounded(
         session.client.callTool({

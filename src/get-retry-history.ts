@@ -693,11 +693,11 @@ export function retryHistoryFromSnapshot(
   }
 }
 
-export interface RetryHistoryToolResult {
+export type RetryHistoryToolResult = {
   readonly isError: boolean;
-  readonly content: readonly { readonly type: 'text'; readonly text: string }[];
+  readonly content: { readonly type: 'text'; readonly text: string }[];
   readonly structuredContent: RetryHistoryResult;
-}
+};
 const productionBytes = 2_097_152;
 function envelope(value: RetryHistoryResult): RetryHistoryToolResult {
   return freeze({

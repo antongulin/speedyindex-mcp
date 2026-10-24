@@ -54,7 +54,7 @@ test('P2-08 preload rejects extra, duplicate, PPR and other-route queries before
         ],
         {
           cwd: process.cwd(),
-          env: { HOME: root, TEST_ACCOUNT_ORIGIN: api.origin },
+          env: { HOME: root, TMPDIR: root, TEST_ACCOUNT_ORIGIN: api.origin },
           stdin: 'ignore',
           stdout: 'pipe',
           stderr: 'pipe',
@@ -151,6 +151,7 @@ for (const arg of ['--help', '--version', '--unsupported']) {
             'get_task_report',
             'create_indexing_task',
             'plan_retry',
+            'get_retry_history',
           ])
             expect(stdout).toContain(tool);
       }
@@ -217,6 +218,7 @@ async function withLocalCli(
       {
         env: {
           HOME: commandHome,
+          TMPDIR: commandHome,
           TEST_ACCOUNT_ORIGIN: api.origin,
           ...(key === undefined ? {} : { SPEEDYINDEX_API_KEY: key }),
         },

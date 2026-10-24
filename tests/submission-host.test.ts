@@ -645,6 +645,7 @@ async function makeHarness() {
               SPEEDYINDEX_API_KEY: apiKey,
               TEST_ACCOUNT_ORIGIN: api.origin,
               HOME: root,
+              TMPDIR: root,
               TEST_SUBMISSION_POLICY: policyPath,
               TEST_SUBMISSION_STATE: stateDirectory,
               TEST_SUBMISSION_NOW: String(now),
@@ -2835,7 +2836,7 @@ test('C15 SOURCE SDK: real CLI cancellation after full POST persists unknown, fr
       );
     };
     const session = await h.sdk();
-    expect((await session.client.listTools()).tools).toHaveLength(8);
+    expect((await session.client.listTools()).tools).toHaveLength(9);
     const controller = new AbortController();
     const input = request('sdk-after-receipt');
     const call = h.track(
@@ -3058,7 +3059,7 @@ test('C15 SOURCE CLI: incomplete or malformed trusted configuration disables wri
         state: 'invalid',
         stateChecked: false,
       });
-      expect((await session.client.listTools()).tools).toHaveLength(8);
+      expect((await session.client.listTools()).tools).toHaveLength(9);
       expect(
         (await session.client.callTool({ name: 'get_balance', arguments: {} }))
           .isError,

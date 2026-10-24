@@ -15,7 +15,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "bun test --no-env-file tests/client.test.ts tests/task-status.test.ts tests/task-report.test.ts tests/stdio.test.ts tests/cli.test.ts tests/submission-ledger.test.ts tests/retry-ledger.test.ts tests/create-indexing-task.test.ts tests/submission-policy.test.ts tests/submission-host.test.ts tests/create-index-check.test.ts tests/create-backlink-check.test.ts tests/retry-observation.test.ts tests/plan-retry.test.ts tests/get-retry-history.test.ts tests/retry-history-owner.test.ts",
+    "test": "bun test --no-env-file tests/get-retry-history-protocol.test.ts tests/client.test.ts tests/task-status.test.ts tests/task-report.test.ts tests/stdio.test.ts tests/cli.test.ts tests/submission-ledger.test.ts tests/retry-ledger.test.ts tests/create-indexing-task.test.ts tests/submission-policy.test.ts tests/submission-host.test.ts tests/create-index-check.test.ts tests/create-backlink-check.test.ts tests/retry-observation.test.ts tests/plan-retry.test.ts tests/get-retry-history.test.ts tests/retry-history-owner.test.ts",
     "test:built": "bun test --no-env-file tests/distribution.test.ts"
   },
   "dependencies": {

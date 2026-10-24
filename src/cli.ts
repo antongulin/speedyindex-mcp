@@ -21,8 +21,9 @@ Usage: bun src/cli.ts [--help | --version]
 
 Stdio MCP server exposing get_balance, list_tasks, get_task_status,
 get_task_report, create_indexing_task, create_index_check, create_backlink_check,
-and plan_retry.
+plan_retry, and get_retry_history.
 plan_retry observes and plans without writes under configured private retry policy.
+get_retry_history reads configured local V2 history without provider requests.
 All three create tools default to disabled writes; pure previews need no key/state.
 Index and backlink checks require explicit opt-in and operator-selected reservation
 profiles in enabled trusted configuration. Reservations are not provider fees.
