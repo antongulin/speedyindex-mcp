@@ -38,6 +38,8 @@ The complete application envelope is JSON `{content:[{type:'text',text:JSON.stri
 
 Keep stdout exclusively MCP protocol except explicit help/version and local fingerprint/init/migration output. Fixed application errors must not reflect raw exceptions. No default paths/caps, environment-file loader, state initialization at startup, reload loop, reconciliation or scheduler. Restart all cooperating hosts after policy changes.
 
+`get-retry-history.ts` owns internal history projection; `retry-history-owner.ts` composes it with existing selected-key V2 readers. These modules register no public tool. Preserve query-only opening without bootstrap or repair, actual native settlement and the original freshness/cancellation fence before publication. Missing historical terminal metadata stays unknown; local history supplies no provider-wide coverage or retry authority.
+
 ## Work Guidance
 
 Reconcile affected contracts and verify behavior through public boundaries.

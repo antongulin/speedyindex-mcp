@@ -62,6 +62,12 @@ import {
   type PlanRetryToolResult,
 } from './plan-retry-result';
 import { freezeSnapshot } from './retry-ledger-snapshot';
+import {
+  createRetryHistoryOwner,
+  type RetryHistoryOwner,
+  type RetryHistoryOwnerOptions,
+} from './retry-history-owner';
+import type { RetryHistoryToolResult } from './get-retry-history';
 
 type PublicError = SubmissionError<CreateIndexCheckErrorCode>;
 interface BaseResult {
@@ -190,6 +196,8 @@ const backlinkStrategy: SubmissionStrategy<CreateBacklinkCheckResult> =
   });
 
 export interface SubmissionHostOptions {
+  /** Captured diagnostic-only wiring; no public selector or paid guard. */
+  history?: RetryHistoryOwnerOptions;
   fetchRequest?: typeof fetch;
   clock?: () => number;
   openLedger?: (options: LedgerPathOptions) => SubmissionLedger;
@@ -397,12 +405,14 @@ export class SubmissionHost {
   private readonly configuration: SubmissionConfiguration;
   private readonly retry: Readonly<ProductionRetryComposition> | undefined;
   private readonly publicResultBytes: number;
+  private readonly history: RetryHistoryOwner;
 
   constructor(
     configuration: SubmissionConfiguration = loadSubmissionConfiguration(),
     options: SubmissionHostOptions = {},
   ) {
     this.configuration = freezeSnapshot(structuredClone(configuration));
+    this.history = createRetryHistoryOwner(this.configuration, options.history);
     this.fetchRequest = options.fetchRequest?.bind(options) ?? globalThis.fetch;
     this.clock = options.clock?.bind(options) ?? Date.now;
     this.open = options.openLedger?.bind(options) ?? openLedger;
@@ -444,6 +454,14 @@ export class SubmissionHost {
         this.retry = undefined;
       }
     }
+  }
+
+  /** Internal no-write inspection. Public registration and result schemas are separate. */
+  async getRetryHistoryToolResult(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<RetryHistoryToolResult> {
+    return this.history.read(value, signal);
   }
 
   /** Internal no-write inspection. Public registration and result schemas are separate. */
