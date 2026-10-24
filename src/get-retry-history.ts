@@ -714,9 +714,14 @@ const fallbacks = {
 export function lowerRetryHistoryResultByteLimit(lower?: number): number {
   const limit = lower ?? productionBytes;
   const minimum = Math.max(
-    ...Object.values(fallbacks).map((value) =>
-      Buffer.byteLength(JSON.stringify(value), 'utf8'),
-    ),
+    ...[
+      ...errorCodeSchema.options.map((code) =>
+        envelope(retryHistoryError(code)),
+      ),
+      ...blockerCodeSchema.options.map((code) =>
+        envelope(retryHistoryBlocked(code)),
+      ),
+    ].map((value) => Buffer.byteLength(JSON.stringify(value), 'utf8')),
   );
   if (
     !Number.isSafeInteger(limit) ||

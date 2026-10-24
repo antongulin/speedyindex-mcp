@@ -701,31 +701,41 @@ test('GRH-07 inactive loader states and invalid inputs never enter SQL; mutable 
   await nativeCase(async (f) => {
     const state = join(f.root, 'missing');
     let reads = 0;
-    for (const config of [
-      loadSubmissionConfiguration({}),
-      f.configure(state, { enabled: false }),
-      f.configure(state, {}, syntheticKey, {
-        policyPath: join(f.root, 'nonexistent-policy'),
-      }),
-      f.configure(state, {}, syntheticKey, { apiKey: null }),
-      f.configure(state, {}, syntheticKey, { apiKey: 'different-key' }),
-    ]) {
-      const host = await f.host(config, {
-        history: {
-          onPhase() {
-            reads++;
+    for (const resultBytes of [undefined, 346]) {
+      for (const config of [
+        loadSubmissionConfiguration({}),
+        f.configure(state, { enabled: false }),
+        f.configure(state, {}, syntheticKey, {
+          policyPath: join(f.root, 'nonexistent-policy'),
+        }),
+        f.configure(state, {}, syntheticKey, { apiKey: null }),
+        f.configure(state, {}, syntheticKey, { apiKey: 'different-key' }),
+      ]) {
+        const host = await f.host(config, {
+          history: {
+            ...(resultBytes === undefined ? {} : { resultBytes }),
+            onPhase() {
+              reads++;
+            },
           },
-        },
-      });
-      const value = await host.getRetryHistoryToolResult({});
-      expect(value.isError).toBe(false);
-      expect(value.structuredContent).toEqual({
-        status: 'blocked',
-        reason: {
-          code: 'ReadConfigurationUnavailable',
-          message: 'Retry history requires configured local state.',
-        },
-      });
+        });
+        const value = await host.getRetryHistoryToolResult({});
+        const expected = {
+          status: 'blocked',
+          reason: {
+            code: 'ReadConfigurationUnavailable',
+            message: 'Retry history requires configured local state.',
+          },
+        } as const;
+        expect(value).toEqual({
+          isError: false,
+          content: [{ type: 'text', text: JSON.stringify(expected) }],
+          structuredContent: expected,
+        });
+        expect(
+          Buffer.byteLength(JSON.stringify(value), 'utf8'),
+        ).toBeLessThanOrEqual(resultBytes ?? 2_097_152);
+      }
     }
     expect(reads).toBe(0);
     expect(existsSync(state)).toBe(false);
@@ -1264,50 +1274,82 @@ test('GRH-12 unsafe or oversized accepted IDs outside the selected page block th
   });
 });
 
-for (const boundary of ['read', 'close'] as const)
-  test(`GRH-13 independent history guard remains held through actual native close and ${boundary} receipt barrier`, async () => {
-    await nativeCase(async (f) => {
-      const state = join(f.root, 'state');
-      f.init(state).close();
-      const config = f.configured(state),
-        gate = f.barrier();
-      let once = true,
-        nativeCloses = 0,
-        settled = false;
-      const hold = async () => {
-        if (once) {
-          once = false;
-          await gate.hold();
-        }
-      };
-      const history: RetryHistoryOwnerOptions = {
-        snapshotHooks: {
-          afterNativeClose() {
-            nativeCloses++;
+for (const resultBytes of [undefined, 346])
+  for (const boundary of ['read', 'close'] as const)
+    test(`GRH-13 independent history guard remains held through actual native close and ${boundary} receipt barrier${resultBytes === undefined ? '' : ' at minimum 346'}`, async () => {
+      await nativeCase(async (f) => {
+        const state = join(f.root, 'state');
+        f.init(state).close();
+        const config = f.configured(state),
+          gate = f.barrier();
+        const db = f.raw(state),
+          before = logical(db);
+        let once = true,
+          nativeCloses = 0,
+          settled = false;
+        const hold = async () => {
+          if (once) {
+            once = false;
+            await gate.hold();
+          }
+        };
+        const history: RetryHistoryOwnerOptions = {
+          ...(resultBytes === undefined ? {} : { resultBytes }),
+          snapshotHooks: {
+            afterNativeClose() {
+              nativeCloses++;
+            },
           },
-        },
-        ...(boundary === 'read'
-          ? { afterReadIO: hold }
-          : { afterBudgetClose: hold }),
-      };
-      const host = await f.host(config, { history }),
-        operation = host.getRetryHistoryToolResult({});
-      f.pending.push(operation);
-      void operation.then(() => {
-        settled = true;
+          ...(boundary === 'read'
+            ? { afterReadIO: hold }
+            : { afterBudgetClose: hold }),
+        };
+        const host = await f.host(config, { history }),
+          operation = host.getRetryHistoryToolResult({});
+        f.pending.push(operation);
+        void operation.then(() => {
+          settled = true;
+        });
+        await gate.entered;
+        expect(nativeCloses).toBe(1);
+        expect(settled).toBe(false);
+        expect(logical(db)).toEqual(before);
+        const refused = await host.getRetryHistoryToolResult({});
+        const busyValue = {
+          status: 'error',
+          error: {
+            code: 'HistoryBusy',
+            message:
+              'Another history read or incompatible state operation is active.',
+          },
+        } as const;
+        expect(refused).toEqual({
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(busyValue) }],
+          structuredContent: busyValue,
+        });
+        expect(nativeCloses).toBe(1);
+        expect(logical(db)).toEqual(before);
+        gate.release();
+        const result = await operation;
+        expect(settled).toBe(true);
+        const reused = await host.getRetryHistoryToolResult({});
+        if (resultBytes === undefined) {
+          resultOk(result);
+          resultOk(reused);
+        } else {
+          resultError(result, 'ResourceLimitExceeded');
+          resultError(reused, 'ResourceLimitExceeded');
+        }
+        for (const value of [refused, result, reused])
+          expect(
+            Buffer.byteLength(JSON.stringify(value), 'utf8'),
+          ).toBeLessThanOrEqual(resultBytes ?? 2_097_152);
+        expect(nativeCloses).toBe(2);
+        expect(logical(db)).toEqual(before);
+        expect(f.attempts()).toBe(0);
       });
-      await gate.entered;
-      expect(nativeCloses).toBe(1);
-      expect(settled).toBe(false);
-      resultError(await host.getRetryHistoryToolResult({}), 'HistoryBusy');
-      expect(nativeCloses).toBe(1);
-      gate.release();
-      resultOk(await operation);
-      resultOk(await host.getRetryHistoryToolResult({}));
-      expect(nativeCloses).toBe(2);
-      expect(f.attempts()).toBe(0);
     });
-  });
 
 test('GRH-13 actual prepared WAL exclusive native busy maps to HistoryBusy and the same host recovers after native release', async () => {
   await nativeCase(async (f) => {

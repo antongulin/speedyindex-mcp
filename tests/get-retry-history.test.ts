@@ -1199,3 +1199,115 @@ test('GRH-06 every fixed closed branch has identical text/structured data and is
     frozen(envelope);
   }
 });
+
+test('GRH-R1-01 the accepted minimum fits all twelve literal fixed envelopes and refuses minimum minus one', () => {
+  const variants = [
+    {
+      status: 'error',
+      error: { code: 'InvalidInput', message: 'Invalid retry-history input.' },
+    },
+    {
+      status: 'error',
+      error: {
+        code: 'CursorMismatch',
+        message: 'The cursor does not match this history query.',
+      },
+    },
+    {
+      status: 'error',
+      error: {
+        code: 'SnapshotChanged',
+        message: 'Local history changed. Start a new history query.',
+      },
+    },
+    {
+      status: 'error',
+      error: {
+        code: 'StateUnavailable',
+        message: 'The complete local retry history is unavailable.',
+      },
+    },
+    {
+      status: 'error',
+      error: {
+        code: 'HistoryBusy',
+        message:
+          'Another history read or incompatible state operation is active.',
+      },
+    },
+    {
+      status: 'error',
+      error: {
+        code: 'ResourceLimitExceeded',
+        message: 'Retry history exceeded a resource limit.',
+      },
+    },
+    {
+      status: 'error',
+      error: { code: 'Cancelled', message: 'Retry history was cancelled.' },
+    },
+    {
+      status: 'error',
+      error: {
+        code: 'DeadlineExceeded',
+        message: 'Retry history exceeded its observation deadline.',
+      },
+    },
+    {
+      status: 'error',
+      error: {
+        code: 'InternalError',
+        message: 'Retry history failed internally.',
+      },
+    },
+    {
+      status: 'blocked',
+      reason: {
+        code: 'ReadConfigurationUnavailable',
+        message: 'Retry history requires configured local state.',
+      },
+    },
+    {
+      status: 'blocked',
+      reason: {
+        code: 'StateMissing',
+        message: 'The configured local state does not exist.',
+      },
+    },
+    {
+      status: 'blocked',
+      reason: {
+        code: 'V2Required',
+        message: 'Retry history requires existing V2 local state.',
+      },
+    },
+  ] as const;
+  const expected = variants.map((value) => {
+    const envelope = {
+      isError: value.status === 'error',
+      content: [{ type: 'text' as const, text: JSON.stringify(value) }],
+      structuredContent: value,
+    };
+    return {
+      envelope,
+      bytes: new TextEncoder().encode(JSON.stringify(envelope)).byteLength,
+    };
+  });
+  const minimum = Math.max(...expected.map(({ bytes }) => bytes));
+  expect(minimum).toBe(346);
+  expect(lowerRetryHistoryResultByteLimit(minimum)).toBe(minimum);
+  expect(() => lowerRetryHistoryResultByteLimit(minimum - 1)).toThrow(
+    RangeError,
+  );
+  for (const { envelope, bytes } of expected) {
+    const actual = retryHistoryToolResult(envelope.structuredContent, {
+      maxBytes: minimum,
+    });
+    expect(actual).toEqual(envelope);
+    expect(new TextEncoder().encode(JSON.stringify(actual)).byteLength).toBe(
+      bytes,
+    );
+    expect(bytes).toBeLessThanOrEqual(minimum);
+    frozen(actual);
+  }
+});
