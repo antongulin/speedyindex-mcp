@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -71,7 +72,9 @@ function readSeed(path: string) {
   return fixtureSchema.parse(value);
 }
 function privateRoot() {
-  const root = mkdtempSync(join(tmpdir(), 'retry-history-native-'));
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), 'retry-history-native-')),
+  );
   chmodSync(root, 0o700);
   return root;
 }

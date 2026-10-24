@@ -3,11 +3,13 @@ import { createHash } from 'node:crypto';
 import {
   chmodSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -21,11 +23,16 @@ import {
 } from './fixtures/get-retry-history-protocol';
 
 function root() {
-  const temporary = process.env.TMPDIR;
-  const home = process.env.HOME;
-  if (!temporary || !home)
-    throw new Error('Private fixture environment required.');
-  for (const path of [temporary, home]) {
+  const enclosure = realpathSync(
+    mkdtempSync(join(tmpdir(), 'grh-preparation-')),
+  );
+  chmodSync(enclosure, 0o700);
+  const home = join(enclosure, 'home');
+  const temporary = join(enclosure, 'tmp');
+  for (const path of [home, temporary]) mkdirSync(path, { mode: 0o700 });
+  const directory = realpathSync(mkdtempSync(join(temporary, 'fixture-')));
+  chmodSync(directory, 0o700);
+  for (const path of [enclosure, home, temporary, directory]) {
     const stat = lstatSync(path);
     if (
       realpathSync(path) !== path ||
@@ -35,9 +42,7 @@ function root() {
     )
       throw new Error('Private fixture environment required.');
   }
-  const path = mkdtempSync(join(temporary, 'grh-preparation-'));
-  chmodSync(path, 0o700);
-  return realpathSync(path);
+  return { directory, home, temporary };
 }
 function save(path: string, value: unknown) {
   const bytes = Buffer.from(JSON.stringify(value, null, 2) + '\n');
@@ -130,7 +135,7 @@ function earlyOperations(count: number): unknown[] {
 }
 
 test('GRH-SANITY-01 finite phase/control streams preserve fragments and reject invalid or premature receipts', async () => {
-  const directory = root();
+  const { directory } = root();
   const badPhases: Buffer[] = [
     Buffer.from('HISTORY_PHASE {"event":"BOOT_READY","event":"BOOT_READY"}\n'),
     Buffer.from(
@@ -374,7 +379,7 @@ test('GRH-SANITY-01 finite phase/control streams preserve fragments and reject i
 });
 
 test('GRH-SANITY-02 exact source child sanity entry consumes saved bounded fixture and exits without native resources', async () => {
-  const directory = root();
+  const { directory, home, temporary } = root();
   const fixture = join(directory, 'phase-sanity.json');
   const saved = save(fixture, {
     version: 1,
@@ -397,8 +402,8 @@ test('GRH-SANITY-02 exact source child sanity entry consumes saved bounded fixtu
   ];
   const environment = {
     PATH: '/usr/bin:/bin',
-    HOME: process.env.HOME!,
-    TMPDIR: process.env.TMPDIR!,
+    HOME: home,
+    TMPDIR: temporary,
     LANG: 'C',
     LC_ALL: 'C',
     TZ: 'UTC',
