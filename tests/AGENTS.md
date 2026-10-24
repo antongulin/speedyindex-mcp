@@ -36,6 +36,8 @@ Source cancellation uses `fixtures/plan-retry-sdk-child.ts` with real createServ
 
 P1C-09 lives in `retry-ledger.test.ts` to reuse the existing child/control/kill-reap fixture. Each child collects its own production candidate through an exact HTTPS-wire guard and an owned loopback receiver, with an allowlisted synthetic environment. No proof or alleged facts arrive over JSON. A real parent writer lock yields native SQLITE_BUSY and a failed BEGIN without proof consumption; after parent release, an independent child connection witnesses the actual admitted writer lock before original elapsed/day/cancellation refusal. The signal getter delegates the captured native getter and only records this lock witness. The cancellation case flushes ABORT during the first blocked native call and observes it at real stdin I/O after failed BEGIN, before a later attempt. It proves no preemption of that same blocked transaction. Use finite phase/pipe barriers, retain failed fixtures and original cleanup errors, and retain new successful roots for bounded reference/archive/byte checks before deletion. Test clocks and transparent receipt decorators cannot authorize readiness.
 
+`get-retry-history.test.ts` and `retry-history-owner.test.ts` cover the internal history foundation. Keep both paths in `scripts.test` so CI runs them. Preserve synthetic SQLite fixtures, actual SQLITE_BUSY and owner close/cancellation/freshness checks; history fixtures must not invent discarded terminal metadata.
+
 ## Work Guidance
 
 Reconcile affected contracts and verify behavior through public boundaries.
