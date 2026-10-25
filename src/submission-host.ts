@@ -266,7 +266,7 @@ function retryStoredResult(
       requestId: reconstruction.input.requestId,
       error: submitRetryError('RequestIdConflict'),
     });
-  return submitRetryResultSchema.parse({
+  const result = submitRetryResultSchema.safeParse({
     status: intent.state,
     requestId: reconstruction.input.requestId,
     replayed: true,
@@ -290,6 +290,11 @@ function retryStoredResult(
           ),
         }),
   });
+  // Native history can retain child IDs outside the public safe-text grammar.
+  // Preserve representable receipts; contain only failed strict projection.
+  return result.success
+    ? result.data
+    : { status: 'error', error: submitRetryError('InternalError') };
 }
 function retryDurableEvidence(
   reconstruction: RetryReconstruction,

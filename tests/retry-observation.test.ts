@@ -18,6 +18,7 @@ import { SpeedyIndexClient } from '../src/client';
 import {
   parseSubmitRetryInput,
   reconstructSubmitRetry,
+  submitRetryError,
   submitRetryResultSchema,
   type SubmitRetryToolResult,
   type SubmitRetryInput,
@@ -31,6 +32,7 @@ import type {
   RetryProof,
   RetryPlanFingerprintInput,
   RetryCreatedOwner,
+  RetryOwnerIntent,
 } from '../src/submission-ledger';
 import {
   planRetryResultSchema,
@@ -57,6 +59,11 @@ class RetryPreparationProbe extends SubmissionHost {
       throw new Error('SYNTHETIC_A2_CONSUMER_MUST_NOT_ENTER');
     });
   }
+}
+// A separate trusted no-send consumer entry; the original nonentry probe stays
+// intact. The real helper still supplies and retains every created owner.
+class RetryConsumerProbe extends SubmissionHost {
+  prepareForTest = this.withRetryPreparation.bind(this);
 }
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -5190,11 +5197,14 @@ function expectPublicEnvelope(result: PlanRetryToolResult) {
   expectSafeFailure(result);
 }
 
-function observePublicSerialization() {
+function observePublicSerialization(requestId?: string) {
   const original = JSON.stringify;
   const observed: { status: string; bytes: number }[] = [];
-  JSON.stringify = ((...args: Parameters<typeof JSON.stringify>) => {
-    const text = Reflect.apply(original, JSON, args) as string;
+  JSON.stringify = function (
+    this: unknown,
+    ...args: Parameters<typeof JSON.stringify>
+  ) {
+    const text = Reflect.apply(original, this, args) as string;
     const value: unknown = args[0];
     if (
       value &&
@@ -5203,14 +5213,17 @@ function observePublicSerialization() {
       'structuredContent' in value &&
       value.structuredContent &&
       typeof value.structuredContent === 'object' &&
-      'status' in value.structuredContent
+      'status' in value.structuredContent &&
+      (requestId === undefined ||
+        ('requestId' in value.structuredContent &&
+          value.structuredContent.requestId === requestId))
     )
       observed.push({
         status: String(value.structuredContent.status),
         bytes: Buffer.byteLength(text, 'utf8'),
       });
     return text;
-  }) as typeof JSON.stringify;
+  } as typeof JSON.stringify;
   // Exact transparent entry sanity before any owner/native verification.
   expect(JSON.stringify({ value: 'é"\\' })).toBe(original({ value: 'é"\\' }));
   expect(observed).toEqual([]);
@@ -5221,6 +5234,109 @@ function observePublicSerialization() {
     },
   };
 }
+
+// Arm only after the cooperating reader/writer has closed, immediately before
+// the consumer returns/throws. The next close is the actual prepared writer.
+function observeRetryPreparationClose(onClosed: () => void) {
+  const nativeClose = Database.prototype.close;
+  let armed = false;
+  const receipts: {
+    receiver: Database;
+    args: Parameters<Database['close']>;
+    returned?: ReturnType<Database['close']>;
+    error?: unknown;
+  }[] = [];
+  Database.prototype.close = function (
+    this: Database,
+    ...args: Parameters<Database['close']>
+  ) {
+    if (!armed) return Reflect.apply(nativeClose, this, args);
+    armed = false;
+    let returned: ReturnType<Database['close']>;
+    try {
+      returned = Reflect.apply(nativeClose, this, args);
+    } catch (error) {
+      receipts.push({ receiver: this, args, error });
+      throw error;
+    }
+    receipts.push({ receiver: this, args, returned });
+    onClosed();
+    return returned;
+  };
+  return {
+    receipts,
+    arm() {
+      armed = true;
+    },
+    restore() {
+      Database.prototype.close = nativeClose;
+    },
+  };
+}
+
+test('SR-R1-CONSUME observer sanity delegates the exact native close and serialization entries', () => {
+  const db = new Database(':memory:'),
+    nativeStringify = JSON.stringify,
+    requestId = 'sr-r1-serialization-sanity';
+  let closed = false,
+    callbacks = 0;
+  const close = observeRetryPreparationClose(() => {
+      callbacks++;
+    }),
+    serialization = observePublicSerialization(requestId);
+  try {
+    expect(db.query('SELECT 1 AS n').get()).toEqual({ n: 1 });
+    close.arm();
+    const returned = db.close();
+    closed = true;
+    expect(close.receipts).toHaveLength(1);
+    expect(close.receipts[0]!.receiver).toBe(db);
+    expect(close.receipts[0]!.args).toEqual([]);
+    expect(close.receipts[0]!.returned).toBe(returned);
+    expect('error' in close.receipts[0]!).toBe(false);
+    expect(callbacks).toBe(1);
+    expect(() => db.query('SELECT 1 AS n').get()).toThrow();
+    expect(serialization.observed).toEqual([]);
+    const data = {
+        status: 'error',
+        requestId,
+        error: submitRetryError('InternalError'),
+      },
+      noRequest = { status: 'error', error: data.error },
+      unrelated = { ...data, requestId: requestId + '-other' };
+    for (const structuredContent of [noRequest, unrelated, data]) {
+      const envelope = {
+        content: [{ type: 'text', text: nativeStringify(structuredContent) }],
+        structuredContent,
+        isError: true,
+      };
+      expect(submitRetryResultSchema.safeParse(structuredContent).success).toBe(
+        true,
+      );
+      const text = JSON.stringify.call(JSON, envelope, null, 2);
+      expect(text).toBe(nativeStringify.call(JSON, envelope, null, 2));
+      expect(serialization.observed).toEqual(
+        structuredContent === data
+          ? [{ status: 'error', bytes: Buffer.byteLength(text, 'utf8') }]
+          : [],
+      );
+    }
+    const sentinel = new Error('SR_R1_TRANSPARENT_JSON_REPLACER');
+    let observedError: unknown;
+    try {
+      JSON.stringify({ value: 1 }, () => {
+        throw sentinel;
+      });
+    } catch (error) {
+      observedError = error;
+    }
+    expect(observedError).toBe(sentinel);
+  } finally {
+    close.restore();
+    serialization.restore();
+    if (!closed) db.close();
+  }
+});
 
 test('P2-01 direct public host rejects authority/preabort/inactive before state or HTTP and normalizes Google', async () => {
   await withProductionReceiver(script(singleSource()), async (api) => {
@@ -5862,6 +5978,619 @@ test('SR-D02-A-A2 sanity local Google actual driver commits then aborts and canc
     }
   });
 });
+
+test('SR-R1-REPLAY-01 native accepted newline child replay contains strict projection failure without changing history', async () => {
+  await withProductionReceiver(script(singleSource('yandex')), async (api) => {
+    const config = fixtureConfiguration(api),
+      clock = new NativeOwnerClock(),
+      childId = 'synthetic-native-child\n';
+    const host = new RetryPreparationProbe(config, {
+      fetchRequest: api.fetch,
+      clock: () => clock.utcMs(),
+      retry: { monotonicMs: () => clock.monotonicMs(), runtime: clock },
+    });
+    const planning = host.planRetryToolResult({ searchEngine: 'yandex' });
+    api.operations.push(planning);
+    const plan = (await bounded(planning)).structuredContent;
+    if (plan.status !== 'ready')
+      throw new Error('SR-R1 replay requires actual public ready.');
+    const input = parseSubmitRetryInput({
+      requestId: 'sr-r1-native-history',
+      expectedPlan: {
+        searchEngine: 'yandex',
+        eligibleUrls: plan.eligibleUrls,
+        budgetScope: config.snapshot.policy.budgetScope,
+        policyRevision: config.snapshot.policy.policyRevision,
+        identity: plan.identity,
+      },
+    });
+    const composition = productionComposition(api, config, clock),
+      collecting = composition.collectLatest(
+        { searchEngine: 'yandex' },
+        input.requestId,
+      );
+    api.operations.push(collecting);
+    const candidate = await bounded(collecting);
+    if (!('kind' in candidate))
+      throw new Error('SR-R1 replay requires independent production proof.');
+    const writer = composition.open();
+    let stored;
+    try {
+      const prepared = writer.prepareVerifiedRetryIntent(
+        candidate.input,
+        candidate.proof,
+      );
+      if (prepared.kind !== 'created')
+        throw new Error('SR-R1 native history must genuinely create.');
+      const claim = writer.claimDispatch(prepared.dispatchCapability, 0);
+      if (claim.kind !== 'claimed')
+        throw new Error('SR-R1 native history claim lost.');
+      writer.recordDispatchOutcome({
+        credentialFingerprint: fingerprint,
+        requestId: input.requestId,
+        expectedStateVersion: claim.stateVersion,
+        outcomeToken: claim.outcomeToken,
+        outcome: {
+          kind: 'accepted',
+          providerType: 'yandex/indexer',
+          providerTaskId: childId,
+        },
+      });
+      stored = writer.readIntent(fingerprint, input.requestId);
+      expect(stored).toMatchObject({
+        state: 'accepted',
+        stateVersion: 2,
+        providerTaskId: childId,
+      });
+    } finally {
+      writer.close();
+    }
+    const reconstruction = reconstructSubmitRetry(input, {
+      credentialFingerprint: fingerprint,
+      currentCaps: config.snapshot.policy.caps,
+    });
+    const nativeReplay = readRetryReplay(
+      { stateDirectory: config.stateDirectory },
+      fingerprint,
+      reconstruction.replay,
+    );
+    expect(nativeReplay).toMatchObject({
+      availability: 'available',
+      kind: 'replay',
+      intent: { state: 'accepted', providerTaskId: childId },
+    });
+    const before = p1cProjection(api, config, 'sr-r1-native-before'),
+      reads = api.wires.length;
+    writeFileSync(
+      join(api.root, 'sr-r1-replay-premises.json'),
+      JSON.stringify({ stored, nativeReplay, reads, createRequests: 0 }),
+    );
+    console.error('SR_R1_REPLAY_PREMISES native accepted and available/replay');
+    clock.wall += 86400000;
+    clock.mono += 60000;
+    const replaying = host.prepareForTest({
+      ...input,
+      acknowledgement: {
+        quoteFingerprint: 'a'.repeat(64),
+        authorizationFingerprint: 'b'.repeat(64),
+      },
+    });
+    // Register the settled receipt so the intentional pre-fix rejection cannot
+    // mask native receiver cleanup with a second unhandled-operation failure.
+    const settlement = replaying.then(
+      (envelope) => ({ kind: 'resolved' as const, envelope }),
+      (error: unknown) => ({ kind: 'rejected' as const, error }),
+    );
+    api.operations.push(settlement);
+    const settled = await bounded(settlement);
+    expect(p1cProjection(api, config, 'sr-r1-native-after')).toEqual(before);
+    expect(api.wires).toHaveLength(reads);
+    expect(reads).toBe(20);
+    expect(host.consumerCalls).toBe(0);
+    expect(clock.handles.size).toBe(0);
+    if (settled.kind === 'rejected') {
+      writeFileSync(
+        join(api.root, 'sr-r1-replay-rejection.json'),
+        JSON.stringify({
+          name: settled.error instanceof Error ? settled.error.name : null,
+          message:
+            settled.error instanceof Error ? settled.error.message : null,
+          unchangedHistory: true,
+          consumerCalls: host.consumerCalls,
+          reads,
+          createRequests: 0,
+        }),
+      );
+      throw settled.error;
+    }
+    const envelope = settled.envelope;
+    expect(
+      submitRetryResultSchema.safeParse(envelope.structuredContent).success,
+    ).toBe(true);
+    expect(envelope.structuredContent).toEqual({
+      status: 'error',
+      error: {
+        code: 'InternalError',
+        message: 'Retry submission failed internally.',
+      },
+    });
+    expect(envelope.isError).toBe(true);
+    expect(JSON.parse(envelope.content[0]!.text)).toEqual(
+      envelope.structuredContent,
+    );
+    expect(Object.isFrozen(envelope)).toBe(true);
+    expect(Object.isFrozen(envelope.structuredContent)).toBe(true);
+    const json = JSON.stringify(envelope);
+    expect(Buffer.byteLength(json, 'utf8')).toBeLessThanOrEqual(2_097_152);
+    for (const value of [
+      childId,
+      '\\n',
+      fixtureKey,
+      fingerprint,
+      config.stateDirectory,
+      localSnapshot(config).ledgerId,
+      'ZodError',
+      'Invalid input',
+    ])
+      expect(json).not.toContain(value);
+    writeFileSync(
+      join(api.root, 'sr-r1-replay-result.json'),
+      JSON.stringify({
+        envelope,
+        unchangedHistory: true,
+        reads,
+        createRequests: 0,
+      }),
+    );
+  });
+});
+
+for (const [caseId, variant] of [
+  ['SR-R1-CONSUME-01', 'returned'],
+  ['SR-R1-CONSUME-02', 'after-consumer-day'],
+  ['SR-R1-CONSUME-02', 'after-native-close-day'],
+  ['SR-R1-CONSUME-03', 'consumer-throw'],
+] as const)
+  test(`${caseId} actual no-send consumer ${variant} retains native cancellation and original owner fences`, async () => {
+    await withProductionReceiver(
+      script(singleSource('google')),
+      async (api) => {
+        const config = fixtureConfiguration(api, {
+          ...allCreatePolicy,
+          retry: {
+            enabled: true,
+            allowUnattributedParents: false,
+            maxAttemptsPerSource: 3,
+          },
+        });
+        seedStandalone(config, 'parent', [A, B, C]);
+        const clock = new NativeOwnerClock(),
+          controller = new AbortController(),
+          listeners = trackOwnerSignal(controller.signal),
+          entered = deferred(),
+          release = deferred(),
+          trace: string[] = [],
+          sentinel = 'PRIVATE_SR_R1_CONSUMER_FAILURE',
+          requestId = 'sr-r1-owned-consumer';
+        api.releases.push(() => release.resolve());
+        const host = new RetryConsumerProbe(config, {
+          fetchRequest: api.fetch,
+          clock: () => clock.utcMs(),
+          retry: { monotonicMs: () => clock.monotonicMs(), runtime: clock },
+        });
+        let owner: RetryCreatedOwner | undefined,
+          preparedReceipt: RetryOwnerIntent | undefined,
+          cancelled: RetryOwnerIntent | undefined,
+          preparing: Promise<SubmitRetryToolResult> | undefined,
+          closeGuard: ReturnType<SubmissionHost['planRetry']> | undefined,
+          cancelledProjection: ReturnType<typeof logicalProjection> | undefined,
+          statusesAtClose: string[] = [],
+          measurementStart = 0,
+          consumerCalls = 0,
+          remainingAtConsumer = 0,
+          timerCountAtConsumer = 0;
+        const serialization = observePublicSerialization(requestId),
+          close = observeRetryPreparationClose(() => {
+            trace.push('native-close-receipt');
+            statusesAtClose = serialization.observed
+              .slice(measurementStart)
+              .map(({ status }) => status);
+            // The private planner's synchronous busy refusal opens no SQL and
+            // serializes no extra public envelope inside this native receipt.
+            closeGuard = host.planRetry({ searchEngine: 'google' });
+            api.operations.push(closeGuard);
+            if (variant === 'after-native-close-day') clock.wall += 86400000;
+          });
+        try {
+          const before = p1cProjection(api, config, 'r1-consumer-before'),
+            planning = host.planRetryToolResult({ searchEngine: 'google' });
+          api.operations.push(planning);
+          const plan = (await bounded(planning)).structuredContent;
+          if (plan.status !== 'ready')
+            throw new Error('SR-R1 consumer requires actual public ready.');
+          expectProductionReady(
+            plan,
+            productionOracle(config, 'google'),
+            config,
+            true,
+          );
+          expect(p1cProjection(api, config, 'r1-consumer-planned')).toEqual(
+            before,
+          );
+          const input = parseSubmitRetryInput({
+            requestId,
+            expectedPlan: {
+              searchEngine: 'google',
+              eligibleUrls: plan.eligibleUrls,
+              budgetScope: config.snapshot.policy.budgetScope,
+              policyRevision: config.snapshot.policy.policyRevision,
+              identity: plan.identity,
+            },
+          });
+          preparing = host
+            .prepareForTest(input, controller.signal, async (work) => {
+              consumerCalls++;
+              owner = work.owner;
+              preparedReceipt = owner.lastObservedIntent();
+              clock.mono = 250;
+              remainingAtConsumer = owner.checkpoint();
+              timerCountAtConsumer = clock.arms.length;
+              trace.push('consumer-entered');
+              entered.resolve();
+              await release.promise;
+              measurementStart = serialization.observed.length;
+              close.arm();
+              if (variant === 'consumer-throw') {
+                // The consumer cause is thrown first. The later abort is real,
+                // and the host must retain that first cause while cancelling.
+                try {
+                  throw new Error(sentinel);
+                } finally {
+                  controller.abort();
+                }
+              }
+              if (!cancelled)
+                throw new Error('SR-R1 cooperating native receipt missing.');
+              if (variant === 'after-consumer-day') clock.wall += 86400000;
+              trace.push('consumer-returned');
+              // This no-send result uses only the actual work and independently
+              // cancelled native receipt; it claims no provider observation.
+              return submitRetryResultSchema.parse({
+                status: 'cancelled',
+                requestId: input.requestId,
+                replayed: false,
+                request: work.request.request,
+                quote: work.request.quote,
+                retry: work.retry,
+                intent: {
+                  requestId: cancelled.requestId,
+                  state: cancelled.state,
+                  stateVersion: cancelled.stateVersion,
+                  createdAtMs: cancelled.createdAtMs,
+                  periodId: cancelled.periodId,
+                  periodStartMs: cancelled.periodStartMs,
+                  policyRevision: cancelled.policyRevision,
+                  policyDigest: cancelled.policyDigest,
+                  reservation: cancelled.reservation,
+                },
+                error: submitRetryError('Cancelled'),
+              });
+            })
+            .then((envelope) => {
+              trace.push('helper-resolved');
+              return envelope;
+            });
+          api.operations.push(preparing);
+          await bounded(entered.promise);
+          if (!owner || !preparedReceipt)
+            throw new Error('SR-R1 actual owner was not transferred.');
+          expect(consumerCalls).toBe(1);
+          expect(preparedReceipt).toMatchObject({
+            state: 'prepared',
+            stateVersion: 0,
+          });
+          expect(remainingAtConsumer).toBe(59850); // Original origin100, not consumer250.
+          expect(clock.handles.size).toBe(0);
+          expect(listeners.active.size).toBe(0);
+          const held = p1cProjection(api, config, 'r1-consumer-held'),
+            busy = host.planRetryToolResult({ searchEngine: 'google' });
+          api.operations.push(busy);
+          expect((await bounded(busy)).structuredContent).toMatchObject({
+            status: 'error',
+            error: { code: 'SubmissionBusy' },
+          });
+          await expectAllFreshBlocked(host);
+          expect(p1cProjection(api, config, 'r1-consumer-busy')).toEqual(held);
+          expect(api.wires).toHaveLength(20);
+          if (variant !== 'consumer-throw') {
+            const cooperating = openLedger({
+              stateDirectory: config.stateDirectory,
+            });
+            try {
+              expect(
+                cooperating.cancelPrepared(fingerprint, input.requestId, 0),
+              ).toEqual({
+                kind: 'cancelled',
+                stateVersion: 1,
+              });
+              const actual = cooperating.readIntent(
+                fingerprint,
+                input.requestId,
+              );
+              if (!actual)
+                throw new Error('SR-R1 cancelled native row missing.');
+              cancelled = actual;
+            } finally {
+              cooperating.close();
+            }
+            expect(cancelled).toMatchObject({
+              state: 'cancelled',
+              stateVersion: 1,
+            });
+            // Only the host may refresh its stale cache after this real change.
+            expect(owner.lastObservedIntent()).toEqual(preparedReceipt);
+            cancelledProjection = p1cProjection(
+              api,
+              config,
+              'r1-cooperating-cancelled',
+            );
+          }
+          release.resolve();
+          const envelope = await bounded(preparing),
+            measurements = serialization.observed.slice(measurementStart);
+          close.restore();
+          serialization.restore();
+          expect(
+            submitRetryResultSchema.safeParse(envelope.structuredContent)
+              .success,
+          ).toBe(true);
+          const result = envelope.structuredContent;
+          expect(result).toMatchObject(
+            variant === 'returned'
+              ? {
+                  status: 'cancelled',
+                  requestId: input.requestId,
+                  replayed: false,
+                  error: { code: 'Cancelled' },
+                  request: plan.request,
+                  quote: plan.quote,
+                }
+              : {
+                  status: 'error',
+                  requestId: input.requestId,
+                  error: {
+                    code:
+                      variant === 'consumer-throw'
+                        ? 'InternalError'
+                        : 'StalePeriodContext',
+                  },
+                  evidence: {
+                    kind: 'durable',
+                    request: plan.request,
+                    quote: plan.quote,
+                  },
+                },
+          );
+          const receipt =
+            result.status === 'cancelled'
+              ? result.intent
+              : result.status === 'error' && result.evidence?.kind === 'durable'
+                ? result.evidence.intent
+                : undefined;
+          expect(receipt).toEqual({
+            requestId: input.requestId,
+            state: 'cancelled',
+            stateVersion: 1,
+            createdAtMs: utc,
+            periodId: 'utc-day:2026-10-21',
+            periodStartMs: Date.parse('2026-10-21T00:00:00Z'),
+            policyRevision: preparedReceipt.policyRevision,
+            policyDigest: preparedReceipt.policyDigest,
+            reservation: { tokens: 200, indexer: 0, checker: 0 },
+          });
+          expect(envelope.isError).toBe(true);
+          expect(JSON.parse(envelope.content[0]!.text)).toEqual(result);
+          expect(Object.isFrozen(envelope)).toBe(true);
+          expect(Object.isFrozen(result)).toBe(true);
+          const json = JSON.stringify(envelope);
+          expect(Buffer.byteLength(json, 'utf8')).toBeLessThanOrEqual(
+            2_097_152,
+          );
+          for (const value of [
+            sentinel,
+            fixtureKey,
+            fingerprint,
+            config.stateDirectory,
+            localSnapshot(config).ledgerId,
+          ])
+            expect(json).not.toContain(value);
+          expect(statusesAtClose).toEqual([
+            variant === 'returned' || variant === 'after-native-close-day'
+              ? 'cancelled'
+              : 'error',
+          ]);
+          expect(measurements.map(({ status }) => status)).toEqual(
+            variant === 'after-native-close-day'
+              ? ['cancelled', 'error']
+              : variant === 'returned'
+                ? ['cancelled']
+                : ['error'],
+          );
+          expect(trace.indexOf('native-close-receipt')).toBeLessThan(
+            trace.indexOf('helper-resolved'),
+          );
+          expect(close.receipts).toHaveLength(1);
+          expect(close.receipts[0]!.args).toEqual([]);
+          expect('error' in close.receipts[0]!).toBe(false);
+          expect(() =>
+            close.receipts[0]!.receiver.query('SELECT 1').get(),
+          ).toThrow();
+          if (!closeGuard)
+            throw new Error('SR-R1 native close guard observation missing.');
+          expect(await bounded(closeGuard)).toEqual({
+            status: 'error',
+            code: 'SubmissionBusy',
+          });
+          expect(owner.lastObservedIntent()).toMatchObject({
+            state: 'cancelled',
+            stateVersion: 1,
+          });
+          expect(() => owner!.refreshIntent()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.checkpoint()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.claim()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.beginPost()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.cancelPrepared()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.recordOutcome({ kind: 'rejected' })).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          owner.finish(); // Retired finish is idempotent even after the day/abort fence.
+          expect(clock.arms).toHaveLength(timerCountAtConsumer);
+          const sql = withP1cReadDb(config, (db) => ({
+            core: db
+              .query(
+                `SELECT state,state_version,claim_token_digest,dispatch_outcome_token_digest,reserved_tokens,reserved_indexer,reserved_checker FROM intents WHERE request_id=?`,
+              )
+              .get(input.requestId),
+            context: db
+              .query(
+                `SELECT origin_kind,parent_family,parent_task_id,source_manifest_digest,plan_fingerprint FROM intent_context WHERE request_id=?`,
+              )
+              .get(input.requestId),
+            urls: db
+              .query(
+                `SELECT ordinal,url_text FROM intent_urls WHERE request_id=? ORDER BY ordinal`,
+              )
+              .all(input.requestId),
+            events: db
+              .query(
+                `SELECT event_kind,state_version FROM intent_events WHERE request_id=? ORDER BY state_version`,
+              )
+              .all(input.requestId),
+            counts: db
+              .query(
+                `SELECT (SELECT COUNT(*) FROM intents) AS intents,(SELECT COUNT(*) FROM intent_context) AS contexts,(SELECT COUNT(*) FROM intent_context WHERE origin_kind='retry') AS retries`,
+              )
+              .get(),
+          }));
+          expect(sql).toEqual({
+            core: {
+              state: 'cancelled',
+              state_version: 1,
+              claim_token_digest: null,
+              dispatch_outcome_token_digest: null,
+              reserved_tokens: 200,
+              reserved_indexer: 0,
+              reserved_checker: 0,
+            },
+            context: {
+              origin_kind: 'retry',
+              parent_family: 'google/indexer',
+              parent_task_id: 'parent',
+              source_manifest_digest:
+                plan.identity.preimage.sourceManifestDigest,
+              plan_fingerprint: plan.identity.fingerprint,
+            },
+            urls: [
+              { ordinal: 0, url_text: A },
+              { ordinal: 1, url_text: B },
+            ],
+            events: [
+              { event_kind: 'prepared', state_version: 0 },
+              { event_kind: 'cancelled', state_version: 1 },
+            ],
+            counts: { intents: 2, contexts: 2, retries: 1 },
+          });
+          const terminal = p1cProjection(api, config, 'r1-consumer-terminal');
+          if (cancelledProjection)
+            expect(terminal).toEqual(cancelledProjection);
+          const replaying = host.prepareForTest(input, undefined, async () => {
+            consumerCalls++;
+            throw new Error('SR_R1_REPLAY_MUST_NOT_REENTER_CONSUMER');
+          });
+          api.operations.push(replaying);
+          const replay = await bounded(replaying);
+          expect(replay.structuredContent).toMatchObject({
+            status: 'cancelled',
+            replayed: true,
+            intent: receipt,
+          });
+          expect(
+            submitRetryResultSchema.safeParse(replay.structuredContent).success,
+          ).toBe(true);
+          expect(consumerCalls).toBe(1);
+          expect(api.wires).toHaveLength(20);
+          expect(p1cProjection(api, config, 'r1-consumer-replay')).toEqual(
+            terminal,
+          );
+          const reusing = host.planRetryToolResult({ searchEngine: 'google' });
+          api.operations.push(reusing);
+          const reused = await bounded(reusing);
+          expectPublicEnvelope(reused);
+          expect(reused.structuredContent.status).toBe('ready');
+          expect(api.wires).toHaveLength(30);
+          expect(api.wires.some(({ path }) => path.endsWith('/create'))).toBe(
+            false,
+          );
+          expect(p1cProjection(api, config, 'r1-consumer-reused')).toEqual(
+            terminal,
+          );
+          expect(clock.handles.size).toBe(0);
+          expect(listeners.active.size).toBe(0);
+          writeFileSync(
+            join(api.root, 'sr-r1-consumer-receipt.json'),
+            JSON.stringify({
+              caseId,
+              variant,
+              preparedReceipt,
+              lastObserved: owner.lastObservedIntent(),
+              envelope,
+              replay,
+              sql,
+              trace,
+              statusesAtClose,
+              measurements,
+              remainingAtConsumer,
+              timerCountAtConsumer,
+              finalMono: clock.mono,
+              finalDay: clock.wall,
+              consumerCalls,
+              actualNativeClose: {
+                count: close.receipts.length,
+                args: close.receipts[0]!.args,
+                returned: String(close.receipts[0]!.returned),
+                threw: 'error' in close.receipts[0]!,
+              },
+              readRequests: api.wires.length,
+              createRequests: 0,
+              timers: clock.handles.size,
+              listeners: listeners.active.size,
+              controlledConsumerFault: variant === 'consumer-throw',
+              spontaneousNativeCloseFault: false,
+            }),
+          );
+        } finally {
+          release.resolve();
+          try {
+            if (preparing) await bounded(preparing);
+          } finally {
+            close.restore();
+            serialization.restore();
+            listeners.restore();
+          }
+        }
+      },
+    );
+  });
 
 for (const state of [
   'prepared',
