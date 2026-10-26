@@ -330,6 +330,35 @@ interface VerifiedRetryComposition {
   ): Promise<RetryCollection>;
   open(): VerifiedRetryLedger;
 }
+export type RetryOwnerIntent = Readonly<
+  Omit<IntentView, 'credentialFingerprint'>
+>;
+export type RetryClaimNotice =
+  Readonly<{ kind: 'lost' }> | Readonly<{ kind: 'claimed'; stateVersion: 1 }>;
+export type OwnedRetryPreparation =
+  | Readonly<{ kind: 'replay'; intent: RetryOwnerIntent }>
+  | Readonly<{ kind: 'created'; owner: RetryCreatedOwner }>;
+export interface RetryOwnerWriter {
+  prepare(
+    input: PrepareRetryIntentInput,
+    proof: RetryProof,
+  ): OwnedRetryPreparation;
+  close(): void;
+}
+/** Private, created-only ownership. None of these methods is a tool selector. */
+export interface RetryCreatedOwner {
+  // Historical receipt only, including after retirement; never a fresh read.
+  lastObservedIntent(): RetryOwnerIntent;
+  refreshIntent(): RetryOwnerIntent | null;
+  checkpoint(): number;
+  claim(): RetryClaimNotice;
+  beginPost(): number;
+  cancelPrepared(): CancelResult;
+  recordOutcome(outcome: DispatchOutcome): RetryOwnerIntent;
+  finish(): void;
+}
+type RetryNewWorkPoison =
+  'writer_open_cleanup' | 'writer_close' | 'paid_settlement';
 export interface ProductionRetryComposition {
   collectLatest(
     input: unknown,
@@ -343,6 +372,10 @@ export interface ProductionRetryComposition {
   ): Promise<PlanRetryToolResult>;
   isNewWorkAvailable(): boolean;
   open(): VerifiedRetryLedger;
+  checkpointCandidate(proof: RetryProof): void;
+  discardCandidate(proof: RetryProof): void;
+  openForSubmission(): RetryOwnerWriter;
+  poisonNewWork(cause: RetryNewWorkPoison): void;
 }
 interface RetryFreshness {
   started: number;
@@ -716,7 +749,7 @@ export function composeVerifiedRetryAdmission(
 ): Readonly<ProductionRetryComposition>;
 export function composeVerifiedRetryAdmission(
   deps: TrustedRetryDependencies | TrustedRetryProductionDependencies,
-) {
+): Readonly<VerifiedRetryComposition> | Readonly<ProductionRetryComposition> {
   if ('transport' in deps === 'verifier' in deps) fail('InvalidLedgerInput');
   let configuration: ConfiguredSubmission;
   try {
@@ -829,7 +862,14 @@ export function composeVerifiedRetryAdmission(
   let collecting = false;
   let writerOpen = false;
   let activeProof: RetryProof | undefined;
+  let retainingAdmissionTime = false;
+  let pendingAdmissionTime: RetryFreshness | undefined;
   let unavailable = false;
+  let cleanupCause: RetryNewWorkPoison | 'read_settlement' | undefined;
+  const poisonNewWork = (cause: RetryNewWorkPoison) => {
+    unavailable = true;
+    cleanupCause ??= cause;
+  };
   // Retain the first fixed domain cause privately when settlement poisons new work.
   let primaryFailure: Exclude<RetryPlanView, RetryPlanReady> | undefined;
   const permission = () => {
@@ -910,6 +950,9 @@ export function composeVerifiedRetryAdmission(
       utcMs,
     );
     assertRetryPlanDecision(state, input.intent);
+    // The final pre-insert callback updates this exact object. Only a returned
+    // created result may transfer it; rollback and replay cannot mint an owner.
+    if (retainingAdmissionTime) pendingAdmissionTime = time;
     return () => checkTime(time, input.intent.budget);
   };
   const latestFailure = (
@@ -1365,6 +1408,7 @@ export function composeVerifiedRetryAdmission(
         await budget?.close();
       } catch {
         unavailable = true;
+        cleanupCause ??= 'read_settlement';
         primaryFailure ??=
           firstFailure ??
           ('kind' in result
@@ -1420,6 +1464,223 @@ export function composeVerifiedRetryAdmission(
     requestId: string,
     signal?: AbortSignal,
   ) => collectLatestOwned(value, requestId, signal, 'candidate');
+  const openVerifiedWriter = (owned = false): VerifiedRetryLedger => {
+    if (collecting || writerOpen) fail('LedgerBusy');
+    writerOpen = true;
+    let ledger: LocalSubmissionLedger;
+    try {
+      ledger = openLocalLedger(
+        options,
+        hooks,
+        admission,
+        owned
+          ? { onUnverifiedClose: () => poisonNewWork('writer_open_cleanup') }
+          : undefined,
+      );
+    } catch (error) {
+      writerOpen = false;
+      throw error;
+    }
+    let closed = false;
+    let preparing = false;
+    const bound = (selected: string) => {
+      if (selected !== binding) fail('InvalidLedgerInput');
+    };
+    return Object.freeze<VerifiedRetryLedger>({
+      prepareVerifiedRetryIntent(input, proof) {
+        if (closed || preparing) fail('LedgerUnavailable');
+        bound(input.intent.budget.credentialFingerprint);
+        preparing = true;
+        activeProof = proof;
+        try {
+          return ledger.prepareRetryIntent(input);
+        } finally {
+          activeProof = undefined;
+          preparing = false;
+        }
+      },
+      claimDispatch: ledger.claimDispatch.bind(ledger),
+      recordDispatchOutcome(value) {
+        bound(value.credentialFingerprint);
+        return ledger.recordDispatchOutcome(value);
+      },
+      cancelPrepared(selected, requestId, version) {
+        bound(selected);
+        return ledger.cancelPrepared(selected, requestId, version);
+      },
+      readIntent(selected, requestId) {
+        bound(selected);
+        return ledger.readIntent(selected, requestId);
+      },
+      close() {
+        if (closed) return;
+        closed = true;
+        try {
+          ledger.close();
+        } catch (error) {
+          if (owned) poisonNewWork('writer_close');
+          throw error;
+        } finally {
+          writerOpen = false;
+        }
+      },
+    });
+  };
+  const safeOwnerIntent = (intent: IntentView): RetryOwnerIntent => {
+    const { credentialFingerprint, ...safe } = intent;
+    void credentialFingerprint;
+    return freezeSnapshot(safe);
+  };
+  const openForSubmission = (): RetryOwnerWriter => {
+    // Opening remains available for exact replay after poison. Only missing-ID
+    // admission is new work, and the shared admission gate refuses it.
+    const ledger = openVerifiedWriter(true);
+    let closed = false;
+    let prepared = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      ledger.close();
+    };
+    return Object.freeze<RetryOwnerWriter>({
+      prepare(input, proof) {
+        try {
+          if (closed || prepared) fail('LedgerUnavailable');
+          prepared = true;
+          retainingAdmissionTime = true;
+          pendingAdmissionTime = undefined;
+          try {
+            const budget = freezeSnapshot(structuredClone(input.intent.budget));
+            const result = ledger.prepareVerifiedRetryIntent(input, proof);
+            if (result.kind === 'replay')
+              return Object.freeze({
+                kind: 'replay',
+                intent: safeOwnerIntent(result.intent),
+              });
+            // Admission necessarily supplied this slot before the real core
+            // created return. Do not add a post-commit fence here: retain the
+            // actual capability even if the commit notification cancelled us.
+            const time = pendingAdmissionTime!;
+            const capability = result.dispatchCapability;
+            const requestId = result.intent.requestId;
+            let observed = safeOwnerIntent(result.intent);
+            let retired = false;
+            let claimTried = false;
+            let postTried = false;
+            let postBegun = false;
+            let outcomeTried = false;
+            let outcomeToken: DispatchOutcomeToken | undefined;
+            const live = () => {
+              if (retired || closed) fail('LedgerUnavailable');
+            };
+            const checkpoint = () => {
+              live();
+              if (unavailable) fail('LedgerUnavailable');
+              checkTime(time, budget);
+              return time.expires - time.lastMono;
+            };
+            const owner = Object.freeze<RetryCreatedOwner>({
+              lastObservedIntent: () => observed,
+              refreshIntent() {
+                live();
+                const current = ledger.readIntent(binding, requestId);
+                if (!current) return null;
+                observed = safeOwnerIntent(current);
+                return observed;
+              },
+              checkpoint,
+              claim() {
+                live();
+                if (claimTried) return Object.freeze({ kind: 'lost' });
+                claimTried = true;
+                checkpoint();
+                const claimed = ledger.claimDispatch(capability, 0);
+                if (claimed.kind === 'lost')
+                  return Object.freeze({ kind: 'lost' });
+                // Save the genuine successful token before any later fence,
+                // read or await. This receipt does not require another SQL read.
+                outcomeToken = claimed.outcomeToken;
+                observed = freezeSnapshot({
+                  ...observed,
+                  state: 'dispatching',
+                  stateVersion: claimed.stateVersion,
+                });
+                return Object.freeze({ kind: 'claimed', stateVersion: 1 });
+              },
+              beginPost() {
+                live();
+                if (!outcomeToken || postTried || outcomeTried)
+                  fail('DispatchClaimLost');
+                postTried = true;
+                const remaining = checkpoint();
+                if (Math.floor(remaining) < 1)
+                  throw new RetryLedgerError('RetryProofExpired');
+                postBegun = true;
+                return remaining;
+              },
+              cancelPrepared() {
+                live();
+                const cancelled = ledger.cancelPrepared(binding, requestId, 0);
+                if (cancelled.kind === 'cancelled')
+                  observed = freezeSnapshot({
+                    ...observed,
+                    state: 'cancelled',
+                    stateVersion: cancelled.stateVersion,
+                  });
+                return Object.freeze(cancelled);
+              },
+              recordOutcome(outcome) {
+                live();
+                if (!outcomeToken || outcomeTried)
+                  fail('DispatchOutcomeClaimLost');
+                // A refused/absent fetch entry can only record proven no-send.
+                if (!postBegun && outcome.kind !== 'rejected')
+                  fail('InvalidLedgerInput');
+                outcomeTried = true;
+                observed = safeOwnerIntent(
+                  ledger.recordDispatchOutcome({
+                    credentialFingerprint: binding,
+                    requestId,
+                    expectedStateVersion: 1,
+                    outcomeToken,
+                    outcome,
+                  }),
+                );
+                return observed;
+              },
+              finish() {
+                if (retired) return;
+                retired = true;
+                let closeFailed = false;
+                try {
+                  close();
+                } catch {
+                  closeFailed = true;
+                }
+                // Always use the original record after the native close
+                // attempt. A failed cleanup keeps its fixed category first.
+                try {
+                  checkTime(time, budget);
+                } catch (error) {
+                  if (!closeFailed) throw error;
+                }
+                if (closeFailed) fail('LedgerUnavailable');
+              },
+            });
+            return Object.freeze({ kind: 'created', owner });
+          } finally {
+            pendingAdmissionTime = undefined;
+            retainingAdmissionTime = false;
+          }
+        } finally {
+          // A logical owned attempt retires even an unconsumed failed-BEGIN or
+          // cooperating-replay candidate. Legacy raw methods keep their rules.
+          records.delete(proof);
+        }
+      },
+      close,
+    });
+  };
   return Object.freeze({
     collectLatest,
     planLatestToolResult(value: unknown, signal?: AbortSignal) {
@@ -1451,7 +1712,27 @@ export function composeVerifiedRetryAdmission(
         return latestFailure(error);
       }
     },
-    isNewWorkAvailable: () => !unavailable,
+    isNewWorkAvailable: () => !unavailable && cleanupCause === undefined,
+    ...(production
+      ? {
+          openForSubmission,
+          poisonNewWork,
+          checkpointCandidate(proof: RetryProof) {
+            if (unavailable) fail('LedgerUnavailable');
+            const record = records.get(proof);
+            if (!record) throw new RetryLedgerError('RetryProofInvalid');
+            const time = { ...record };
+            checkTime(time);
+            records.set(
+              proof,
+              Object.freeze({ ...record, lastMono: time.lastMono }),
+            );
+          },
+          discardCandidate(proof: RetryProof) {
+            records.delete(proof);
+          },
+        }
+      : {}),
     async collect(
       value: RetrySelection,
       signal?: AbortSignal,
@@ -1604,61 +1885,7 @@ export function composeVerifiedRetryAdmission(
         collecting = false;
       }
     },
-    open(): VerifiedRetryLedger {
-      if (collecting || writerOpen) fail('LedgerBusy');
-      writerOpen = true;
-      let ledger: LocalSubmissionLedger;
-      try {
-        ledger = openLocalLedger(options, hooks, admission);
-      } catch (error) {
-        writerOpen = false;
-        throw error;
-      }
-      let closed = false;
-      let preparing = false;
-      const bound = (selected: string) => {
-        if (selected !== binding) fail('InvalidLedgerInput');
-      };
-      return Object.freeze<VerifiedRetryLedger>({
-        prepareVerifiedRetryIntent(
-          input: PrepareRetryIntentInput,
-          proof?: RetryProof,
-        ) {
-          if (closed || preparing) fail('LedgerUnavailable');
-          bound(input.intent.budget.credentialFingerprint);
-          preparing = true;
-          activeProof = proof;
-          try {
-            return ledger.prepareRetryIntent(input);
-          } finally {
-            activeProof = undefined;
-            preparing = false;
-          }
-        },
-        claimDispatch: ledger.claimDispatch.bind(ledger),
-        recordDispatchOutcome(value) {
-          bound(value.credentialFingerprint);
-          return ledger.recordDispatchOutcome(value);
-        },
-        cancelPrepared(selected, requestId, version) {
-          bound(selected);
-          return ledger.cancelPrepared(selected, requestId, version);
-        },
-        readIntent(selected, requestId) {
-          bound(selected);
-          return ledger.readIntent(selected, requestId);
-        },
-        close() {
-          if (closed) return;
-          closed = true;
-          try {
-            ledger.close();
-          } finally {
-            writerOpen = false;
-          }
-        },
-      });
-    },
+    open: () => openVerifiedWriter(),
   });
 }
 
@@ -3526,6 +3753,7 @@ function openLocalLedger(
   options: LedgerPathOptions,
   retryHooks?: RetryPrepareHooks,
   verifiedAdmission?: VerifiedAdmission,
+  cleanup?: Readonly<{ onUnverifiedClose(): void }>,
 ): LocalSubmissionLedger {
   validatePathInput(options);
   const uid = ensurePosixRuntime();
@@ -3564,7 +3792,9 @@ function openLocalLedger(
       try {
         database.close();
       } catch {
-        // Keep state untouched and return only the fixed category.
+        // Only an actual failed unwind close supplies this private receipt.
+        // Existing callers and the narrow reader retain their error contract.
+        cleanup?.onUnverifiedClose();
       }
     }
     throw toLedgerError(error);

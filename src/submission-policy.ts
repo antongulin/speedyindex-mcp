@@ -436,6 +436,29 @@ export interface SubmissionContext {
   readonly authorization: Readonly<IndexingAuthorization>;
 }
 
+/** Pure comparison commitment. The binding is trusted host data, never public input.
+ * The exact ordered preimage is shared with historical replay reconstruction. */
+export function computeSubmissionAuthorizationFingerprint(value: {
+  readonly quoteFingerprint: string;
+  readonly policyDigest: string;
+  readonly credentialFingerprint: string;
+  readonly budgetScope: string;
+  readonly periodId: string;
+  readonly periodStartMs: number;
+}): string {
+  return hash(
+    'speedyindex-submission-authorization-v1\0' +
+      JSON.stringify({
+        quoteFingerprint: value.quoteFingerprint,
+        policyDigest: value.policyDigest,
+        credentialFingerprint: value.credentialFingerprint,
+        budgetScope: value.budgetScope,
+        periodId: value.periodId,
+        periodStartMs: value.periodStartMs,
+      }),
+  );
+}
+
 /** nowMs comes from the trusted host clock, never MCP arguments. This is a
  * reservation day, not observed provider billing or authenticated human consent. */
 export function createSubmissionContext(
@@ -460,17 +483,14 @@ export function createSubmissionContext(
   const periodId = 'utc-day:' + new Date(startMs).toISOString().split('T')[0];
   const { policy, digest: policyDigest } = configuration.snapshot;
   const credentialFingerprint = configuration.credential.fingerprint;
-  const fingerprint = hash(
-    'speedyindex-submission-authorization-v1\0' +
-      JSON.stringify({
-        quoteFingerprint,
-        policyDigest,
-        credentialFingerprint,
-        budgetScope: policy.budgetScope,
-        periodId,
-        periodStartMs: startMs,
-      }),
-  );
+  const fingerprint = computeSubmissionAuthorizationFingerprint({
+    quoteFingerprint,
+    policyDigest,
+    credentialFingerprint,
+    budgetScope: policy.budgetScope,
+    periodId,
+    periodStartMs: startMs,
+  });
   const budget = Object.freeze({
     credentialFingerprint,
     budgetScope: policy.budgetScope,

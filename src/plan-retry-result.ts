@@ -274,7 +274,7 @@ const authorizationSchema = submissionAuthorizationSchema.safeExtend({
   period: periodSchema,
   fingerprint: digestSchema,
 });
-const preimageSchema = z.strictObject({
+export const retryPlanPreimageSchema = z.strictObject({
   parent: z.strictObject({
     family: familySchema,
     taskId: providerTaskIdSchema,
@@ -303,6 +303,11 @@ const preimageSchema = z.strictObject({
   urlCount: indexingRequestSchema.shape.urlCount,
   providerBodyBytes: indexingRequestSchema.shape.providerBodyBytes,
   reservation: submissionUnitVectorSchema,
+});
+export const retryPlanComparisonSchema = z.strictObject({
+  status: z.literal('comparison'),
+  preimage: retryPlanPreimageSchema,
+  fingerprint: digestSchema,
 });
 const reasonSchema = z.enum([
   'LocalUnresolvedHold',
@@ -334,11 +339,7 @@ const readySchema = z
     request: indexingRequestSchema,
     quote: indexingQuoteSchema,
     authorization: authorizationSchema,
-    identity: z.strictObject({
-      status: z.literal('comparison'),
-      preimage: preimageSchema,
-      fingerprint: digestSchema,
-    }),
+    identity: retryPlanComparisonSchema,
   })
   .superRefine((value, context) => {
     try {
