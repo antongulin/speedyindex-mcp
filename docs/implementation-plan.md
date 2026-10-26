@@ -39,6 +39,10 @@ The internal observation/comparison core, production owner composition and publi
 - Reuse the local SQLite submission ledger for durable request identity, reservations and dispatch state, with separately accepted lineage and retry eligibility. Provider idempotency is not documented; current unknown/dispatching/prepared holds permit no automatic resend, expiry or release. A future retry tool must establish eligibility without bypassing those holds.
 - Observe provider results separately from submission. A terminal provider result records that provider's outcome and does not establish fresh Google indexing truth.
 
+## Private retry submission foundation
+
+The internal foundation includes strict submission input and comparison reconstruction, bounded result envelopes, an owned V2 writer lifecycle and protected host preparation. Exact historical replay precedes current new-work gates. The foundation is verified with synthetic local fixtures. Public `submit_retry`, its paid consumer and one-shot execution remain unimplemented. Actual native host cleanup/close-fault coverage remains open; a post-close observer failure does not establish that coverage.
+
 ## Local retry history
 
 `get_retry_history` is implemented on this source branch through a pure projection, native query-only owner and ninth adapter on the configured host. The strict optional selectors choose both engines and 25 entries by default; parent requires an exact engine/ID, and cursors bind the query, limit and revision. Each call validates the complete selected-key V2 snapshot across scopes/families/policies/periods before returning recorded indexer retry contexts. The [public contract](../README.md#read-only-local-retry-history) preserves all six local states, counts, nullable terminal details, unknown ancestry/inception/provider-wide history and comparison-only refs. History does no provider observation, paid admission or logical write; the existing CLI loader still requires matching enabled configuration. Absent/disabled retry permission does not block it.
