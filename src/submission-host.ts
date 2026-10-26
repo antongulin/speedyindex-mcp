@@ -872,32 +872,39 @@ export class SubmissionHost {
     let result: SubmitRetryResult | undefined;
     let publication: SubmitRetryToolResult | undefined;
     const failureResult = (failure: RetryFailure): SubmitRetryResult => {
-      if (observed) {
-        const code =
-          failure.status === 'error' ||
-          failure.error.code === 'StalePeriodContext'
-            ? failure.error.code
-            : 'StateUnavailable';
-        return submitRetryResultSchema.parse({
-          status: 'error',
-          requestId: id,
-          error: submitRetryError(
-            code,
-            code === 'ReadFailed'
-              ? {
-                  ...(failure.error.phase === undefined
-                    ? {}
-                    : { phase: failure.error.phase }),
-                  ...(failure.error.cause === undefined
-                    ? {}
-                    : { cause: failure.error.cause }),
-                }
-              : {},
-          ),
-          evidence: retryDurableEvidence(reconstruction, observed),
-        });
+      try {
+        let projection: unknown = { ...failure, requestId: id };
+        if (observed) {
+          const code =
+            failure.status === 'error' ||
+            failure.error.code === 'StalePeriodContext'
+              ? failure.error.code
+              : 'StateUnavailable';
+          projection = {
+            status: 'error',
+            requestId: id,
+            error: submitRetryError(
+              code,
+              code === 'ReadFailed'
+                ? {
+                    ...(failure.error.phase === undefined
+                      ? {}
+                      : { phase: failure.error.phase }),
+                    ...(failure.error.cause === undefined
+                      ? {}
+                      : { cause: failure.error.cause }),
+                  }
+                : {},
+            ),
+            evidence: retryDurableEvidence(reconstruction, observed),
+          };
+        }
+        const parsed = submitRetryResultSchema.safeParse(projection);
+        if (parsed.success) return parsed.data;
+      } catch {
+        // Contain only public projection; native ownership and history stay intact.
       }
-      return submitRetryResultSchema.parse({ ...failure, requestId: id });
+      return { status: 'error', error: submitRetryError('InternalError') };
     };
     try {
       const collected = await composition.collectLatest(

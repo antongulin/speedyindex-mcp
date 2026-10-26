@@ -382,6 +382,7 @@ import {
   readRetrySnapshot,
   readRetryPlanningState,
   readRetryReplay,
+  RetryLedgerError,
   type PrepareIntentInput,
   type SubmissionLedger,
   type PrepareResult,
@@ -6144,6 +6145,468 @@ test('SR-R1-REPLAY-01 native accepted newline child replay contains strict proje
     );
   });
 });
+
+for (const [variant, childId] of [
+  ['UNREPRESENTABLE_NATIVE_CHILD', 'synthetic-native-child\n'],
+  ['REPRESENTABLE_NATIVE_CHILD', 'synthetic-native-child-safe'],
+] as const)
+  test(`SR-R2-RECOVERY-01 actual owned acceptance and cancellation ${variant}`, async () => {
+    await withProductionReceiver(
+      script(singleSource('yandex')),
+      async (api) => {
+        const config = fixtureConfiguration(api),
+          clock = new NativeOwnerClock(),
+          controller = new AbortController(),
+          listeners = trackOwnerSignal(controller.signal),
+          requestId = 'sr-r2-owned-recovery',
+          trace: string[] = [];
+        const host = new RetryConsumerProbe(config, {
+          fetchRequest: api.fetch,
+          clock: () => clock.utcMs(),
+          retry: { monotonicMs: () => clock.monotonicMs(), runtime: clock },
+        });
+        const close = observeRetryPreparationClose(() => {
+          trace.push('native-close-receipt');
+        });
+        let owner: RetryCreatedOwner | undefined,
+          accepted: RetryOwnerIntent | undefined,
+          acceptedProjection: ReturnType<typeof logicalProjection> | undefined,
+          settling: Promise<unknown> | undefined,
+          cancellation: unknown,
+          consumerThrown: unknown,
+          nativePremisesComplete = false,
+          consumerCalls = 0;
+        try {
+          const before = p1cProjection(api, config, 'r2-recovery-before'),
+            oracle = productionOracle(config, 'yandex'),
+            planning = host.planRetryToolResult({ searchEngine: 'yandex' });
+          api.operations.push(planning);
+          const plan = (await bounded(planning)).structuredContent;
+          if (plan.status !== 'ready')
+            throw new Error('SR-R2 recovery requires actual public ready.');
+          expectProductionReady(plan, oracle, config, true);
+          expect(p1cProjection(api, config, 'r2-recovery-planned')).toEqual(
+            before,
+          );
+          const input = parseSubmitRetryInput({
+            requestId,
+            expectedPlan: {
+              searchEngine: 'yandex',
+              eligibleUrls: plan.eligibleUrls,
+              budgetScope: config.snapshot.policy.budgetScope,
+              policyRevision: config.snapshot.policy.policyRevision,
+              identity: plan.identity,
+            },
+          });
+          const reconstruction = reconstructSubmitRetry(input, {
+            credentialFingerprint: fingerprint,
+            currentCaps: config.snapshot.policy.caps,
+          });
+          const expectedIntent = {
+            requestId,
+            state: 'accepted',
+            stateVersion: 2,
+            createdAtMs: utc,
+            periodId: 'utc-day:2026-10-21',
+            periodStartMs: Date.parse('2026-10-21T00:00:00Z'),
+            policyRevision: config.snapshot.policy.policyRevision,
+            policyDigest: config.snapshot.digest,
+            reservation: { tokens: 40, indexer: 2, checker: 0 },
+            providerTaskId: childId,
+            providerType: 'yandex/indexer',
+          } as const;
+          const preparing = host.prepareForTest(
+            input,
+            controller.signal,
+            async (work) => {
+              consumerCalls++;
+              owner = work.owner;
+              try {
+                expect(owner.lastObservedIntent()).toMatchObject({
+                  requestId,
+                  state: 'prepared',
+                  stateVersion: 0,
+                });
+                expect(owner.claim()).toEqual({
+                  kind: 'claimed',
+                  stateVersion: 1,
+                });
+                expect(owner.lastObservedIntent()).toMatchObject({
+                  state: 'dispatching',
+                  stateVersion: 1,
+                });
+                expect(owner.beginPost()).toBe(60000);
+                // Synthetic native history through the real owner, with no fetch
+                // entry or claim of a real provider ACK/job execution.
+                accepted = owner.recordOutcome({
+                  kind: 'accepted',
+                  providerType: 'yandex/indexer',
+                  providerTaskId: childId,
+                });
+                expect(accepted).toMatchObject(expectedIntent);
+                expect(owner.lastObservedIntent()).toEqual(accepted);
+                const sql = withP1cReadDb(config, (db) => ({
+                  core: db
+                    .query(
+                      `SELECT request_id,task_family,state,state_version,provider_task_id,provider_type,claim_token_digest,dispatch_outcome_token_digest,reserved_tokens,reserved_indexer,reserved_checker,period_id,period_start_ms FROM intents WHERE request_id=?`,
+                    )
+                    .get(requestId),
+                  context: db
+                    .query(
+                      `SELECT origin_kind,parent_family,parent_task_id,source_manifest_digest,plan_fingerprint FROM intent_context WHERE request_id=?`,
+                    )
+                    .get(requestId),
+                  urls: db
+                    .query(
+                      `SELECT ordinal,url_text FROM intent_urls WHERE request_id=? ORDER BY ordinal`,
+                    )
+                    .all(requestId),
+                  events: db
+                    .query(
+                      `SELECT event_kind,state_version,provider_task_id,provider_type FROM intent_events WHERE request_id=? ORDER BY state_version`,
+                    )
+                    .all(requestId),
+                  counts: db
+                    .query(
+                      `SELECT (SELECT COUNT(*) FROM intents) AS intents,(SELECT COUNT(*) FROM intent_context) AS contexts,(SELECT COUNT(*) FROM intent_context WHERE origin_kind='retry') AS retries`,
+                    )
+                    .get(),
+                }));
+                expect(sql).toEqual({
+                  core: {
+                    request_id: requestId,
+                    task_family: 'yandex/indexer',
+                    state: 'accepted',
+                    state_version: 2,
+                    provider_task_id: childId,
+                    provider_type: 'yandex/indexer',
+                    claim_token_digest: null,
+                    dispatch_outcome_token_digest: null,
+                    reserved_tokens: 40,
+                    reserved_indexer: 2,
+                    reserved_checker: 0,
+                    period_id: 'utc-day:2026-10-21',
+                    period_start_ms: Date.parse('2026-10-21T00:00:00Z'),
+                  },
+                  context: {
+                    origin_kind: 'retry',
+                    parent_family: 'yandex/indexer',
+                    parent_task_id: 'parent',
+                    source_manifest_digest:
+                      oracle.preimage.sourceManifestDigest,
+                    plan_fingerprint: oracle.planFingerprint,
+                  },
+                  urls: [
+                    { ordinal: 0, url_text: A },
+                    { ordinal: 1, url_text: B },
+                  ],
+                  events: [
+                    {
+                      event_kind: 'prepared',
+                      state_version: 0,
+                      provider_task_id: null,
+                      provider_type: null,
+                    },
+                    {
+                      event_kind: 'dispatching',
+                      state_version: 1,
+                      provider_task_id: null,
+                      provider_type: null,
+                    },
+                    {
+                      event_kind: 'accepted',
+                      state_version: 2,
+                      provider_task_id: childId,
+                      provider_type: 'yandex/indexer',
+                    },
+                  ],
+                  counts: { intents: 1, contexts: 1, retries: 1 },
+                });
+                const nativeReplay = readRetryReplay(
+                  { stateDirectory: config.stateDirectory },
+                  fingerprint,
+                  reconstruction.replay,
+                );
+                expect(nativeReplay).toMatchObject({
+                  availability: 'available',
+                  kind: 'replay',
+                  intent: expectedIntent,
+                });
+                acceptedProjection = p1cProjection(
+                  api,
+                  config,
+                  'r2-recovery-accepted',
+                );
+                expect(api.wires).toHaveLength(20);
+                expect(
+                  api.wires.some(({ path }) => path.endsWith('/create')),
+                ).toBe(false);
+                writeFileSync(
+                  join(api.root, 'sr-r2-native-premises.json'),
+                  JSON.stringify({
+                    variant,
+                    childId,
+                    accepted,
+                    sql,
+                    nativeReplay,
+                    readRequests: api.wires.length,
+                    createRequests: 0,
+                  }),
+                  { mode: 0o600 },
+                );
+                nativePremisesComplete = true;
+                // All independent SQL/replay readers are closed. The observer's
+                // next native close belongs to the actual created owner's writer.
+                close.arm();
+                controller.abort();
+                try {
+                  owner.checkpoint();
+                } catch (error) {
+                  cancellation = error;
+                  writeFileSync(
+                    join(api.root, 'sr-r2-cancellation-premise.json'),
+                    JSON.stringify({
+                      originalSignalAborted: controller.signal.aborted,
+                      name: error instanceof Error ? error.name : null,
+                      message: error instanceof Error ? error.message : null,
+                      code:
+                        error instanceof RetryLedgerError ? error.code : null,
+                    }),
+                    { mode: 0o600 },
+                  );
+                  throw error; // The actual captured-signal checkpoint cause.
+                }
+                throw new Error(
+                  'SR-R2 original owner checkpoint did not cancel.',
+                );
+              } catch (error) {
+                consumerThrown = error;
+                throw error;
+              }
+            },
+          );
+          // Register both settlements immediately: the intentional pre-fix strict
+          // rejection must not become an unrelated receiver-cleanup failure.
+          const settlement = preparing.then(
+            (envelope) => {
+              trace.push('helper-resolved');
+              return { kind: 'resolved' as const, envelope };
+            },
+            (error: unknown) => {
+              trace.push('helper-rejected');
+              return { kind: 'rejected' as const, error };
+            },
+          );
+          settling = settlement;
+          api.operations.push(settlement);
+          const settled = await bounded(settlement);
+          if (!nativePremisesComplete) throw consumerThrown;
+          if (!owner || !accepted || !acceptedProjection)
+            throw new Error('SR-R2 actual native owner/receipt missing.');
+          expect(cancellation).toBeInstanceOf(RetryLedgerError);
+          expect(cancellation).toMatchObject({ code: 'RetryCancelled' });
+          expect(consumerThrown).toBe(cancellation);
+          expect(controller.signal.aborted).toBe(true);
+          expect(consumerCalls).toBe(1);
+          expect(close.receipts).toHaveLength(1);
+          expect(close.receipts[0]!.args).toEqual([]);
+          expect('error' in close.receipts[0]!).toBe(false);
+          expect(() =>
+            close.receipts[0]!.receiver.query('SELECT 1').get(),
+          ).toThrow();
+          expect(trace.indexOf('native-close-receipt')).toBeLessThan(
+            trace.indexOf(
+              settled.kind === 'resolved'
+                ? 'helper-resolved'
+                : 'helper-rejected',
+            ),
+          );
+          expect(owner.lastObservedIntent()).toEqual(accepted);
+          expect(() => owner!.refreshIntent()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.checkpoint()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.claim()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.beginPost()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.cancelPrepared()).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          expect(() => owner!.recordOutcome({ kind: 'rejected' })).toThrow(
+            'Submission ledger is unavailable.',
+          );
+          owner.finish();
+          expect(p1cProjection(api, config, 'r2-recovery-settled')).toEqual(
+            acceptedProjection,
+          );
+          const replaying = host.prepareForTest(input, undefined, async () => {
+            consumerCalls++;
+            throw new Error('SR_R2_REPLAY_MUST_NOT_REENTER_CONSUMER');
+          });
+          api.operations.push(replaying);
+          const replay = await bounded(replaying);
+          expect(replay.structuredContent).toMatchObject(
+            variant === 'UNREPRESENTABLE_NATIVE_CHILD'
+              ? { status: 'error', error: submitRetryError('InternalError') }
+              : { status: 'accepted', replayed: true, intent: expectedIntent },
+          );
+          expect(p1cProjection(api, config, 'r2-recovery-replayed')).toEqual(
+            acceptedProjection,
+          );
+          expect(consumerCalls).toBe(1);
+          expect(api.wires).toHaveLength(20);
+          expect(api.wires.some(({ path }) => path.endsWith('/create'))).toBe(
+            false,
+          );
+          expect(clock.handles.size).toBe(0);
+          expect(listeners.active.size).toBe(0);
+          writeFileSync(
+            join(api.root, 'sr-r2-recovery-settlement.json'),
+            JSON.stringify({
+              variant,
+              childId,
+              nativePremisesComplete,
+              cancellation: {
+                name: cancellation instanceof Error ? cancellation.name : null,
+                code:
+                  cancellation instanceof RetryLedgerError
+                    ? cancellation.code
+                    : null,
+              },
+              settlement:
+                settled.kind === 'resolved'
+                  ? settled
+                  : {
+                      kind: settled.kind,
+                      error: {
+                        name:
+                          settled.error instanceof Error
+                            ? settled.error.name
+                            : null,
+                        message:
+                          settled.error instanceof Error
+                            ? settled.error.message
+                            : null,
+                        stack:
+                          settled.error instanceof Error
+                            ? settled.error.stack
+                            : null,
+                      },
+                    },
+              replay,
+              trace,
+              cachedAccepted: owner.lastObservedIntent(),
+              unchangedHistory: true,
+              consumerCalls,
+              readRequests: api.wires.length,
+              createRequests: 0,
+              actualNativeClose: {
+                count: close.receipts.length,
+                args: close.receipts[0]!.args,
+                returned: String(close.receipts[0]!.returned),
+                threw: 'error' in close.receipts[0]!,
+              },
+              timers: clock.handles.size,
+              listeners: listeners.active.size,
+              spontaneousNativeCloseFault: false,
+            }),
+            { mode: 0o600 },
+          );
+          // This is the intended pre-fix RED, after actual native/cancellation and
+          // resource premises have been saved independently of the public oracle.
+          expect(settled.kind).toBe('resolved');
+          if (settled.kind !== 'resolved') throw settled.error;
+          const envelope = settled.envelope;
+          expect(
+            submitRetryResultSchema.safeParse(envelope.structuredContent)
+              .success,
+          ).toBe(true);
+          expect(envelope.structuredContent).toEqual(
+            variant === 'UNREPRESENTABLE_NATIVE_CHILD'
+              ? {
+                  status: 'error',
+                  error: {
+                    code: 'InternalError',
+                    message: 'Retry submission failed internally.',
+                  },
+                }
+              : {
+                  status: 'error',
+                  requestId,
+                  error: submitRetryError('Cancelled'),
+                  evidence: {
+                    kind: 'durable',
+                    request: plan.request,
+                    quote: plan.quote,
+                    retry: {
+                      parent: oracle.preimage.parent,
+                      sourceManifestDigest:
+                        oracle.preimage.sourceManifestDigest,
+                      planFingerprint: oracle.planFingerprint,
+                    },
+                    intent: expectedIntent,
+                  },
+                },
+          );
+          expect(envelope.isError).toBe(true);
+          expect(JSON.parse(envelope.content[0]!.text)).toEqual(
+            envelope.structuredContent,
+          );
+          expect(Object.isFrozen(envelope)).toBe(true);
+          expect(Object.isFrozen(envelope.structuredContent)).toBe(true);
+          const json = JSON.stringify(envelope);
+          expect(Buffer.byteLength(json, 'utf8')).toBeLessThanOrEqual(
+            2_097_152,
+          );
+          for (const privateValue of [
+            fixtureKey,
+            fingerprint,
+            config.stateDirectory,
+            localSnapshot(config).ledgerId,
+            'ZodError',
+            'Invalid input',
+            'dispatchCapability',
+            'proof',
+            'ledgerId',
+          ])
+            expect(json).not.toContain(privateValue);
+          if (variant === 'UNREPRESENTABLE_NATIVE_CHILD') {
+            expect(json).not.toContain('synthetic-native-child');
+            expect(json).not.toContain('\\n');
+            expect('requestId' in envelope.structuredContent).toBe(false);
+            expect('evidence' in envelope.structuredContent).toBe(false);
+          }
+          writeFileSync(
+            join(api.root, 'sr-r2-recovery-result.json'),
+            JSON.stringify({
+              variant,
+              envelope,
+              unchangedHistory: true,
+              firstCause: 'RetryCancelled',
+              actualNativeCloseCount: close.receipts.length,
+              readRequests: api.wires.length,
+              createRequests: 0,
+              timers: clock.handles.size,
+              listeners: listeners.active.size,
+            }),
+            { mode: 0o600 },
+          );
+        } finally {
+          try {
+            if (settling) await bounded(settling);
+          } finally {
+            close.restore();
+            listeners.restore();
+          }
+        }
+      },
+    );
+  });
 
 for (const [caseId, variant] of [
   ['SR-R1-CONSUME-01', 'returned'],
