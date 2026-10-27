@@ -29,6 +29,35 @@ import {
   planRetryFiniteCases,
 } from './plan-retry-sdk';
 
+import {
+  verifyCompareReportsSdk,
+  verifyCompareReportsSchemaSdk,
+  verifyCompareReportsFiniteSdk,
+  verifyCompareReportsCancellationSdk,
+  compareReportsFiniteCases,
+} from './compare-reports-sdk';
+
+test('CR-C3-S01 SOURCE comparison registry and nine SDK rejection arms', async () => {
+  await verifyCompareReportsSchemaSdk('src/cli.ts');
+}, 30000);
+
+test('CR-C3-S02 SOURCE caller direction, exact IDs and independent date channels', async () => {
+  await verifyCompareReportsSdk('src/cli.ts', 'generic');
+}, 30000);
+
+test('CR-C3-S03 SOURCE complete advertised backlink pages and unknown donors', async () => {
+  await verifyCompareReportsSdk('src/cli.ts', 'backlink');
+}, 30000);
+
+for (const kind of compareReportsFiniteCases)
+  test(`CR-C3-S04 SOURCE finite ${kind}`, async () => {
+    await verifyCompareReportsFiniteSdk('src/cli.ts', kind);
+  }, 30000);
+
+test('CR-C3-S05 SOURCE pending native body settles through held cancellation before recovery', async () => {
+  await verifyCompareReportsCancellationSdk();
+}, 30000);
+
 test('GRH-15 SOURCE CLI advertises strict local history and returns genuine independent SQL pages', async () => {
   await verifyRetryHistorySourceSdk();
 }, 30000);
@@ -165,6 +194,7 @@ test('LT-06: real SDK process registers all read-only tools with structured and 
       'create_backlink_check',
       'plan_retry',
       'get_retry_history',
+      'compare_reports',
     ]);
     expect(tools[0]?.inputSchema).toMatchObject({
       type: 'object',
@@ -691,7 +721,7 @@ test('F02: direct stdin EOF after initialize exits successfully', async () => {
   await verifyEof('src/cli.ts');
 });
 
-test('IC10/C15 SOURCE SDK: nine tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
+test('IC10/C15 SOURCE SDK: ten tools expose strict schemas, paid annotations, unpriced checker preview and disabled results', async () => {
   const api = await fixture((_request, response) => response.end('unexpected'));
   let session: Awaited<ReturnType<typeof connect>> | undefined;
   try {
@@ -707,6 +737,7 @@ test('IC10/C15 SOURCE SDK: nine tools expose strict schemas, paid annotations, u
       'create_backlink_check',
       'plan_retry',
       'get_retry_history',
+      'compare_reports',
     ]);
     await verifyUnconfiguredReads(session.client);
     const checker = tools[5]!;

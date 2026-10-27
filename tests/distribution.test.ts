@@ -30,7 +30,31 @@ import {
   planRetryFiniteCases,
 } from './plan-retry-sdk';
 
-test('GRH-15 BUILT CLI nine tools and genuine selected-key six-state history paginate without writes', async () => {
+import {
+  verifyCompareReportsSdk,
+  verifyCompareReportsSchemaSdk,
+  verifyCompareReportsFiniteSdk,
+  compareReportsFiniteCases,
+} from './compare-reports-sdk';
+
+test('CR-C3-S01 BUILT comparison registry and nine SDK rejection arms', async () => {
+  await verifyCompareReportsSchemaSdk('dist/cli.js');
+}, 30000);
+
+test('CR-C3-S02 BUILT caller direction, exact IDs and independent date channels', async () => {
+  await verifyCompareReportsSdk('dist/cli.js', 'generic');
+}, 30000);
+
+test('CR-C3-S03 BUILT complete advertised backlink pages and unknown donors', async () => {
+  await verifyCompareReportsSdk('dist/cli.js', 'backlink');
+}, 30000);
+
+for (const kind of compareReportsFiniteCases)
+  test(`CR-C3-S04 BUILT finite ${kind}`, async () => {
+    await verifyCompareReportsFiniteSdk('dist/cli.js', kind);
+  }, 30000);
+
+test('GRH-15 BUILT CLI ten tools and genuine selected-key six-state history paginate without writes', async () => {
   await verifyRetryHistorySourceSdk('dist/cli.js');
 }, 30000);
 
@@ -116,6 +140,7 @@ test('LT-08: built CLI registers and calls all four read-only tools', async () =
       'create_backlink_check',
       'plan_retry',
       'get_retry_history',
+      'compare_reports',
     ]);
     const result = await session.client.callTool({
       name: 'get_balance',
@@ -352,7 +377,7 @@ async function withBuiltSubmission(
   if (failures.length) throw failures[0];
 }
 
-test('C15 BUILT: nine-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
+test('C15 BUILT: ten-tool schemas, paid annotations, no-key preview, disabled submit and SDK input rejection', async () => {
   await withBuiltSubmission(async (h) => {
     const session = await h.open([], '');
     const { tools } = await bounded(session.client.listTools());
@@ -366,6 +391,7 @@ test('C15 BUILT: nine-tool schemas, paid annotations, no-key preview, disabled s
       'create_backlink_check',
       'plan_retry',
       'get_retry_history',
+      'compare_reports',
     ]);
     await verifyUnconfiguredReads(session.client);
     const checker = tools[5]!;
@@ -667,7 +693,7 @@ test('C15 BUILT: explicit local setup, one accepted POST, restart replay, bad ac
       state,
     ];
     let session = await h.open(args);
-    expect((await bounded(session.client.listTools())).tools).toHaveLength(9);
+    expect((await bounded(session.client.listTools())).tools).toHaveLength(10);
     async function call(input: Record<string, unknown>) {
       const result = await bounded(
         session.client.callTool({
