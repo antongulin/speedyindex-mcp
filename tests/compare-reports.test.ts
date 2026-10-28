@@ -556,6 +556,8 @@ interface N1Expected {
   progress: readonly CompareOwnerPhase[];
   child?: boolean;
   retainedBytes?: number;
+  releaseFailure?: boolean;
+  throwOnClose?: readonly ('before_close' | 'after_close')[];
 }
 
 const n1Selected: CompareReportsInput = { ...input };
@@ -665,7 +667,7 @@ function n1Blocked(code: keyof typeof n1BlockMessages): CompareReportsResult {
 
 function n1ReadFailed(
   phase: 'status' | 'report' | 'fence',
-): CompareReportsResult {
+): Extract<CompareReportsResult, { status: 'error' }> {
   return {
     status: 'error',
     error: {
@@ -791,6 +793,13 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
   const closedReceipts: Promise<void>[] = [];
   const receiverErrors: unknown[] = [];
   const phases: CompareOwnerPhase[] = [];
+  const observerThrows: CompareOwnerPhase[] = [];
+  const closeObservations: {
+    phase: CompareOwnerPhase;
+    readerClosed: number;
+    releases: number;
+    budgetCode: unknown;
+  }[] = [];
   const calls: {
     receiver: boolean;
     signal: AbortSignal | undefined;
@@ -995,6 +1004,8 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
             },
             afterRelease() {
               releaseReceipts++;
+              if (expected.releaseFailure && releaseReceipts === 1)
+                throw new Error('Synthetic comparison release failure.');
             },
           }),
         {
@@ -1036,6 +1047,28 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
           : { limits: { retainedBytes: expected.retainedBytes } }),
         onPhase(phase) {
           phases.push(phase);
+          if (
+            (expected.releaseFailure || expected.throwOnClose) &&
+            (phase === 'before_close' || phase === 'after_close')
+          ) {
+            let budgetCode: unknown;
+            try {
+              calls[0]?.budget?.checkpoint();
+            } catch (error) {
+              budgetCode =
+                error instanceof Error && 'code' in error ? error.code : error;
+            }
+            closeObservations.push({
+              phase,
+              readerClosed,
+              releases: releaseReceipts,
+              budgetCode,
+            });
+            if (expected.throwOnClose?.includes(phase)) {
+              observerThrows.push(phase);
+              throw new Error('Synthetic comparison close observer failure.');
+            }
+          }
         },
       });
       client.getTaskStatus = () => {
@@ -1072,6 +1105,23 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
       expect(readerClosed).toBe(expected.reads);
       expect(doneReceipts).toBe(expected.reads);
       expect(releaseReceipts).toBe(expected.reads);
+      if (expected.releaseFailure || expected.throwOnClose) {
+        expect(observerThrows).toEqual([...(expected.throwOnClose ?? [])]);
+        expect(closeObservations).toEqual([
+          {
+            phase: 'before_close',
+            readerClosed: expected.reads,
+            releases: expected.reads,
+            budgetCode: expected.releaseFailure ? 'CleanupFailed' : undefined,
+          },
+          {
+            phase: 'after_close',
+            readerClosed: expected.reads,
+            releases: expected.reads,
+            budgetCode: expected.releaseFailure ? 'CleanupFailed' : 'Cancelled',
+          },
+        ]);
+      }
       expect(guard.calls()).toBe(0);
     }
     await Promise.all(handlers);
@@ -1106,6 +1156,8 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
       doneReceipts,
       cancelReceipts,
       releaseReceipts,
+      observerThrows,
+      closeObservations,
       readerInstrumentation: expected.child
         ? 'Unchanged child fixture has no separate reader decorator; actual owner after_close plus child native EOF/reap recorded.'
         : 'Original native delegated receipts only.',
@@ -6146,4 +6198,62 @@ test('CR-N27 immutable keyless and whitespace clients return the fixed MissingCr
     }
     expect(attempts).toBe(0);
   }
+});
+
+test('CR-R1-CLEANUP-01 native release fault reaches owner close rejection and cleanup envelope', async () => {
+  await n1Run(n1GenericScript('CR-R1-CLEANUP-01', 'google/indexer'), {
+    result: {
+      status: 'error',
+      error: {
+        code: 'CleanupFailed',
+        message: 'Report comparison cleanup failed.',
+      },
+      cleanup: 'failed',
+    },
+    reads: 1,
+    progress: n1Initial,
+    releaseFailure: true,
+  });
+});
+
+test('CR-R1-CLEANUP-02 native release fault preserves the original invalid-response cause', async () => {
+  const script = n1GenericScript('CR-R1-CLEANUP-02', 'google/indexer');
+  await n1Run(
+    { ...script, reply: () => null },
+    {
+      result: { ...n1ReadFailed('status'), cleanup: 'failed' },
+      reads: 1,
+      progress: n1Initial,
+      releaseFailure: true,
+    },
+  );
+});
+
+test('CR-R1-OBS-01 each throwing close observer independently returns InternalError after native settlement', async () => {
+  for (const phase of ['before_close', 'after_close'] as const)
+    await n1Run(n1GenericScript('CR-R1-OBS-01-' + phase, 'google/indexer'), {
+      result: {
+        status: 'error',
+        error: {
+          code: 'InternalError',
+          message: 'Report comparison failed internally.',
+        },
+      },
+      reads: 7,
+      progress: n1Complete,
+      throwOnClose: [phase],
+    });
+});
+
+test('CR-R1-OBS-02 both throwing close observers preserve the original read failure', async () => {
+  const script = n1GenericScript('CR-R1-OBS-02', 'google/indexer');
+  await n1Run(
+    { ...script, reply: () => null },
+    {
+      result: n1ReadFailed('status'),
+      reads: 1,
+      progress: n1Initial,
+      throwOnClose: ['before_close', 'after_close'],
+    },
+  );
 });
