@@ -2377,7 +2377,7 @@ test('CR-CPU01 fixed32 and128 certification keeps full frames and native volume 
     receipts.push({ n, calls: atN.calls, volume: atN.volume, cap });
   }
   console.info('CR-CPU01 native-volume ' + JSON.stringify(receipts));
-  // All functional/full-frame/N-N1 checks above precede this expected old RED.
+  // Regression guard for the formerly red volume bound; expected to pass now.
   for (const receipt of receipts)
     expect(receipt.volume).toBeLessThanOrEqual(receipt.cap);
 });
@@ -6271,4 +6271,190 @@ test('CR-B2-SORT-OBSERVER-FAULT original parent refusal precedes sort and preser
         lateCheckpoints: actual.lateCheckpoints,
       }),
   );
+});
+
+test('CR-R1-EVERY-NATIVE-CHANGES guards retain native Map/Set effects with a replaced every', () => {
+  const native = JSON.stringify;
+  const every = Object.getOwnPropertyDescriptor(Array.prototype, 'every')!;
+  for (const kind of ['map', 'set'] as const) {
+    for (const location of ['prototype', 'own'] as const) {
+      const prototype = kind === 'map' ? Map.prototype : Set.prototype;
+      const name = kind === 'map' ? 'entries' : 'values';
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, name)!;
+      const meter = createCompareOwnerRootBytes();
+      let calls = 0;
+      let actualCalls = 0;
+      let exactCalls = 0;
+      let actual: number | undefined;
+      let exact: number | undefined;
+      meter.measurementScope((writers) => {
+        const map = writers.map<unknown>();
+        const set = writers.set<unknown>();
+        map.put('key', 'initial Ω');
+        set.add('initial Ω');
+        const value = kind === 'map' ? map.value : set.value;
+        const changed = {
+          ...descriptor,
+          value(this: object) {
+            calls++;
+            const rows = Array.from(
+              Reflect.apply(descriptor.value, this, []) as Iterable<unknown>,
+            );
+            rows.push(kind === 'map' ? ['extra', 'native é'] : 'native é');
+            return rows.values();
+          },
+        };
+        try {
+          if (location === 'own') Object.defineProperty(value, name, changed);
+          map.seal();
+          set.seal();
+          Object.defineProperty(Array.prototype, 'every', {
+            ...every,
+            value: () => true,
+          });
+          if (location === 'prototype')
+            Object.defineProperty(prototype, name, changed);
+          const parent = writers.array<unknown>();
+          parent.append(value);
+          parent.seal();
+          const roots = [parent.value, value, parent.value];
+          calls = 0;
+          actual = meter.bytes(roots);
+          actualCalls = calls;
+          calls = 0;
+          exact = cpuFrameBytes(native, roots);
+          exactCalls = calls;
+        } finally {
+          Object.defineProperty(Array.prototype, 'every', every);
+          if (location === 'prototype')
+            Object.defineProperty(prototype, name, descriptor);
+        }
+      });
+      expect(Object.getOwnPropertyDescriptor(Array.prototype, 'every')).toEqual(
+        every,
+      );
+      expect(Object.getOwnPropertyDescriptor(prototype, name)).toEqual(
+        descriptor,
+      );
+      expect(actual).toBe(exact);
+      expect(exactCalls).toBeGreaterThan(0);
+      expect(actualCalls).toBe(exactCalls);
+    }
+  }
+});
+
+test('CR-R1-EVERY-DELEGATING exact frames do not depend on a benign every replacement', () => {
+  const native = JSON.stringify;
+  const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'every')!;
+  const meter = createCompareOwnerRootBytes();
+  let lookups = 0;
+  let actual: number | undefined;
+  let exact: number | undefined;
+  meter.measurementScope((writers) => {
+    const map = writers.map<string>();
+    const set = writers.set<string>();
+    map.put('key', 'é');
+    set.add('Ω');
+    map.seal();
+    set.seal();
+    const parent = writers.array<unknown>();
+    parent.append(map.value);
+    parent.append(set.value);
+    parent.seal();
+    const roots = [parent.value, map.value, set.value];
+    try {
+      Object.defineProperty(Array.prototype, 'every', {
+        ...descriptor,
+        value(this: unknown[], ...args: unknown[]) {
+          lookups++;
+          return Reflect.apply(descriptor.value, this, args);
+        },
+      });
+      actual = meter.bytes(roots);
+      exact = cpuFrameBytes(native, roots);
+    } finally {
+      Object.defineProperty(Array.prototype, 'every', descriptor);
+    }
+  });
+  expect(Object.getOwnPropertyDescriptor(Array.prototype, 'every')).toEqual(
+    descriptor,
+  );
+  expect(actual).toBe(exact);
+  expect(lookups).toBe(0);
+});
+
+test('CR-R1-EVERY-ACCESSOR guards do not invoke an unrelated throwing every getter', () => {
+  const native = JSON.stringify;
+  const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'every')!;
+  const sentinel = new Error('unrelated every getter');
+  const meter = createCompareOwnerRootBytes();
+  let lookups = 0;
+  let caught: unknown;
+  let actual: number | undefined;
+  let exact: number | undefined;
+  meter.measurementScope((writers) => {
+    const map = writers.map<string>();
+    const set = writers.set<string>();
+    map.put('key', 'é');
+    set.add('Ω');
+    map.seal();
+    set.seal();
+    const parent = writers.array<unknown>();
+    parent.append(map.value);
+    parent.append(set.value);
+    parent.seal();
+    const roots = [parent.value, map.value, set.value];
+    try {
+      Object.defineProperty(Array.prototype, 'every', {
+        configurable: true,
+        enumerable: descriptor.enumerable ?? false,
+        get() {
+          lookups++;
+          throw sentinel;
+        },
+      });
+      actual = meter.bytes(roots);
+      exact = cpuFrameBytes(native, roots);
+    } catch (error) {
+      caught = error;
+    } finally {
+      Object.defineProperty(Array.prototype, 'every', descriptor);
+    }
+  });
+  expect(Object.getOwnPropertyDescriptor(Array.prototype, 'every')).toEqual(
+    descriptor,
+  );
+  expect(caught).toBeUndefined();
+  expect(lookups).toBe(0);
+  expect(actual).toBe(exact);
+});
+
+test('CR-R1-CLOSED-PRODUCERS managed writes after seal refuse without changing frame contents', () => {
+  const native = JSON.stringify;
+  const meter = createCompareOwnerRootBytes();
+  meter.measurementScope((writers) => {
+    const array = writers.array<string>();
+    const map = writers.map<string>();
+    const set = writers.set<string>();
+    array.append('array Ω');
+    map.put('key', 'map é');
+    set.add('set Ω');
+    array.seal();
+    map.seal();
+    set.seal();
+    const roots = [array.value, map.value, set.value];
+    const before = cpuFrameBytes(native, roots);
+    expect(meter.bytes(roots)).toBe(before);
+    for (const action of [
+      () => array.append('late'),
+      () => map.put('late', 'late'),
+      () => set.add('late'),
+    ])
+      expect(action).toThrow(TypeError);
+    expect(cpuFrameBytes(native, roots)).toBe(before);
+    expect(meter.bytes(roots)).toBe(before);
+    expect(array.value).toEqual(['array Ω']);
+    expect(Array.from(map.value.entries())).toEqual([['key', 'map é']]);
+    expect(Array.from(set.value.values())).toEqual(['set Ω']);
+  });
 });

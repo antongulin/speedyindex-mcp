@@ -42,6 +42,16 @@ function unchangedWriterNative(index: number): boolean {
     current.configurable === original.configurable
   );
 }
+function unchangedWriterNatives(indices: readonly number[]): boolean {
+  for (let index = 0; index < indices.length; index++)
+    if (!unchangedWriterNative(indices[index]!)) return false;
+  return true;
+}
+function withoutOwnMethods(value: object, names: readonly string[]): boolean {
+  for (let index = 0; index < names.length; index++)
+    if (Object.getOwnPropertyDescriptor(value, names[index]!)) return false;
+  return true;
+}
 // Trusted unmodified module initialization, as for the writer kernel above.
 // Descriptor equality detects later changes; it does not authenticate pre-import
 // replacements. Never recapture this baseline when a meter/scope is created.
@@ -101,6 +111,9 @@ interface NumericMeasurement {
  * at private allocation sites, after their last mutation. Certification is
  * bottom-up: every object child must already have its own closed certificate.
  * Weak keys retain no DTOs; values are byte counts, never serialized images.
+ * Trusted producers keep sealed aliases and borrowed read graphs read-only
+ * throughout their scope. Registered slot graphs stay unchanged until replaced
+ * or cleared; their recorded scalars describe those fixed snapshots.
  */
 export function createCompareOwnerRootBytes() {
   const ownedBytes = new WeakMap<object, number>();
@@ -122,7 +135,7 @@ export function createCompareOwnerRootBytes() {
           writerNatives[8][0],
           Symbol.iterator,
         ) &&
-        [1, 2, 3, 4, 8, 10].every(unchangedWriterNative))) &&
+        unchangedWriterNatives([1, 2, 3, 4, 8, 10]))) &&
     (!(dependencies & 2) ||
       (Object.getPrototypeOf(Set.prototype) === Object.prototype &&
         !Object.getOwnPropertyDescriptor(Set.prototype, 'toJSON') &&
@@ -131,7 +144,7 @@ export function createCompareOwnerRootBytes() {
           writerNatives[9][0],
           Symbol.iterator,
         ) &&
-        [5, 6, 7, 9, 10].every(unchangedWriterNative))) &&
+        unchangedWriterNatives([5, 6, 7, 9, 10]))) &&
     (!(dependencies & 4) || unchangedWriterNative(0));
   const currentContainer = (value: object, kind: number) => {
     if (Object.getOwnPropertyDescriptor(value, 'toJSON')) return false;
@@ -143,16 +156,12 @@ export function createCompareOwnerRootBytes() {
     if (kind === 2)
       return (
         Object.getPrototypeOf(value) === Map.prototype &&
-        ['entries', 'get', 'has', 'set'].every(
-          (name) => !Object.getOwnPropertyDescriptor(value, name),
-        )
+        withoutOwnMethods(value, ['entries', 'get', 'has', 'set'])
       );
     if (kind === 3)
       return (
         Object.getPrototypeOf(value) === Set.prototype &&
-        ['values', 'has', 'add'].every(
-          (name) => !Object.getOwnPropertyDescriptor(value, name),
-        )
+        withoutOwnMethods(value, ['values', 'has', 'add'])
       );
     if (kind === 5) {
       const prototype = Object.getPrototypeOf(value);
@@ -291,7 +300,11 @@ export function createCompareOwnerRootBytes() {
     afterACount = 0,
     currentBCount = 0;
   return Object.freeze({
-    /** Lexical private producer lifetime; no enrollment of existing containers. */
+    /**
+     * Synchronous private producer lifetime; no enrollment of existing containers.
+     * Use managed append/put/add before seal, then keep every alias read-only for
+     * the remainder of this scope. Native Map/Set freezing does not close entries.
+     */
     measurementScope<T>(
       operation: (writers: {
         array<V>(): {
