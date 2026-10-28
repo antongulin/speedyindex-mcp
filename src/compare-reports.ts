@@ -183,7 +183,11 @@ const refuse = (code: BlockerCode | ErrorCode): never => {
 type Checkpoint = () => void;
 const noCheckpoint: Checkpoint = () => {};
 
-/** Notifications only: callbacks observe/check, never supply data or authority. */
+/**
+ * Trusted notifications: callbacks observe/check, never supply data or authority.
+ * Observer exceptions propagate unchanged so the owning caller can classify its
+ * budget or cancellation failure; they are not fixed core-result failures.
+ */
 export type CompareWorkRootsObserver = (
   roots: readonly unknown[],
   completedOwned?: object,
@@ -382,7 +386,11 @@ function indexedTotalContradiction(
       indexedCount > report.size - unindexedOnly)
   );
 }
-/** Whitelist the existing normalized status. Missing optional facts stay null. */
+/**
+ * Whitelist the existing normalized status. Missing optional facts stay null.
+ * Throws CompareReportsFault for fixed refusals; compareReportsFailure maps those
+ * at a tool boundary. Trusted callback exceptions need the owner's classification.
+ */
 export function projectCompareStatus(
   value: unknown,
   construction: {
@@ -430,7 +438,11 @@ export function projectCompareStatus(
   return result;
 }
 
-/** Safe exact strings are retained; URL parser output is never returned. */
+/**
+ * Safe exact strings are retained; URL parser output is never returned.
+ * Throws CompareReportsFault for fixed refusals; compareReportsFailure maps those
+ * at a tool boundary. Trusted callback exceptions need the owner's classification.
+ */
 export function projectCompareLinksReport(
   value: unknown,
   checkpoint: Checkpoint = noCheckpoint,
@@ -526,7 +538,11 @@ export function projectCompareLinksReport(
   return result;
 }
 
-/** Dated cabinet grammar only; malformed link data never becomes an empty set. */
+/**
+ * Dated cabinet grammar only; malformed link data never becomes an empty set.
+ * Throws CompareReportsFault for fixed refusals; compareReportsFailure maps those
+ * at a tool boundary. Trusted callback exceptions need the owner's classification.
+ */
 export function projectCompareBacklinkPage(
   value: unknown,
   checkpoint: Checkpoint = noCheckpoint,
@@ -1648,7 +1664,10 @@ function compareBacklinks(
     scopeWork(outer, () => [rows, result]),
   );
 }
-/** Consume copied leaf evidence; callers still owe collection/coherence/owner gates. */
+/**
+ * Consume copied leaf evidence; callers still owe collection/coherence/owner gates.
+ * Trusted checkpoint and observer exceptions propagate to their owning caller.
+ */
 export function compareProjectedReports(
   input: unknown,
   before: CompareSideEvidence,
@@ -1786,7 +1805,10 @@ export function lowerCompareReportsResultByteLimit(lower?: number) {
     throw new RangeError('Invalid report-comparison result limit.');
   return limit;
 }
-/** Deep copy/validate/freeze and measure the full escaped, duplicated application envelope. */
+/**
+ * Deep copy/validate/freeze and measure the full escaped, duplicated application envelope.
+ * Trusted checkpoint and observer exceptions propagate to their owning caller.
+ */
 export function compareReportsToolResult(
   value: unknown,
   construction: {

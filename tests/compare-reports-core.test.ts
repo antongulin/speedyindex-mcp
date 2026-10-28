@@ -1836,3 +1836,269 @@ test('CR-R1-MEASUREMENTS-ONLY facade refusal and checkpoints remain active witho
   }
   expect(caught).toBe(interrupted);
 });
+
+test('CR-R2-OBSERVER-ABORT trusted observer and checkpoint failures retain owner identity', () => {
+  const scenarios = [
+    {
+      selected: input,
+      before: {
+        status: projectCompareStatus(status('before')),
+        reports: [projectCompareLinksReport(links('before'))],
+      },
+      after: {
+        status: projectCompareStatus(status('after')),
+        reports: [projectCompareLinksReport(links('after'))],
+      },
+    },
+    {
+      selected: { ...input, family: 'backlink/checker' },
+      before: {
+        status: projectCompareStatus(backlinkStatus('before')),
+        reports: [projectCompareBacklinkPage(page('before'))],
+      },
+      after: {
+        status: projectCompareStatus(backlinkStatus('after')),
+        reports: [projectCompareBacklinkPage(page('after'))],
+      },
+    },
+  ];
+  const caughtFrom = (action: () => unknown): unknown => {
+    try {
+      action();
+    } catch (error) {
+      return error;
+    }
+    throw new Error('Expected trusted callback abort.');
+  };
+  const interrupted = new Error('synthetic owner budget abort');
+  const abort = () => {
+    throw interrupted;
+  };
+  for (const { selected, before, after } of scenarios) {
+    const ordinary = compareProjectedReports(selected, before, after);
+    expect(ordinary.status).toBe('compared');
+    const compare = (checkpoint: () => void, observeWork: () => void) =>
+      compareProjectedReports(selected, before, after, checkpoint, observeWork);
+    const publish = (checkpoint: () => void, observeWork: () => void) =>
+      compareReportsToolResult(ordinary, { checkpoint, observeWork });
+    for (const action of [compare, publish]) {
+      expect(caughtFrom(() => action(() => {}, abort))).toBe(interrupted);
+      expect(caughtFrom(() => action(abort, () => {}))).toBe(interrupted);
+      let observed = false;
+      expect(
+        caughtFrom(() =>
+          action(
+            () => {
+              if (observed) abort();
+            },
+            () => {
+              observed = true;
+            },
+          ),
+        ),
+      ).toBe(interrupted);
+    }
+    expect(
+      compare(
+        () => {},
+        () => {},
+      ),
+    ).toEqual(ordinary);
+    expect(
+      publish(
+        () => {},
+        () => {},
+      ),
+    ).toEqual(independentEnvelope(ordinary));
+    expectCode(
+      compareProjectedReports({ ...selected, extra: true }, before, after),
+      'InvalidInput',
+    );
+  }
+});
+
+function capRefusal(action: () => unknown) {
+  try {
+    action();
+  } catch (error) {
+    return compareReportsFailure(error);
+  }
+  throw new Error('Expected resource or evidence refusal.');
+}
+
+test('CR-R2-LINKS-PARTITION-CAP counts both partitions inclusively', () => {
+  const urls = Array.from(
+    { length: 10_000 },
+    (_, i) => `https://example.test/cap/${i}`,
+  );
+  const report = links('before', urls.slice(0, 5_000), urls.slice(5_000), {
+    size: 10_000,
+    processedCount: 10_000,
+    indexedCount: 5_000,
+  });
+  const projected = projectCompareLinksReport(report);
+  expect(projected.indexedLinks.length).toBe(5_000);
+  expect(projected.unindexedLinks.length).toBe(5_000);
+  expectCode(
+    capRefusal(() =>
+      projectCompareLinksReport({
+        ...report,
+        unindexedLinks: [
+          ...report.unindexedLinks,
+          'https://example.test/extra',
+        ],
+      }),
+    ),
+    'ResourceLimitExceeded',
+  );
+});
+
+test('CR-R2-BACKLINK-PROJECTION-CAPS preserve inclusive page and donor bounds', () => {
+  const donors = Array.from({ length: 100 }, (_, i) =>
+    donor([], { donor_url: `https://donor.test/${i}` }),
+  );
+  const report = page('before', donors, { size: 101, processedCount: 101 });
+  expect(projectCompareBacklinkPage(report).donors.length).toBe(100);
+  expectCode(
+    capRefusal(() =>
+      projectCompareBacklinkPage({ ...report, donors: [...donors, donor()] }),
+    ),
+    'ConflictingEvidence',
+  );
+  expect(
+    projectCompareBacklinkPage(page('before', [], { lastPage: 14 })).lastPage,
+  ).toBe(14);
+  expectCode(
+    capRefusal(() =>
+      projectCompareBacklinkPage(page('before', [], { lastPage: 15 })),
+    ),
+    'ResourceLimitExceeded',
+  );
+  const tuple = { url: a, anchor: 'synthetic', nofollow: false };
+  const links = Array.from({ length: 1_000 }, () => ({ ...tuple }));
+  const projected = projectCompareBacklinkPage(page('before', [donor(links)]));
+  expect(projected.rawTargetLinkCount).toBe(1_000);
+  expect(projected.duplicateTargetLinkCount).toBe(999);
+  expectCode(
+    capRefusal(() =>
+      projectCompareBacklinkPage(page('before', [donor([...links, tuple])])),
+    ),
+    'ResourceLimitExceeded',
+  );
+});
+
+test('CR-R2-BACKLINK-PAGE-RAW-TARGET-CAP sums donors before accepting a page', () => {
+  const tuple = { url: a, anchor: 'synthetic', nofollow: false };
+  const donors = Array.from({ length: 10 }, (_, i) =>
+    donor(
+      Array.from({ length: 1_000 }, () => ({ ...tuple })),
+      {
+        donor_url: `https://donor.test/${i}`,
+      },
+    ),
+  );
+  const report = page('before', donors, { size: 11, processedCount: 11 });
+  expect(projectCompareBacklinkPage(report).rawTargetLinkCount).toBe(10_000);
+  expectCode(
+    capRefusal(() =>
+      projectCompareBacklinkPage({
+        ...report,
+        donors: [...donors, donor([tuple])],
+      }),
+    ),
+    'ResourceLimitExceeded',
+  );
+});
+
+test('CR-R2-BACKLINK-PAGE-COUNT-CAP accepts fifteen coherent pages', () => {
+  const reports = Array.from({ length: 15 }, (_, i) =>
+    projectCompareBacklinkPage(
+      page('before', [], { size: 0, processedCount: 0, page: i, lastPage: 14 }),
+    ),
+  );
+  const before = {
+    status: projectCompareStatus(
+      backlinkStatus('before', { size: 0, processedCount: 0 }),
+    ),
+    reports,
+  };
+  const after = {
+    status: projectCompareStatus(
+      backlinkStatus('after', { size: 0, processedCount: 0 }),
+    ),
+    reports: [
+      projectCompareBacklinkPage(
+        page('after', [], { size: 0, processedCount: 0 }),
+      ),
+    ],
+  };
+  const selected = { ...input, family: 'backlink/checker' };
+  const result = asBacklink(compareProjectedReports(selected, before, after));
+  expect(result.before.report.pagesVisited).toBe(15);
+  expect(result.before.report.lastPage).toBe(14);
+  expectCode(
+    compareProjectedReports(selected, { ...before, reports: [] }, after),
+    'ConflictingEvidence',
+  );
+  expectCode(
+    compareProjectedReports(
+      selected,
+      { ...before, reports: [...reports, reports[0]!] },
+      after,
+    ),
+    'ConflictingEvidence',
+  );
+});
+
+test('CR-R2-BACKLINK-COMPARE-RAW-TARGET-CAP sums individually valid pages', () => {
+  const tuple = { url: a, anchor: 'synthetic', nofollow: false };
+  const donors = Array.from({ length: 10 }, (_, i) =>
+    donor(
+      Array.from({ length: 1_000 }, () => ({ ...tuple })),
+      {
+        donor_url: `https://donor.test/${i}`,
+      },
+    ),
+  );
+  const makePage = (n: number, rows: unknown[]) =>
+    page('before', rows, {
+      size: 11,
+      processedCount: 11,
+      page: n,
+      lastPage: 1,
+    });
+  const before = {
+    status: projectCompareStatus(
+      backlinkStatus('before', { size: 11, processedCount: 11 }),
+    ),
+    reports: [
+      projectCompareBacklinkPage(makePage(0, donors.slice(0, 5))),
+      projectCompareBacklinkPage(makePage(1, donors.slice(5))),
+    ],
+  };
+  const after = {
+    status: projectCompareStatus(
+      backlinkStatus('after', { size: 0, processedCount: 0 }),
+    ),
+    reports: [
+      projectCompareBacklinkPage(
+        page('after', [], { size: 0, processedCount: 0 }),
+      ),
+    ],
+  };
+  const selected = { ...input, family: 'backlink/checker' };
+  const boundary = asBacklink(compareProjectedReports(selected, before, after));
+  expect(boundary.before.coverage.rawTargetLinkCount).toBe(10_000);
+  const overPage = projectCompareBacklinkPage(
+    makePage(1, [...donors.slice(5), donor([tuple])]),
+  );
+  expect(overPage.rawTargetLinkCount).toBe(5_001);
+  expectCode(
+    compareProjectedReports(
+      selected,
+      { ...before, reports: [before.reports[0]!, overPage] },
+      after,
+    ),
+    'ResourceLimitExceeded',
+  );
+});
