@@ -618,6 +618,7 @@ function advertised(tools: Awaited<ReturnType<Client['listTools']>>['tools']) {
       'create_backlink_check',
       'plan_retry',
       'get_retry_history',
+      'compare_reports',
     ],
   );
   const tool = tools.find((t) => t.name === 'get_retry_history');
