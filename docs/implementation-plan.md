@@ -51,6 +51,10 @@ The owner captures one original pre-SQL budget, native closure, actual I/O cance
 
 Pure/native cases cover projection identity, metadata gaps, complete-audit/filter boundaries, cursor/revision semantics, exact escaped-byte limits, real SQLite close and owner settlement. Two saved protocol/entry preparation cases precede new helper use. Thirteen source/built SDK cases cover the strict nine-tool inventory, genuine six-state history/SQL oracles, finite states and continuation, source-only lower-limit error surfacing and actual queued cancellation/recovery. Built CLI cases retain real framing/EOF/reap/SQL evidence without injected owner phases. These tests do not establish a release or provider activation. Mandatory full candidate checks, exact-head review, pinned-runtime CI and delivery remain separate gates. Public retry dispatch, deterministic one-shot execution and scheduling remain unimplemented.
 
+## Private compare core foundation
+
+`src/compare-reports.ts` implements the private pure normalized-evidence compare core: strict status, links and backlink projections, exact comparison, fixed refusals and the inclusive 2,097,152-byte application envelope. It performs no provider read, SQL, state or network work, imports no owner runtime and registers no public tool, so the server still exposes nine tools. `tests/compare-reports-core.test.ts` is its explicit source-suite entry with synthetic fixtures. The public `compare_reports` tool, owner/meter integration and the separate measurement cases remain later delivery gates; this foundation alone is not release or provider evidence.
+
 ## Review and delivery
 
 Robin review automation is installed on the default branch. Substantive changes require a real review of their exact head plus CI and delivery verification. The workflow excludes `synchronize`; later pushes need an authorized manual review within the task budget. Fork PR events lack repository secrets and need an authorized maintainer command through the default-branch workflow. Deployment, scheduling, and releases remain outside this foundation.
