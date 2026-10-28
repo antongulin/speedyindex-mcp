@@ -46,19 +46,11 @@ import { normalizeTaskStatusResult, type TaskFamily } from '../src/task-status';
 
 import { normalizeTaskReport } from '../src/task-report';
 
-const a = 'https://example.test/a';
-
-const b = 'https://example.test/b';
-
 const c = 'https://example.test/c';
-
-const d = 'https://example.test/d';
 
 const e = 'https://example.test/e';
 
 const f = 'https://example.test/f';
-
-const donorUrl = 'https://DONOR.test/Path?b=2&a=1#exact';
 
 const family: TaskFamily = 'google/indexer';
 
@@ -72,68 +64,6 @@ const expectedScope = {
   originalHistory: 'unknown',
   liveState: 'not_observed',
 } as const;
-
-function status(id: string, extra: Record<string, unknown> = {}) {
-  return {
-    id,
-    type: family,
-    size: 4,
-    processedCount: 4,
-    indexedCount: 2,
-    isCompleted: true,
-    ...extra,
-  };
-}
-
-function links(
-  id: string,
-  indexedLinks = [a, c],
-  unindexedLinks = [b, d],
-  extra: Record<string, unknown> = {},
-) {
-  return {
-    family,
-    reportKind: 'links',
-    taskId: id,
-    type: family,
-    size: 4,
-    processedCount: 4,
-    indexedCount: 2,
-    indexedLinks,
-    unindexedLinks,
-    title: 'ignored',
-    createdAt: 'ignored chronology',
-    ...extra,
-  };
-}
-
-function donor(targetLinks: unknown = [], extra: Record<string, unknown> = {}) {
-  return {
-    donor_url: donorUrl,
-    processed: true,
-    target_links: targetLinks,
-    ...extra,
-  };
-}
-
-function page(
-  id: string,
-  donors: unknown[] = [donor()],
-  extra: Record<string, unknown> = {},
-) {
-  return {
-    family: 'backlink/checker',
-    reportKind: 'backlink',
-    taskId: id,
-    size: 1,
-    processedCount: 1,
-    page: 0,
-    lastPage: 0,
-    donors,
-    isCompleted: true,
-    ...extra,
-  };
-}
 
 function asLinks(value: CompareReportsResult) {
   if (value.status !== 'compared' || value.reportKind !== 'links')
