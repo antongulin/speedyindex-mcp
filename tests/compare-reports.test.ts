@@ -6061,7 +6061,13 @@ test('CR-ND-PREP saved-observation-schema-and-full-script', async () => {
       new URL('./fixtures/compare-reports-native.ts', import.meta.url),
     );
     expect(createHash('sha256').update(helper).digest('hex')).toBe(
-      '7985cc007f20d7a3b1274fa9590043295d830028df65ff71320c04dfb5862acc',
+      '4f1485c0e7686d1380ca5863b1056a3beb39d986d3b2bdd232a66766df2a1f93',
+    );
+    const sharedHelper = await readFile(
+      new URL('./fixtures/compare-reports-measurements.ts', import.meta.url),
+    );
+    expect(createHash('sha256').update(sharedHelper).digest('hex')).toBe(
+      '5f10d141c7ba9f05fb9ef9dfc2fe57bc18d30a164c7af212cb03c5068216723c',
     );
     expect(helper.toString('utf8')).toContain(
       'return nativeFetch(new URL(path, loopback), init);',
