@@ -226,11 +226,11 @@ function observingWork(
   failed?: () => void,
   measurements?: ComparePrivateMeasurements,
 ): Work | undefined {
-  if (!observer) return undefined;
+  if (!observer && !measurements) return undefined;
   const notify = (roots: readonly unknown[], completedOwned?: object) => {
     try {
       check();
-      observer(roots, completedOwned);
+      observer?.(roots, completedOwned);
       check();
     } catch (error) {
       failed?.();
@@ -1238,11 +1238,16 @@ export function compareReportsError(
   code: ErrorCode,
   details: FailureDetails = {},
 ): CompareReportsResult {
-  const { cleanup, ...errorDetails } = details;
+  const { cleanup, phase, cause } = details;
   return freeze(
     compareReportsResultSchema.parse({
       status: 'error',
-      error: { code, message: errorMessages[code], ...errorDetails },
+      error: {
+        code,
+        message: errorMessages[code],
+        ...(code === 'ReadFailed' && phase !== undefined ? { phase } : {}),
+        ...(code === 'ReadFailed' && cause !== undefined ? { cause } : {}),
+      },
       ...(cleanup === undefined ? {} : { cleanup }),
     }),
   );

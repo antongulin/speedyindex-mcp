@@ -14,6 +14,7 @@ import {
   projectCompareBacklinkPage,
   projectCompareLinksReport,
   projectCompareStatus,
+  type ComparePrivateMeasurements,
   type CompareReportsResult,
 } from '../src/compare-reports';
 import type { TaskFamily } from '../src/task-status';
@@ -1689,4 +1690,149 @@ test('CR-U12 complete literal result keeps source dates separate and caller dire
   ]);
   expect(opposite.scope).toEqual(expectedScope);
   expect(Object.hasOwn(opposite, 'observedAt')).toBe(false);
+});
+
+test('CR-R1-ERROR-DETAILS fixed errors retain only applicable defined metadata', () => {
+  const typed = compareReportsError('DeadlineExceeded', {
+    phase: 'status',
+    cause: 'http',
+    cleanup: 'failed',
+  });
+  expectCode(typed, 'DeadlineExceeded');
+  if (typed.status !== 'error') throw new Error('Expected fixed error.');
+  expect(Object.keys(typed.error).sort()).toEqual(['code', 'message']);
+  expect(typed.cleanup).toBe('failed');
+
+  const variants: {
+    phase?: 'status' | undefined;
+    cause?: 'http' | undefined;
+    cleanup?: 'failed' | undefined;
+    extra?: string;
+  }[] = [
+    {},
+    { phase: undefined },
+    { cause: undefined },
+    { phase: 'status' },
+    { cause: 'http' },
+    { phase: 'status', cause: 'http' },
+    { cleanup: undefined },
+    { cleanup: 'failed' },
+    { phase: 'status', cause: 'http', cleanup: 'failed' },
+    { phase: 'status', extra: 'synthetic-private-metadata' },
+  ];
+  for (const code of compareReportsErrorCodeSchema.options) {
+    for (const details of variants) {
+      // Exercise JavaScript's explicit-undefined shapes without widening the API.
+      const actual: unknown = Reflect.apply(compareReportsError, undefined, [
+        code,
+        details,
+      ]);
+      const result = compareReportsResultSchema.parse(actual);
+      if (result.status !== 'error') throw new Error('Expected fixed error.');
+      expect(result.error.code).toBe(code);
+      const phase = code === 'ReadFailed' ? details.phase : undefined;
+      const cause = code === 'ReadFailed' ? details.cause : undefined;
+      expect(result.error.phase).toBe(phase);
+      expect(result.error.cause).toBe(cause);
+      expect(Object.hasOwn(result.error, 'phase')).toBe(phase !== undefined);
+      expect(Object.hasOwn(result.error, 'cause')).toBe(cause !== undefined);
+      expect(result.cleanup).toBe(details.cleanup);
+      expect(Object.hasOwn(result, 'cleanup')).toBe(
+        details.cleanup !== undefined,
+      );
+      expect(Object.isFrozen(actual)).toBe(true);
+      expect(JSON.stringify(actual)).not.toContain(
+        'synthetic-private-metadata',
+      );
+      expect(
+        compareReportsEnvelopeSchema.safeParse(independentEnvelope(result))
+          .success,
+      ).toBe(true);
+    }
+  }
+});
+
+test('CR-R1-MEASUREMENTS-ONLY facade refusal and checkpoints remain active without an observer', () => {
+  const refuseMeasurement = (): never => {
+    throw new Error('synthetic-private-measurement-refusal');
+  };
+  const measurements: ComparePrivateMeasurements = {
+    array: refuseMeasurement,
+    set: refuseMeasurement,
+    map: refuseMeasurement,
+    privateRead: refuseMeasurement,
+    privateKeys: refuseMeasurement,
+    privateValues: refuseMeasurement,
+    privateFilter: refuseMeasurement,
+  };
+  const scenarios = [
+    {
+      selected: input,
+      before: {
+        status: projectCompareStatus(status('before')),
+        reports: [projectCompareLinksReport(links('before'))],
+      },
+      after: {
+        status: projectCompareStatus(status('after')),
+        reports: [projectCompareLinksReport(links('after', [b, c], [a, d]))],
+      },
+    },
+    {
+      selected: { ...input, family: 'backlink/checker' },
+      before: {
+        status: projectCompareStatus(backlinkStatus('before')),
+        reports: [projectCompareBacklinkPage(page('before'))],
+      },
+      after: {
+        status: projectCompareStatus(backlinkStatus('after')),
+        reports: [projectCompareBacklinkPage(page('after'))],
+      },
+    },
+  ];
+  const expected = {
+    status: 'error',
+    error: {
+      code: 'InternalError',
+      message: 'Report comparison failed internally.',
+    },
+  } as const;
+  for (const { selected, before, after } of scenarios) {
+    const ordinary = compareProjectedReports(selected, before, after);
+    expect(ordinary.status).toBe('compared');
+    expect(
+      compareProjectedReports(
+        selected,
+        before,
+        after,
+        undefined,
+        undefined,
+        measurements,
+      ),
+    ).toEqual(expected);
+    expect(compareReportsToolResult(ordinary, { measurements })).toEqual(
+      independentEnvelope(expected),
+    );
+  }
+
+  const interrupted = new Error('synthetic checkpoint interruption');
+  let measured = false;
+  const checkpointMeasurements: ComparePrivateMeasurements = {
+    ...measurements,
+    privateRead: () => {
+      measured = true;
+      return false;
+    },
+  };
+  let caught: unknown;
+  try {
+    compareReportsToolResult(genericPair(), {
+      measurements: checkpointMeasurements,
+      checkpoint: () => {
+        if (measured) throw interrupted;
+      },
+    });
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBe(interrupted);
 });
