@@ -558,6 +558,7 @@ interface N1Expected {
   retainedBytes?: number;
   releaseFailure?: boolean;
   throwOnClose?: readonly ('before_close' | 'after_close')[];
+  fenceWork?: { maxCalls: number; abortAt?: number; windows: number };
 }
 
 const n1Selected: CompareReportsInput = { ...input };
@@ -794,6 +795,15 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
   const receiverErrors: unknown[] = [];
   const phases: CompareOwnerPhase[] = [];
   const observerThrows: CompareOwnerPhase[] = [];
+  const fenceWindows: { calls: number; endedBy: 'client' | 'close' }[] = [];
+  let fenceActive = false,
+    fenceCalls = 0,
+    windowCalls = 0;
+  let actualStatus: string | undefined;
+  const finishFence = (endedBy: 'client' | 'close') => {
+    if (fenceActive) fenceWindows.push({ calls: windowCalls, endedBy });
+    fenceActive = false;
+  };
   const closeObservations: {
     phase: CompareOwnerPhase;
     readerClosed: number;
@@ -1021,6 +1031,7 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
         this: SpeedyIndexClient,
         ...args: Parameters<SpeedyIndexClient['getTaskStatus']>
       ) {
+        finishFence('client');
         const promise = originalStatus.apply(this, args);
         calls.push({
           receiver: this === client,
@@ -1033,6 +1044,7 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
         this: SpeedyIndexClient,
         ...args: Parameters<SpeedyIndexClient['getTaskReport']>
       ) {
+        finishFence('client');
         const promise = originalReport.apply(this, args);
         calls.push({
           receiver: this === client,
@@ -1041,14 +1053,47 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
         });
         return promise;
       };
+      const controller = new AbortController();
+      const nativeNow = performance.now.bind(performance);
       const owner = createCompareReportsOwner(client, {
         ...(expected.retainedBytes === undefined
           ? {}
           : { limits: { retainedBytes: expected.retainedBytes } }),
+        ...(expected.fenceWork
+          ? {
+              runtime: {
+                now() {
+                  if (fenceActive) {
+                    windowCalls++;
+                    fenceCalls++;
+                    if (fenceCalls === expected.fenceWork?.abortAt)
+                      controller.abort();
+                    // Test-only work cutoff; never a measured horizon breach.
+                    if (fenceCalls > 2_000_000)
+                      throw new Error('Synthetic fence work cutoff.');
+                  }
+                  return nativeNow();
+                },
+                setTimeout(callback: () => void, delay: number) {
+                  return setTimeout(callback, delay);
+                },
+                clearTimeout(handle: unknown) {
+                  clearTimeout(handle as ReturnType<typeof setTimeout>);
+                },
+              },
+            }
+          : {}),
         onPhase(phase) {
           phases.push(phase);
+          if (expected.fenceWork && phase === 'after_report_b') {
+            fenceActive = true;
+            windowCalls = 0;
+          }
+          if (phase === 'before_close') finishFence('close');
           if (
-            (expected.releaseFailure || expected.throwOnClose) &&
+            (expected.releaseFailure ||
+              expected.throwOnClose ||
+              expected.fenceWork) &&
             (phase === 'before_close' || phase === 'after_close')
           ) {
             let budgetCode: unknown;
@@ -1077,8 +1122,15 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
       client.getTaskReport = () => {
         throw new Error('Uncaptured N1 report.');
       };
-      const controller = new AbortController();
       const actual = await owner.compare(script.input, controller.signal);
+      actualStatus = actual.structuredContent.status;
+      if (expected.fenceWork) {
+        expect(fenceCalls).toBeLessThanOrEqual(expected.fenceWork.maxCalls);
+        expect(fenceWindows).toHaveLength(expected.fenceWork.windows);
+        expect(fenceWindows.every((window) => window.calls > 0)).toBe(true);
+        if (expected.fenceWork.abortAt)
+          expect(fenceCalls).toBe(expected.fenceWork.abortAt);
+      }
       expect(actual).toEqual(independentEnvelope(expected.result));
       expect(phases).toEqual([
         ...expected.progress,
@@ -1105,14 +1157,22 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
       expect(readerClosed).toBe(expected.reads);
       expect(doneReceipts).toBe(expected.reads);
       expect(releaseReceipts).toBe(expected.reads);
-      if (expected.releaseFailure || expected.throwOnClose) {
+      if (
+        expected.releaseFailure ||
+        expected.throwOnClose ||
+        expected.fenceWork
+      ) {
         expect(observerThrows).toEqual([...(expected.throwOnClose ?? [])]);
         expect(closeObservations).toEqual([
           {
             phase: 'before_close',
             readerClosed: expected.reads,
             releases: expected.reads,
-            budgetCode: expected.releaseFailure ? 'CleanupFailed' : undefined,
+            budgetCode: expected.releaseFailure
+              ? 'CleanupFailed'
+              : expected.fenceWork?.abortAt
+                ? 'Cancelled'
+                : undefined,
           },
           {
             phase: 'after_close',
@@ -1158,6 +1218,7 @@ async function n1Run(script: N1Script, expected: N1Expected): Promise<void> {
       releaseReceipts,
       observerThrows,
       closeObservations,
+      ...(expected.fenceWork ? { fenceCalls, fenceWindows, actualStatus } : {}),
       readerInstrumentation: expected.child
         ? 'Unchanged child fixture has no separate reader decorator; actual owner after_close plus child native EOF/reap recorded.'
         : 'Original native delegated receipts only.',
@@ -6257,3 +6318,419 @@ test('CR-R1-OBS-02 both throwing close observers preserve the original read fail
     },
   );
 });
+
+function eqtStatusRecord(
+  id: 'before' | 'after',
+  size: number,
+  processed: number,
+): N1BacklinkResult['before']['status'] {
+  return {
+    id,
+    type: 'backlink/checker',
+    size,
+    processedCount: processed,
+    indexedCount: null,
+    isCompleted: false,
+    status: null,
+    checkAfter: null,
+    awaitingResult: null,
+    dripFeed: null,
+    days: null,
+    daysPassed: null,
+    isStopped: null,
+    targetDomains: [' Example.test '],
+    providerCreatedAt:
+      id === 'before' ? ' status-before Ω ' : ' status-after Ω ',
+  };
+}
+
+function eqtStatusWire(size: number, processed: number): [N1Record, N1Record] {
+  return ['before', 'after'].map((id): N1Record => ({
+    id,
+    type: 'backlink/checker',
+    size,
+    processed_count: processed,
+    is_completed: false,
+    created_at: id === 'before' ? ' status-before Ω ' : ' status-after Ω ',
+    target_domains: [' Example.test '],
+  })) as [N1Record, N1Record];
+}
+
+function eqtReportWire(
+  side: 'before' | 'after',
+  size: number,
+  processed: number,
+  donors: readonly N1Record[],
+): N1Record {
+  return {
+    id: side,
+    size,
+    processed_count: processed,
+    is_completed: false,
+    page: 0,
+    last_page: 0,
+    donors,
+  };
+}
+
+function eqtSteps(): readonly CompareWireStep[] {
+  return [
+    { kind: 'status' },
+    { kind: 'report', side: 'before', page: 0 },
+    { kind: 'report', side: 'after', page: 0 },
+    { kind: 'status' },
+    { kind: 'report', side: 'before', page: 0 },
+    { kind: 'report', side: 'after', page: 0 },
+    { kind: 'status' },
+  ];
+}
+
+const eqtDenseDonors = 7,
+  eqtDenseLinks = 120;
+
+function eqtDenseTuple(donor: number, index: number): N1Target {
+  return {
+    url: 'https://e.test/',
+    anchor: `a${donor * eqtDenseLinks + index}`,
+    nofollow: index % 2 === 1,
+  };
+}
+
+function eqtDenseLinksFor(donor: number, reversed = false): N1Target[] {
+  return Array.from({ length: eqtDenseLinks }, (_, index) =>
+    eqtDenseTuple(donor, reversed ? eqtDenseLinks - 1 - index : index),
+  );
+}
+
+function eqtDenseDonorRows(reversed: boolean): N1Record[] {
+  return Array.from({ length: eqtDenseDonors }, (_, donor) => ({
+    donor_url: `https://e.test/d${donor}`,
+    processed: true,
+    target_links: eqtDenseLinksFor(donor, reversed),
+  }));
+}
+
+function eqtDenseResult(): N1BacklinkResult {
+  const rows: N1BacklinkResult['rows'] = Array.from(
+    { length: eqtDenseDonors },
+    (_, donor) => ({
+      donorUrl: `https://e.test/d${donor}`,
+      before: { state: 'reported', targetLinks: eqtDenseLinksFor(donor) },
+      after: { state: 'reported', targetLinks: eqtDenseLinksFor(donor) },
+      comparison: {
+        state: 'compared',
+        newlyReportedTargetUrls: [],
+        noLongerReportedTargetUrls: [],
+        attributeChangedTargetUrls: [],
+        unchangedTargetUrls: ['https://e.test/'],
+      },
+    }),
+  );
+  const coverage = {
+    rawDonorCount: eqtDenseDonors,
+    observedUniqueDonorCount: eqtDenseDonors,
+    duplicateDonorCount: 0,
+    conflictingDonorCount: 0,
+    rawTargetLinkCount: eqtDenseDonors * eqtDenseLinks,
+    duplicateTargetLinkCount: 0,
+    reportedSlotGap: 0,
+  };
+  const summary = (id: 'before' | 'after'): N1BacklinkResult['before'] => ({
+    status: eqtStatusRecord(id, eqtDenseDonors, eqtDenseDonors),
+    report: {
+      size: eqtDenseDonors,
+      processedCount: eqtDenseDonors,
+      isCompleted: false,
+      lastPage: 0,
+      pagesVisited: 1,
+    },
+    coverage: { ...coverage },
+  });
+  return {
+    status: 'compared',
+    reportKind: 'backlink',
+    family: 'backlink/checker',
+    beforeTaskId: 'before',
+    afterTaskId: 'after',
+    scope: { ...expectedScope },
+    targetScope: {
+      provenance: 'matching_current_provider_status',
+      targetDomains: [' Example.test '],
+      originalTargets: 'unknown',
+    },
+    before: summary('before'),
+    after: summary('after'),
+    rows,
+    counts: {
+      comparedDonors: eqtDenseDonors,
+      unknownDonors: 0,
+      totalDonors: eqtDenseDonors,
+      newlyReportedTargetUrls: 0,
+      noLongerReportedTargetUrls: 0,
+      attributeChangedTargetUrls: 0,
+      unchangedTargetUrls: eqtDenseDonors,
+    },
+  };
+}
+
+function eqtTarget(url: string, anchor: string, nofollow = false): N1Target {
+  return { url, anchor, nofollow };
+}
+
+const eqtDuplicateA: readonly N1Target[] = [
+    eqtTarget('https://example.test/du1', 'one'),
+    eqtTarget('https://example.test/du2', 'two', true),
+    eqtTarget('https://example.test/du3', 'three'),
+  ],
+  eqtDuplicateB: readonly N1Target[] = [
+    eqtTarget('https://example.test/du1', 'one'),
+    eqtTarget('https://example.test/du2', 'two', true),
+    eqtTarget('https://example.test/du4', 'four'),
+  ],
+  eqtEscBefore: readonly N1Target[] = [
+    eqtTarget('https://example.test/t1', 'old "q" \\,|'),
+    eqtTarget('https://example.test/t2', 'Ω \u2028 🙂', true),
+    eqtTarget('https://example.test/t3', 'before-only'),
+  ],
+  eqtEscAfter: readonly N1Target[] = [
+    eqtTarget('https://example.test/t1', 'new "q" \\,|', true),
+    eqtTarget('https://example.test/t2', 'Ω \u2028 🙂', true),
+    eqtTarget('https://example.test/t4', 'after-only'),
+  ],
+  eqtSepBefore: readonly N1Target[] = [
+    eqtTarget('https://example.test/p|q', 'r'),
+    eqtTarget('https://example.test/s', 't'),
+  ],
+  eqtSepAfter: readonly N1Target[] = [
+    eqtTarget('https://example.test/p', 'q|r'),
+    eqtTarget('https://example.test/s', 't'),
+  ];
+
+function eqt03Donors(side: 'before' | 'after'): N1Record[] {
+  const duplicate = [...eqtDuplicateA];
+  const esc = side === 'before' ? [...eqtEscBefore] : [...eqtEscAfter];
+  const sep = side === 'before' ? [...eqtSepBefore] : [...eqtSepAfter];
+  // Exact duplicate donor identities, one distinct same-URL row, one reported
+  // escaped row, one delimiter-sensitive row, a raw null count and an invalid
+  // link row keep unknown/reported multiplicity together.
+  return [
+    {
+      donor_url: 'https://example.test/dup',
+      processed: true,
+      target_links: duplicate,
+    },
+    {
+      donor_url: 'https://example.test/dup',
+      processed: true,
+      target_links: [...duplicate].reverse(),
+    },
+    {
+      donor_url: 'https://example.test/dup',
+      processed: true,
+      target_links: [...eqtDuplicateB],
+    },
+    {
+      donor_url: 'https://example.test/esc',
+      processed: true,
+      target_links: esc,
+    },
+    {
+      donor_url: 'https://example.test/sep',
+      processed: true,
+      target_links: sep,
+    },
+    { donor_url: 'https://example.test/null', processed: false },
+    {
+      donor_url: 'https://example.test/invalid',
+      processed: true,
+      target_links: [{ url: 'notaurl', anchor: 'x', nofollow: false }],
+    },
+  ];
+}
+
+function eqt03BPass(
+  side: 'before' | 'after',
+  variant: 'equal' | 'multiplicity' | 'attribute',
+): N1Record[] {
+  const rows = eqt03Donors(side)
+    .reverse()
+    .map((row) =>
+      Array.isArray(row.target_links)
+        ? { ...row, target_links: [...row.target_links].reverse() }
+        : row,
+    );
+  if (side !== 'after' || variant === 'equal') return rows;
+  if (variant === 'attribute')
+    return rows.map((row) =>
+      row.donor_url === 'https://example.test/sep' && row.processed === true
+        ? { ...row, target_links: [...eqtSepBefore] }
+        : row,
+    );
+  // One extra exact donor row changes only the row multiset; report and status
+  // counters stay coherent with the accepted header equality.
+  return [
+    ...rows,
+    {
+      donor_url: 'https://example.test/esc',
+      processed: true,
+      target_links: [...eqtEscAfter],
+    },
+  ];
+}
+
+function eqt03Result(): N1BacklinkResult {
+  const coverage = {
+    rawDonorCount: 7,
+    observedUniqueDonorCount: 5,
+    duplicateDonorCount: 2,
+    conflictingDonorCount: 1,
+    rawTargetLinkCount: 15,
+    duplicateTargetLinkCount: 0,
+    reportedSlotGap: 1,
+  };
+  const summary = (id: 'before' | 'after'): N1BacklinkResult['before'] => ({
+    status: eqtStatusRecord(id, 6, 4),
+    report: {
+      size: 6,
+      processedCount: 4,
+      isCompleted: false,
+      lastPage: 0,
+      pagesVisited: 1,
+    },
+    coverage: { ...coverage },
+  });
+  return {
+    status: 'compared',
+    reportKind: 'backlink',
+    family: 'backlink/checker',
+    beforeTaskId: 'before',
+    afterTaskId: 'after',
+    scope: { ...expectedScope },
+    targetScope: {
+      provenance: 'matching_current_provider_status',
+      targetDomains: [' Example.test '],
+      originalTargets: 'unknown',
+    },
+    before: summary('before'),
+    after: summary('after'),
+    rows: [
+      {
+        donorUrl: 'https://example.test/dup',
+        before: { state: 'unknown', reason: 'conflicting_donor_rows' },
+        after: { state: 'unknown', reason: 'conflicting_donor_rows' },
+        comparison: { state: 'unknown' },
+      },
+      {
+        donorUrl: 'https://example.test/esc',
+        before: { state: 'reported', targetLinks: [...eqtEscBefore] },
+        after: { state: 'reported', targetLinks: [...eqtEscAfter] },
+        comparison: {
+          state: 'compared',
+          newlyReportedTargetUrls: ['https://example.test/t4'],
+          noLongerReportedTargetUrls: ['https://example.test/t3'],
+          attributeChangedTargetUrls: ['https://example.test/t1'],
+          unchangedTargetUrls: ['https://example.test/t2'],
+        },
+      },
+      {
+        donorUrl: 'https://example.test/sep',
+        before: { state: 'reported', targetLinks: [...eqtSepBefore] },
+        after: { state: 'reported', targetLinks: [...eqtSepAfter] },
+        comparison: {
+          state: 'compared',
+          newlyReportedTargetUrls: ['https://example.test/p'],
+          noLongerReportedTargetUrls: ['https://example.test/p|q'],
+          attributeChangedTargetUrls: [],
+          unchangedTargetUrls: ['https://example.test/s'],
+        },
+      },
+      {
+        donorUrl: 'https://example.test/null',
+        before: { state: 'unknown', reason: 'not_processed' },
+        after: { state: 'unknown', reason: 'not_processed' },
+        comparison: { state: 'unknown' },
+      },
+      {
+        donorUrl: 'https://example.test/invalid',
+        before: { state: 'unknown', reason: 'invalid_target_link' },
+        after: { state: 'unknown', reason: 'invalid_target_link' },
+        comparison: { state: 'unknown' },
+      },
+    ],
+    counts: {
+      comparedDonors: 2,
+      unknownDonors: 3,
+      totalDonors: 5,
+      newlyReportedTargetUrls: 2,
+      noLongerReportedTargetUrls: 2,
+      attributeChangedTargetUrls: 1,
+      unchangedTargetUrls: 2,
+    },
+  };
+}
+
+function eqtScript(
+  id: string,
+  variant?: 'equal' | 'multiplicity' | 'attribute',
+): N1Script {
+  return {
+    id,
+    input: n1BacklinkSelected,
+    steps: eqtSteps(),
+    reply(step, index) {
+      const size = variant ? 6 : eqtDenseDonors;
+      const processed = variant ? 4 : eqtDenseDonors;
+      if (step.kind === 'status')
+        return { code: 0, result: eqtStatusWire(size, processed) };
+      const donors = variant
+        ? index < 4
+          ? eqt03Donors(step.side)
+          : eqt03BPass(step.side, variant)
+        : eqtDenseDonorRows(index >= 4);
+      return {
+        code: 0,
+        result: eqtReportWire(step.side, size, processed, donors),
+      };
+    },
+  };
+}
+
+test('CR-R2-EQT-01 bounded density isolates synchronous fence work from projection accounting', async () => {
+  expect(bytes(independentEnvelope(eqtDenseResult()))).toBeLessThanOrEqual(
+    2_097_152,
+  );
+  await n1Run(eqtScript('CR-R2-EQT-01'), {
+    result: eqtDenseResult(),
+    reads: 7,
+    progress: n1Complete,
+    fenceWork: { maxCalls: 20_000, windows: 2 },
+  });
+}, 90_000);
+
+test('CR-R2-EQT-02 synchronous caller abort inside fence work settles before another read', async () => {
+  await n1Run(eqtScript('CR-R2-EQT-02'), {
+    result: {
+      status: 'error',
+      error: { code: 'Cancelled', message: 'Report comparison was cancelled.' },
+    },
+    reads: 5,
+    progress: n1BeforeFence,
+    fenceWork: { maxCalls: 20_000, abortAt: 200, windows: 1 },
+  });
+}, 90_000);
+
+test('CR-R2-EQT-03 reordered multiset, raw multiplicity, unknown reasons and delimiter tuples stay exact', async () => {
+  await n1Run(eqtScript('CR-R2-EQT-03-equal', 'equal'), {
+    result: eqt03Result(),
+    reads: 7,
+    progress: n1Complete,
+    fenceWork: { maxCalls: 20_000, windows: 2 },
+  });
+  for (const variant of ['multiplicity', 'attribute'] as const)
+    await n1Run(eqtScript('CR-R2-EQT-03-' + variant, variant), {
+      result: n1Blocked('EvidenceChanged'),
+      reads: 6,
+      progress: n1AfterFence,
+      fenceWork: { maxCalls: 20_000, windows: 2 },
+    });
+}, 30_000);

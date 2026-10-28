@@ -615,50 +615,54 @@ export function createCompareReportsOwner(
             after = flatten(b, before);
           if (before.length !== after.length) return false;
           const matched = after.map(() => false);
-          const work = () => observeWork([before, after, matched]);
-          const equalDonor = (a: IndexedDonor, b: IndexedDonor) => {
-            if (
-              a.rawTargetCount !== b.rawTargetCount ||
-              a.donor.donorUrl !== b.donor.donorUrl ||
-              a.donor.processedWitness !== b.donor.processedWitness
-            )
-              return false;
-            const x = a.donor.evidence,
-              y = b.donor.evidence;
-            if (x.state === 'unknown' || y.state === 'unknown')
-              return (
-                x.state === 'unknown' &&
-                y.state === 'unknown' &&
-                x.reason === y.reason
-              );
-            return (
-              x.targetLinks.length === y.targetLinks.length &&
-              x.targetLinks.every((link) =>
-                y.targetLinks.some((other) => {
-                  checkpoint();
-                  return (
-                    link.url === other.url &&
-                    link.anchor === other.anchor &&
-                    link.nofollow === other.nofollow
-                  );
-                }),
-              )
-            );
-          };
-          // Paired rows and owner roots stay fixed during these searches.
-          // Each false (5 JSON bytes) becomes true (4), so this frame dominates.
-          work();
-          for (const donor of before) {
-            let found = false;
-            for (let i = 0; i < after.length; i++) {
-              checkpoint();
-              if (!matched[i] && equalDonor(donor, after[i]!)) {
-                matched[i] = true;
-                found = true;
-                break;
+          const buckets = new Map<string, number[]>();
+          const work = (...scratch: unknown[]) =>
+            observeWork([before, after, matched, buckets, ...scratch]);
+          const signature = (row: IndexedDonor) => {
+            checkpoint();
+            const evidence = row.donor.evidence;
+            const keys: string[] = [];
+            if (evidence.state === 'reported')
+              for (const link of evidence.targetLinks) {
+                checkpoint();
+                keys.push(
+                  JSON.stringify([link.url, link.anchor, link.nofollow]),
+                );
               }
-            }
-            if (!found) return false;
+            checkpoint();
+            keys.sort();
+            checkpoint();
+            // Projections already deduplicate tuples. Sorting fresh JSON keys
+            // preserves set equality without delimiter collisions or row mutation.
+            const value = JSON.stringify([
+              row.rawTargetCount,
+              row.donor.donorUrl,
+              row.donor.processedWitness,
+              evidence.state === 'unknown'
+                ? ['unknown', evidence.reason]
+                : ['reported', keys],
+            ]);
+            checkpoint();
+            work(keys, value);
+            return value;
+          };
+          work();
+          for (const [index, row] of after.entries()) {
+            const value = signature(row);
+            const bucket = buckets.get(value);
+            if (bucket) bucket.push(index);
+            else buckets.set(value, [index]);
+            checkpoint();
+            work(value);
+          }
+          for (const row of before) {
+            const bucket = buckets.get(signature(row));
+            const index = bucket?.pop();
+            checkpoint();
+            if (index === undefined || matched[index]) return false;
+            matched[index] = true;
+            // Buckets only shrink and false (5 bytes) becomes true (4).
+            // Each signature call charges its live scratch against that index.
           }
           return true;
         };
