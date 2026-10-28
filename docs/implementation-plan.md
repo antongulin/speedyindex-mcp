@@ -53,7 +53,7 @@ Pure/native cases cover projection identity, metadata gaps, complete-audit/filte
 
 ## Private compare core foundation
 
-`src/compare-reports.ts` implements the private pure normalized-evidence compare core: strict status, links and backlink projections, exact comparison, fixed refusals and the inclusive 2,097,152-byte application envelope. It performs no provider read, SQL, state or network work, imports no owner runtime and registers no public tool, so the server still exposes nine tools. `tests/compare-reports-core.test.ts` is its explicit source-suite entry with synthetic fixtures. The public `compare_reports` tool, owner/meter integration and the separate measurement cases remain later delivery gates; this foundation alone is not release or provider evidence.
+`src/compare-reports.ts` implements the private pure normalized-evidence compare core: strict status, links and backlink projections, exact comparison, fixed refusals and the inclusive 2,097,152-byte application envelope. It performs no provider read, SQL, state or network work, imports no owner runtime and registers no public tool, so the server still exposes nine tools. `tests/compare-reports-core.test.ts` is its explicit source-suite entry with synthetic fixtures. The private scalar measurement kernel now lives in `src/compare-reports-measurements.ts` with its retained component suite in `tests/compare-reports-measurements.test.ts`. The public `compare_reports` tool and owner integration remain later delivery gates; this source foundation alone is not release or provider evidence.
 
 ## Review and delivery
 
