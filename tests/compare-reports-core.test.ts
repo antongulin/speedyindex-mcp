@@ -2102,3 +2102,76 @@ test('CR-R2-BACKLINK-COMPARE-RAW-TARGET-CAP sums individually valid pages', () =
     'ResourceLimitExceeded',
   );
 });
+
+test('CR-R3-PROJECTION-ABORT helpers preserve trusted aborts and completed ownership', () => {
+  type Observer = (roots: readonly unknown[], completedOwned?: object) => void;
+  const cases: {
+    ordinary: object;
+    project: (checkpoint: () => void, observer: Observer) => object;
+  }[] = [
+    {
+      ordinary: projectCompareStatus(status('before')),
+      project: (checkpoint, observeWork) =>
+        projectCompareStatus(status('before'), { checkpoint, observeWork }),
+    },
+    {
+      ordinary: projectCompareLinksReport(links('before')),
+      project: (checkpoint, observeWork) =>
+        projectCompareLinksReport(links('before'), checkpoint, observeWork),
+    },
+    {
+      ordinary: projectCompareBacklinkPage(page('before')),
+      project: (checkpoint, observeWork) =>
+        projectCompareBacklinkPage(page('before'), checkpoint, observeWork),
+    },
+  ];
+  const interrupted = new Error('synthetic projection owner abort');
+  const abort = () => {
+    throw interrupted;
+  };
+  const caughtFrom = (action: () => unknown): unknown => {
+    try {
+      action();
+    } catch (error) {
+      return error;
+    }
+    throw new Error('Expected trusted projection abort.');
+  };
+  for (const { ordinary, project } of cases) {
+    expect(caughtFrom(() => project(abort, () => {}))).toBe(interrupted);
+    expect(caughtFrom(() => project(() => {}, abort))).toBe(interrupted);
+    let observed = false;
+    expect(
+      caughtFrom(() =>
+        project(
+          () => {
+            if (observed) abort();
+          },
+          () => {
+            observed = true;
+          },
+        ),
+      ),
+    ).toBe(interrupted);
+    expect(
+      caughtFrom(() =>
+        project(
+          () => {},
+          (_roots, completedOwned) => {
+            if (completedOwned) abort();
+          },
+        ),
+      ),
+    ).toBe(interrupted);
+    let completed: object | undefined;
+    const actual = project(
+      () => {},
+      (_roots, completedOwned) => {
+        if (completedOwned) completed = completedOwned;
+      },
+    );
+    expect(actual).toEqual(ordinary);
+    expect(Object.isFrozen(actual)).toBe(true);
+    expect(completed).toBe(actual);
+  }
+});

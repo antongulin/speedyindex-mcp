@@ -1167,7 +1167,11 @@ function backlinkSemantics(value: BacklinkResult, work?: Work) {
   });
 }
 
-/** Closed structure plus derived partition/count checks, including application errors. */
+/**
+ * Closed structure plus derived partition/count checks, including application errors.
+ * Raw/duplicate coverage totals are trusted projection observations checked for
+ * consistency here, not reconstructed from discarded raw arrays.
+ */
 const resultShape = z.union([
   linksResultSchema,
   backlinkResultSchema,
