@@ -5,7 +5,7 @@ An unofficial [Model Context Protocol](https://modelcontextprotocol.io) server f
 [![CI](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/antongulin/speedyindex-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-This Bun/TypeScript source branch exposes nine tools over stdio: **`get_balance`**, **`list_tasks`**, **`get_task_status`**, **`get_task_report`**, **`create_indexing_task`**, **`create_index_check`**, **`create_backlink_check`**, **`plan_retry`**, and **`get_retry_history`**. Submissions are disabled by default; create previews work without a key or database. Retry planning and local retry history require existing private configuration and V2 state. Index-check and backlink-check reservations require operator-selected policy profiles. `get_balance` returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published; branch implementation is not delivery evidence.
+This Bun/TypeScript source branch exposes ten tools over stdio: **`get_balance`**, **`list_tasks`**, **`get_task_status`**, **`get_task_report`**, **`create_indexing_task`**, **`create_index_check`**, **`create_backlink_check`**, **`plan_retry`**, **`get_retry_history`**, and **`compare_reports`**. Submissions are disabled by default; create previews work without a key or database. Retry planning and local retry history require existing private configuration and V2 state. Index-check and backlink-check reservations require operator-selected policy profiles. `get_balance` returns the token, indexer, and checker wallets separately, with an observation timestamp. This project is independently maintained and is not affiliated with or endorsed by SpeedyIndex. No npm package or release is published; branch implementation is not delivery evidence.
 
 ## Run from source
 
@@ -77,7 +77,7 @@ Call `get_task_report` with one supported `family` and one nonblank opaque `task
 
 For `backlink/checker`, optional `page` and `limit` default to `0` and `100`; `limit` is bounded from 1 to 100. The request sends `task_id`, `page`, and `limit` in one fixed `/v2/task/backlink/checker/report` POST. The flat `reportKind: "backlink"` result contains `family`, `taskId`, `size`, `processedCount`, `page`, `lastPage`, and `donors`, with only `isCompleted` optional. The page and task ID must match the request, and the donor count cannot exceed the requested limit. Donor rows must be JSON objects; donor keys and nested finite JSON values, including `null`, are preserved without assigning meaning to provider-specific fields. Empty pages beyond `lastPage` are allowed; nonempty pages beyond it are rejected. No additional page is fetched. Report counters, arrays, and optional completion metadata do not establish completeness, retry eligibility, or fresh Google indexing truth.
 
-The four read tools make one authenticated request to a fixed `https://api.speedyindex.com/v2` route, using the API key as the raw `Authorization` header. Requests have a 10-second deadline, support MCP cancellation, reject redirects, and never retry automatically. Read-tool failures return `isError: true` with a sanitized message and no structured result. Provider bodies and exception details are never reflected in those errors. Normal stdout contains MCP messages only; diagnostics use stderr. Closing stdin ends the process.
+The four single-request read tools make one authenticated request to a fixed `https://api.speedyindex.com/v2` route, using the API key as the raw `Authorization` header. Requests have a 10-second deadline, support MCP cancellation, reject redirects, and never retry automatically. Read-tool failures return `isError: true` with a sanitized message and no structured result. Provider bodies and exception details are never reflected in those errors. Normal stdout contains MCP messages only; diagnostics use stderr. Closing stdin ends the process.
 
 Read responses over this MCP's 16 MiB decoded-body safety bound are rejected; this is not a SpeedyIndex maximum.
 
@@ -205,6 +205,26 @@ Every application branch has identical JSON text and structured content, with `i
 
 History preserves logical SQL rows/schema/versions but can change physical WAL/SHM bookkeeping and needs writable private storage. The owner keeps one pre-SQL monotonic budget and its independent history guard through native close, an actual I/O cancellation opportunity, awaited budget settlement and a final signal/clock check. Synchronous SQL/CPU can delay cancellation; SDK cancellation may suppress the reply. Client rejection alone proves no owner completion. Reuse follows settled owner cleanup; clean refusals/cancellation permit the next call on the same host. An opaque snapshot `ReadFailure` conservatively disables only that host's history reader until restart. History leaves create/planner authority unchanged. See [maintenance](docs/state-maintenance.md#read-only-local-history) for existing-state and recovery boundaries.
 
+## Read-only report comparison
+
+Call `compare_reports` with exactly one supported `family` and two distinct opaque task IDs:
+
+```json
+{
+  "family": "google/indexer",
+  "beforeTaskId": "before-report",
+  "afterTaskId": "after-report"
+}
+```
+
+Families are `google/indexer`, `google/checker`, `yandex/indexer`, `yandex/checker`, `bing/checker` and `backlink/checker`. IDs must be safe nonblank strings; their exact text and the caller's before/after direction are preserved. The tool uses the existing read client's key and needs no submission policy or local ledger. It creates no jobs, reservations or retry authority.
+
+The result is compared links/backlink evidence, blocked, or a fixed sanitized error. Application `isError` is true exactly for error; SDK input rejection is separate. Generic comparisons retain reported membership changes and unknown omissions. Backlink comparisons retain the matching current target scope and unknown missing donor evidence. Status and generic-report `providerCreatedAt` are separate nullable fields with exact provider strings; backlink report metadata has no date field. Dates do not reorder the caller's IDs. Observations are non-atomic and establish no original corpus equality, original history or live indexing truth.
+
+The owner keeps collection, validation, serialization and awaited native settlement/close within its original budget and final signal/clock fences. The complete escaped application envelope counts both JSON text and duplicated structured content and is bounded inclusively to 2,097,152 UTF-8 bytes. SDK framing, process RSS and hard whole-tool latency are outside that bound. See [architecture](docs/architecture.md#report-comparison) for all read, raw-entry and retention limits.
+
+Backlink fences index donors by exact URL and compare canonical JSON tuples of target links, so duplicate rows keep their multiplicity and the target set stays exact. Index and scratch structures remain charged to retained work. Dense projection accounting can still reach the unchanged 60-second horizon within admitted cardinality and then returns a fixed `DeadlineExceeded` result instead of partial evidence; the matching regression is not a maximum-density, RSS or latency guarantee, and that cost remains an open follow-up. Hosted CI passed the complete source and built suites on the accepted head, and merged-artifact QA repeated the frozen install, build and complete built suite. No live provider call, release or deployment is included.
+
 ## Optional operator setup
 
 Use only canonical absolute POSIX paths you explicitly select. The state parent must already exist and be trusted. Initialize a new private state directory with this local command, which requires no key, policy, network or MCP session:
@@ -289,7 +309,7 @@ The tests use dummy credentials, loopback HTTP fixtures, the official MCP client
 
 See [architecture](docs/architecture.md), [dependency decisions](docs/dependencies.md), [contributing](CONTRIBUTING.md), [security reporting](SECURITY.md), [agent guidance](AGENTS.md), and the [LLM documentation index](llms.txt).
 
-Three public tools remain in the [roadmap](docs/implementation-plan.md): `submit_retry`, `compare_reports`, and `summarize_campaigns`. Deterministic one-shot execution and scheduling also remain unimplemented. This source branch implements read-only `plan_retry` and `get_retry_history`; implementation and synthetic verification do not establish a release, provider activation or delivery of the remaining workflow.
+Two public tools remain in the [roadmap](docs/implementation-plan.md): `submit_retry` and `summarize_campaigns`. Deterministic one-shot execution and scheduling also remain unimplemented. This source branch implements read-only `plan_retry`, `get_retry_history` and `compare_reports`; implementation and synthetic verification do not establish a release, provider activation or delivery of the remaining workflow.
 
 The V2 foundation preserves explicit new-state initialization, offline V1 migration, coherent bounded local snapshots, mode-separated exact replay and internal atomic retry admission. Planning inspection reads period/cap/lifetime decisions without creating reservations or periods. The production owner composes same-key two-pass HTTP observations with final coherent readers under the shared host guard. Local accepted manifests and permitted external observed corpora keep distinct provenance, without invented parents. Internal proofs stay private; public comparison data cannot authorize a paid retry. See the [architecture](docs/architecture.md) for bounds, replay and historical-evidence limits, and [state maintenance](docs/state-maintenance.md) for migration and recovery constraints.
 
