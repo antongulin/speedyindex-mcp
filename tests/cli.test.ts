@@ -152,6 +152,7 @@ for (const arg of ['--help', '--version', '--unsupported']) {
             'create_indexing_task',
             'plan_retry',
             'get_retry_history',
+            'compare_reports',
           ])
             expect(stdout).toContain(tool);
       }
