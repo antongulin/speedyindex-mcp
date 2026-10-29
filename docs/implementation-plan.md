@@ -70,7 +70,7 @@ Ten tools are implemented, including delivered `compare_reports` ([BOO-21](https
 | Independent | Add read-only `summarize_campaigns`                 | [BOO-84](https://linear.app/boostbusiness/issue/BOO-84/add-read-only-summarize-campaigns)                       | Bounded read-only summaries of related task outcomes                       | None       |
 | Independent | Reduce dense report comparison projection cost      | [BOO-85](https://linear.app/boostbusiness/issue/BOO-85/reduce-dense-report-comparison-projection-cost)          | Projection-cost follow-up to delivered comparison, related to BOO-21       | None       |
 
-The order column reflects only the declared blockers: native cleanup proof before public submission, submission before one-shot execution, and one-shot before scheduling. `summarize_campaigns` and the dense-projection cost follow-up are independent. All six issues are unassigned and carry no priority, cycle or due date; they select no operator values and start no implementation.
+The order column reflects only the declared blockers: native cleanup proof before public submission, submission before one-shot execution, and one-shot before scheduling. `summarize_campaigns` and the dense-projection cost follow-up are independent. Linear owns current issue status, priority, labels and ownership; these entries select no operator values and start no implementation.
 
 ## Review and delivery
 
